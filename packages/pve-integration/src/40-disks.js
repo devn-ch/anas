@@ -428,6 +428,15 @@
         function push(name, value) {
             rows.push({ name: name, value: '' + value });
         }
+        // The daemon passed -n standby: a spun-down disk was never read, so the
+        // placeholders below would read as "Supported: No" facts. One honest row.
+        if (smart.standby === true) {
+            push(t('Standby'), t('Disk is spun down; SMART was not read so as not to wake it'));
+            return Ext.create('Ext.data.Store', {
+                fields: [{ name: 'name', type: 'string' }, { name: 'value', type: 'string' }],
+                data: rows,
+            });
+        }
         push(t('Supported'), smart.supported ? t('Yes') : t('No'));
         push(t('Enabled'), smart.enabled ? t('Yes') : t('No'));
         push(t('Overall Health'), smart.overallHealth);

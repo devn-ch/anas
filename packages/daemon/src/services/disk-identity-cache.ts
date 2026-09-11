@@ -6,6 +6,7 @@
  */
 
 import type { CommandExecutor } from '../executor/types.js'
+import { isSmartctlStandby } from '../parsers/smartctl.js'
 
 export interface DiskIdentity {
   /** Human-readable model family, e.g. "Western Digital Red Pro" */
@@ -68,38 +69,54 @@ export class DiskIdentityCache {
   }
 
   private async load(diskId: string, devicePath: string): Promise<DiskIdentity> {
-    const identity = await this.fetchFromSmartctl(devicePath)
-    this.cache.set(diskId, identity)
+    const { identity, cacheable } = await this.fetchFromSmartctl(devicePath)
+    if (cacheable)
+      this.cache.set(diskId, identity)
     return identity
   }
 
-  private async fetchFromSmartctl(devicePath: string): Promise<DiskIdentity> {
+  private async fetchFromSmartctl(devicePath: string): Promise<{ identity: DiskIdentity, cacheable: boolean }> {
     try {
-      const result = await this.executor.exec('/usr/sbin/smartctl', ['-iH', '--json', devicePath])
-      // smartctl -iH is identity + health check (no full scan), fast
+      // -n standby: if the disk is asleep, smartctl checks the power mode and
+      // exits without issuing anything that would spin it up. -iH is identity +
+      // health check (no full scan), fast.
+      const result = await this.executor.exec('/usr/sbin/smartctl', ['-n', 'standby', '-iH', '--json', devicePath])
+      if (isSmartctlStandby(result)) {
+        // The disk is spun down and we declined to wake it — nothing was read.
+        // Return the empty identity but do NOT cache it: the next inventory
+        // pass retries, and caches once the disk is awake.
+        return { identity: emptyIdentity(), cacheable: false }
+      }
       const data = JSON.parse(result.stdout)
       return {
-        modelFamily: data.model_family ?? null,
-        deviceModel: data.model_name ?? null,
-        formFactor: data.form_factor?.name ?? null,
-        firmwareVersion: data.firmware_version ?? null,
-        interface: formatInterface(data),
-        trimSupport: !!data.trim?.supported,
-        smartHealthy: data.smart_status?.passed ?? null,
+        identity: {
+          modelFamily: data.model_family ?? null,
+          deviceModel: data.model_name ?? null,
+          formFactor: data.form_factor?.name ?? null,
+          firmwareVersion: data.firmware_version ?? null,
+          interface: formatInterface(data),
+          trimSupport: !!data.trim?.supported,
+          smartHealthy: data.smart_status?.passed ?? null,
+        },
+        cacheable: true,
       }
     }
     catch {
       // smartctl failed or returned invalid JSON — return empty identity
-      return {
-        modelFamily: null,
-        deviceModel: null,
-        formFactor: null,
-        firmwareVersion: null,
-        interface: null,
-        trimSupport: false,
-        smartHealthy: null,
-      }
+      return { identity: emptyIdentity(), cacheable: true }
     }
+  }
+}
+
+function emptyIdentity(): DiskIdentity {
+  return {
+    modelFamily: null,
+    deviceModel: null,
+    formFactor: null,
+    firmwareVersion: null,
+    interface: null,
+    trimSupport: false,
+    smartHealthy: null,
   }
 }
 

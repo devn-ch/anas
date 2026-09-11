@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { parseSmartctl } from '../smartctl.js'
+import { isSmartctlStandby, parseSmartctl, standbySmartData } from '../smartctl.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/system')
@@ -86,5 +86,58 @@ describe('parseSmartctl', () => {
     assert.equal(result.nvmePercentageUsed, 5)
     assert.equal(result.nvmeAvailableSpare, 100)
     assert.deepEqual(result.attributes, [])
+    assert.equal(result.standby, false)
+  })
+})
+
+describe('isSmartctlStandby', () => {
+  function standbyJson(mode: string) {
+    return JSON.stringify({
+      smartctl: { messages: [{ string: `Device is in ${mode} mode, exit(2)`, severity: 'information' }] },
+    })
+  }
+
+  it('exit 2 + STANDBY message → true', () => {
+    assert.equal(isSmartctlStandby({ stdout: standbyJson('STANDBY'), exitCode: 2 }), true)
+  })
+
+  it('exit 2 + SLEEP message → true', () => {
+    assert.equal(isSmartctlStandby({ stdout: standbyJson('SLEEP'), exitCode: 2 }), true)
+  })
+
+  it('exit 2 OR-ed with other bits + STANDBY message → true', () => {
+    assert.equal(isSmartctlStandby({ stdout: standbyJson('STANDBY'), exitCode: 6 }), true)
+  })
+
+  it('exit 0 + normal JSON → false', () => {
+    assert.equal(isSmartctlStandby({ stdout: JSON.stringify({ model_name: 'X' }), exitCode: 0 }), false)
+  })
+
+  it('exit 2 + non-JSON stdout → false', () => {
+    assert.equal(isSmartctlStandby({ stdout: 'Device is in STANDBY mode, exit(2)', exitCode: 2 }), false)
+  })
+
+  it('exit 2 + no standby message → false (bit 1 alone is not proof of standby)', () => {
+    assert.equal(isSmartctlStandby({ stdout: JSON.stringify({ smartctl: { messages: [{ string: 'Device open failed' }] } }), exitCode: 2 }), false)
+  })
+})
+
+describe('standbySmartData', () => {
+  it('is the empty payload plus standby: true', () => {
+    const data = standbySmartData()
+    assert.equal(data.standby, true)
+    assert.equal(data.supported, false)
+    assert.equal(data.enabled, false)
+    assert.equal(data.overallHealth, 'UNKNOWN')
+    assert.equal(data.temperature, null)
+    assert.equal(data.powerOnHours, null)
+    assert.deepEqual(data.attributes, [])
+    assert.equal(data.nvmePercentageUsed, null)
+    assert.equal(data.nvmeAvailableSpare, null)
+  })
+
+  it('parseSmartctl normal output carries standby: false (unsupported branch too)', () => {
+    assert.equal(parseSmartctl(loadFixture('smartctl.json')).standby, false)
+    assert.equal(parseSmartctl({ smart_support: { available: true, enabled: true } }).standby, false)
   })
 })

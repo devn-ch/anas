@@ -5,7 +5,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { parseByIdToKernel, parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { LSBLK_ARGS, parseLsblk } from '../parsers/lsblk.js'
-import { parseSmartctl } from '../parsers/smartctl.js'
+import { isSmartctlStandby, parseSmartctl, standbySmartData } from '../parsers/smartctl.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { iscsiServedSerials, normalizeSerial } from '../services/iscsi-held.js'
@@ -332,11 +332,17 @@ export async function diskRoutes(
       return { error: { code: 'NOT_FOUND', message: `Disk '${id}' not found` } }
     }
 
+    // -n standby: a spun-down disk is reported as such, never woken to read SMART.
     const smartResult = await executor.exec('/usr/sbin/smartctl', [
+      '-n',
+      'standby',
       '-a',
       '--json',
       disk.path,
     ])
+
+    if (isSmartctlStandby(smartResult))
+      return { data: standbySmartData() }
 
     const smartData = parseSmartctl(smartResult.stdout)
     return { data: smartData }

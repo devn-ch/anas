@@ -29,6 +29,48 @@ interface SmartctlOutput {
   [key: string]: unknown
 }
 
+/** The power-mode line smartctl prints when `-n standby` made it skip a sleeping disk. */
+const STANDBY_MESSAGE_RE = /in (?:STANDBY|SLEEP) mode/i
+
+/**
+ * Single source of truth for "smartctl declined to read the disk because it is
+ * asleep": run with `-n standby`, smartctl checks the power mode first and, for
+ * a disk in STANDBY or SLEEP, exits with bit 1 set (exit code 2, possibly
+ * OR'ed with other bits) WITHOUT issuing any command that would spin the
+ * platters up. With `--json` it still emits a document whose messages name the
+ * power mode; a bare exit code alone is not enough (bit 1 also fires for other
+ * failures), so the message is required to confirm it was the power mode.
+ */
+export function isSmartctlStandby(result: { stdout: string, exitCode: number }): boolean {
+  if ((result.exitCode & 2) === 0)
+    return false
+  try {
+    const data = JSON.parse(result.stdout) as {
+      smartctl?: { messages?: Array<{ string?: string }> }
+    }
+    const messages = data.smartctl?.messages ?? []
+    return messages.some(m => STANDBY_MESSAGE_RE.test(m.string ?? ''))
+  }
+  catch {
+    return false
+  }
+}
+
+/** The SmartData payload for a disk we refused to wake: placeholders + the standby flag. */
+export function standbySmartData(): SmartData {
+  return {
+    supported: false,
+    enabled: false,
+    overallHealth: 'UNKNOWN',
+    temperature: null,
+    powerOnHours: null,
+    attributes: [],
+    nvmePercentageUsed: null,
+    nvmeAvailableSpare: null,
+    standby: true,
+  }
+}
+
 /**
  * Parse `smartctl -a --json` output into SmartData.
  */
@@ -48,6 +90,7 @@ export function parseSmartctl(json: string | SmartctlOutput): SmartData {
       attributes: [],
       nvmePercentageUsed: null,
       nvmeAvailableSpare: null,
+      standby: false,
     }
   }
 
@@ -90,5 +133,6 @@ export function parseSmartctl(json: string | SmartctlOutput): SmartData {
     attributes,
     nvmePercentageUsed: nvmeLog?.percentage_used ?? null,
     nvmeAvailableSpare: nvmeLog?.available_spare ?? null,
+    standby: false,
   }
 }

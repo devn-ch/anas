@@ -182,6 +182,12 @@ export const SmartData = z.object({
   supported: z.boolean(),
   /** Whether SMART is enabled */
   enabled: z.boolean(),
+  /**
+   * True when the disk was in standby/sleep and smartctl was told not to wake
+   * it; every other field is then a placeholder, not a measurement. Optional so
+   * an old daemon still validates.
+   */
+  standby: z.boolean().optional(),
   /** Overall health assessment */
   overallHealth: SmartHealth,
   /** Temperature in Celsius */
