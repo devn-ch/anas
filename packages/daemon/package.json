@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@anas/shared": "*",
-    "fastify": "^5.0.0",
+    "fastify": "^5.12.4",
     "zod": "^4.3.6"
   },
   "devDependencies": {
