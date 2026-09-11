@@ -418,8 +418,13 @@ export {
   SnapshotTarget,
 } from './schemas/schedules.js'
 
-// Self-heal repair engine schemas (story selfheal.5)
+// Self-heal repair engine schemas (story selfheal.5) + the repair job (selfheal.6)
 export {
+  AhrRepairBlockOutcome,
+  AhrRepairFile,
+  AhrRepairFileOutcome,
+  AhrRepairRequest,
+  AhrRepairResult,
   SelfhealDiagnostics,
   SelfhealMapping,
   SelfhealOutcome,

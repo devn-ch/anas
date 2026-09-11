@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { AbsolutePath } from './common.js'
 
 /**
  * Self-heal repair engine schemas (story selfheal.5).
@@ -202,3 +203,76 @@ export const SelfhealOutcome = z.object({
   diagnostics: SelfhealDiagnostics.optional(),
 })
 export type SelfhealOutcome = z.infer<typeof SelfhealOutcome>
+
+// ---------------------------------------------------------------------------
+//  The repair JOB (story selfheal.6) — POST /v1/ahr/:name/repair
+// ---------------------------------------------------------------------------
+
+/**
+ * One file the operator asked to have repaired, with the exact blocks.
+ *
+ * The request is always EXPLICIT: the blocks come from the findings the
+ * operator selected in the Scrubs window, never from "everything the daemon
+ * thinks is bad". A repair writes through md, and what it writes over is named
+ * by the caller.
+ *
+ * `path` is absolute and under the pool's mountpoint. A scrub finding that
+ * lives OUTSIDE the mounted tree (`outsideMount` — a corrupt block inside
+ * `@snapshots/…`) is filesystem-relative and is refused here rather than
+ * silently reinterpreted: repair works on the live `@data` tree in this cut.
+ */
+export const AhrRepairFile = z.object({
+  path: AbsolutePath,
+  /** 4 KiB file block indexes, as `AhrScrubFinding.badBlocks` reports them. */
+  blocks: z.array(z.number().int().nonnegative()).min(1, 'name at least one block'),
+})
+export type AhrRepairFile = z.infer<typeof AhrRepairFile>
+
+/** Body of POST /v1/ahr/:name/repair. */
+export const AhrRepairRequest = z.object({
+  files: z.array(AhrRepairFile).min(1, 'name at least one file'),
+})
+export type AhrRepairRequest = z.infer<typeof AhrRepairRequest>
+
+/** What the engine concluded about one requested block. */
+export const AhrRepairBlockOutcome = z.object({
+  block: z.number().int().nonnegative(),
+  outcome: SelfhealOutcomeKind,
+  /** The engine's own sentence — including a `refused:` gate and an error text. */
+  reason: z.string(),
+})
+export type AhrRepairBlockOutcome = z.infer<typeof AhrRepairBlockOutcome>
+
+/** Every requested block of one file, in the order they were attempted. */
+export const AhrRepairFileOutcome = z.object({
+  path: z.string(),
+  blocks: z.array(AhrRepairBlockOutcome),
+})
+export type AhrRepairFileOutcome = z.infer<typeof AhrRepairFileOutcome>
+
+/**
+ * The result of a repair job.
+ *
+ * THREE honest buckets, and no fourth place to hide a block in:
+ *
+ *  - `repaired` — the reconstruction matched the stored checksum, was written
+ *    through md, re-checked clean and read back cold.
+ *  - `unrepairable` — nothing below the csum tree can be proven right for this
+ *    block. `mapping-abort` counts here too (the bytes still pass their stored
+ *    csum, so the engine refused to write) and keeps its own reason in the
+ *    per-block entry. Restore the file from backup.
+ *  - `aboveMd` — parity already agreed with the bad data. Nothing was written.
+ *
+ * `blocks` is every block attempted, so the three buckets always add up to it.
+ */
+export const AhrRepairResult = z.object({
+  /** The AHR pool the repair ran on. */
+  pool: z.string(),
+  files: z.array(AhrRepairFileOutcome),
+  repaired: z.number().int().nonnegative(),
+  unrepairable: z.number().int().nonnegative(),
+  aboveMd: z.number().int().nonnegative(),
+  /** Total blocks attempted — repaired + unrepairable + aboveMd. */
+  blocks: z.number().int().nonnegative(),
+})
+export type AhrRepairResult = z.infer<typeof AhrRepairResult>

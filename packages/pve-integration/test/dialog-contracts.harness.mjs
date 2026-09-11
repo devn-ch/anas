@@ -399,6 +399,19 @@ function makeComponent(cfg, parent) {
     deselectAll() { c._selection = [] },
   })
   c.ensureVisible = () => c
+  /**
+   * Tick SEVERAL rows (a checkboxmodel grid). Rows the grid's own `beforeselect`
+   * vetoes never enter the selection — exactly what the checkbox does in a
+   * browser, and the rule the repair action depends on (selfheal.6).
+   */
+  c.selectRows = function (idxs) {
+    const veto = cfg && cfg.listeners && cfg.listeners.beforeselect
+    c._selection = idxs
+      .map(i => (c.store ? c.store.getAt(i) : null))
+      .filter(rec => rec && (typeof veto !== 'function' || veto(c.getSelectionModel(), rec) !== false))
+    c.fireEvent('selectionchange', {}, c._selection)
+    return c._selection.slice()
+  }
   /** What a click on a row does: set the selection and fire the grid's listener. */
   c.selectRow = function (idx) {
     const rec = c.store.getAt(idx)
@@ -7176,6 +7189,154 @@ async function scrubFindingsChecks() {
   eq('scrubs: …and simply has no findings to show', rowFor(grid2, 'ahr0').get('findings'), null)
 }
 
+// ============================================================================
+//  Scrubs: Repair from parity, in the findings window (story selfheal.6)
+// ============================================================================
+//
+// The findings window is the ONE place a repair is asked for — the findings are
+// what it is selected from. The contract below is the whole surface: which rows
+// can be ticked (and why the others cannot), when the verb lights up, that it
+// goes out through the confirm-code door with the exact files and blocks the
+// operator picked, and that the job's three buckets come back into the same
+// window — including the honest "still running" when the poll budget ends
+// first.
+
+// A second repairable file, with TWO bad blocks — a repair request carries the
+// block indexes, not a count, and the result is counted per block.
+const FINDING_D = {
+  path: '/mnt/anas-ahr/ahr0/db/pg_data.bin',
+  subvolume: '@data',
+  inode: 402,
+  stripes: [{ logical: 30000000, offset: 0, length: 4096 }],
+  badBlocks: [12, 13],
+}
+
+const REPAIR_ROUTES = {
+  'GET /scrub': SCRUB_STATES,
+  'GET /jobs': {
+    data: [scrubJob({
+      id: 'r1',
+      at: '2026-09-11T09:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=4',
+        checkedArrays: 3,
+        findings: [FINDING_A, FINDING_B, FINDING_C, FINDING_D],
+        errorsReported: 4,
+        errorsAttributed: 4,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  },
+}
+
+/** A completed repair job, as the daemon's job route hands it back. */
+function repairJob(result) {
+  return { id: 'rj1', status: 'completed', operation: 'ahr.repair', result }
+}
+
+async function repairFromParityChecks() {
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], REPAIR_ROUTES)
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onLink)
+  await settle()
+  const win = openWindow()
+  ok('repair: the findings window opens', !!win && win.cls === 'anas-win-scrub-findings')
+  if (!win) { return }
+  const fGrid = win.down('#findingsGrid')
+  const btn = win.down('#repairFromParity')
+  ok('repair: the findings grid is addressable by itemId', !!fGrid)
+  ok('repair: the window carries the Repair from parity button', !!btn && btn.cls === 'anas-btn-repair-parity')
+  if (!fGrid || !btn) { return }
+  eq('repair: the findings are ticked one by one (checkbox selection)',
+    fGrid.selModel && fGrid.selModel.selType, 'checkboxmodel')
+
+  // --- Enablement ------------------------------------------------------------
+  eq('repair: the verb needs a selection', btn.disabled, true)
+  ok('repair: …and says so on the button', /tick the files/.test(btn.tooltip || ''), btn.tooltip)
+
+  // --- Selection rules -------------------------------------------------------
+  // Row order: A (repairable, 1 block), B (missing), C (outsideMount), D (2 blocks).
+  eq('repair: every finding is a row', fGrid.getStore().getCount(), 4)
+  eq('repair: a DELETED file cannot be ticked', fGrid.selectRows([1]).length, 0)
+  eq('repair: a finding inside a SNAPSHOT cannot be ticked', fGrid.selectRows([2]).length, 0)
+  eq('repair: …and the verb stays off', btn.disabled, true)
+  const repairCol = (fGrid.columns || []).find(c => c.dataIndex === 'outcome')
+  ok('repair: the window has a Repair column', !!repairCol)
+  const repairCell = (i) => {
+    const meta = {}
+    const html = repairCol.renderer(fGrid.getStore().getAt(i).get('outcome'), meta, fGrid.getStore().getAt(i))
+    return `${html} ${meta.tdAttr || ''}`
+  }
+  ok('repair: a deleted file says WHY it cannot be repaired',
+    /cannot be repaired/.test(repairCell(1)) && /deleted since the scrub/.test(repairCell(1)), repairCell(1))
+  ok('repair: a snapshot finding says it is outside the mounted tree',
+    /cannot be repaired/.test(repairCell(2)) && /live @data tree only/.test(repairCell(2)), repairCell(2))
+  ok('repair: a repairable file shows nothing yet, not a verdict', /—/.test(repairCell(0)), repairCell(0))
+
+  eq('repair: two repairable files tick', fGrid.selectRows([0, 3]).length, 2)
+  eq('repair: …and the verb lights up', btn.disabled, false)
+  eq('repair: an unrepairable row ticked ALONGSIDE them is dropped, not carried',
+    fGrid.selectRows([0, 1, 3]).length, 2)
+
+  // --- The confirm-gated request --------------------------------------------
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('repair: the verb goes through the confirm-code door', !!sent)
+  if (!sent) { return }
+  eq('repair: …to the pool\'s own repair endpoint', sent.path, '/ahr/ahr0/repair')
+  eq('repair: …as a POST', sent.method, 'post')
+  eq('repair: the request names the files IN FULL, never truncated',
+    sent.body.files.map(f => f.path), [FINDING_A.path, FINDING_D.path])
+  eq('repair: …and the exact 4 KiB blocks the scrub probed',
+    sent.body.files.map(f => f.blocks), [[300], [12, 13]])
+  ok('repair: the confirm dialog says how many blocks in how many files',
+    /3 block\(s\) in 2 file\(s\)/.test(sent.confirmIntro || ''), sent.confirmIntro)
+  ok('repair: the poll budget is raised past the 15 s default (a repair is minutes)',
+    Number(sent.maxMs) > 15000, sent.maxMs)
+  ok('repair: the poll rides the window, not a component that closes', sent.view === win)
+
+  // --- The result, in the same window ---------------------------------------
+  const panel = win.down('#repairResult')
+  ok('repair: the result panel is hidden until there is a result', !!panel && panel.hidden === true)
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'repaired', reason: 'reconstructed from parity' }] },
+      { path: FINDING_D.path, blocks: [
+        { block: 12, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' },
+        { block: 13, outcome: 'above-md', reason: 'parity agrees with the bad data' },
+      ] },
+    ],
+    repaired: 1,
+    unrepairable: 1,
+    aboveMd: 1,
+    blocks: 3,
+  }))
+  await settle()
+  eq('repair: the result appears in the window the request was made from', panel.hidden, false)
+  ok('repair: the three buckets are counted', /1 repaired · 1 unrepairable · 1 above md/.test(panel.html), panel.html)
+  ok('repair: unrepairable says restore from backup', /restore this file from backup/.test(panel.html), panel.html)
+  ok('repair: above md implicates something other than the disks, as an implication',
+    /implicates something other than the disks/.test(panel.html) && !/proves/.test(panel.html), panel.html)
+  ok('repair: a repaired file carries its verdict on its own row', /repaired/.test(repairCell(0)), repairCell(0))
+  ok('repair: a mixed file says BOTH of its outcomes',
+    /1 unrepairable/.test(repairCell(3)) && /1 above-md/.test(repairCell(3)), repairCell(3))
+
+  // --- The honest "not finished" --------------------------------------------
+  sent.onComplete({ id: 'rj2', status: 'running' })
+  await settle()
+  ok('repair: a job still running claims no result', /still running/.test(panel.html), panel.html)
+  ok('repair: …and says where the answer will arrive', /notification/.test(panel.html), panel.html)
+}
+
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
@@ -7275,6 +7436,10 @@ created.windows.length = 0
 // Story selfheal.3 — the AHR scrub's findings on the Scrubs row, and the one
 // window they open.
 await scrubFindingsChecks()
+warnings.length = 0
+created.windows.length = 0
+// Story selfheal.6 — Repair from parity, in that same window.
+await repairFromParityChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

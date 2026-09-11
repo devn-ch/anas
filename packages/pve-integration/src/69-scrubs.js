@@ -67,10 +67,19 @@
  * a record the system does not keep. The PVE warning notification carries the
  * same paths and is what survives a restart.
  *
+ * REPAIR FROM PARITY (selfheal.6) lives in that same window and nowhere else —
+ * the findings are what a repair is selected FROM, so the verb belongs where
+ * they are told. Tick the files to repair (a finding with no live file under
+ * the mountpoint — deleted, or inside a snapshot — cannot be ticked and says
+ * why), confirm what the daemon warns about, and the job's three honest buckets
+ * come back into the same window. Never automatic, never a read-path heal: an
+ * operator asks for it, on named files, with named blocks.
+ *
  * Test hooks: view cls 'anas-view anas-view-scrubs', grid cls 'anas-grid-scrub',
  * scrub toggle 'anas-btn-scrub-toggle', run 'anas-btn-scrub-run', stop
  * 'anas-btn-scrub-stop', findings window 'anas-win-scrub-findings' with grid
- * 'anas-grid-scrub-findings'.
+ * 'anas-grid-scrub-findings' (itemId '#findingsGrid'), repair button
+ * 'anas-btn-repair-parity' and result panel '#repairResult'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  * Fail-open everywhere: a broken view renders an error panel, never breaks PVE.
@@ -611,9 +620,195 @@
             : muted('0');
     }
 
+    // ---- Repair from parity (selfheal.6) ------------------------------------
+    //
+    // A finding can be repaired only when there is a live file under the pool's
+    // mountpoint to repair: a path deleted since the scrub has nothing left,
+    // and a path inside a snapshot is outside the mounted tree (repair works on
+    // the live @data tree in this cut). Both are refused by the daemon too —
+    // this is the same rule said early, on the checkbox, so the operator is not
+    // told after choosing. A finding whose probe found no bad block has nothing
+    // to write either.
+    function repairableRow(rec) {
+        return !rec.get('missing') && !rec.get('outsideMount') && Number(rec.get('blocks')) > 0;
+    }
+
+    function repairBlockedReason(rec) {
+        if (rec.get('outsideMount')) {
+            return t('this finding is inside a snapshot, outside the pool\'s mounted tree — '
+                + 'repair works on the live @data tree only');
+        }
+        if (rec.get('missing')) {
+            return t('the file no longer exists — it was deleted since the scrub named it');
+        }
+        if (!Number(rec.get('blocks'))) {
+            return t('no block inside the reported stripe failed to read — there is nothing to repair');
+        }
+        return '';
+    }
+
+    // The Repair column: what will happen, then what did. Before a run it is a
+    // dash for a file that can be repaired and the reason for one that cannot;
+    // after the job it carries that file's own outcome, counted per block.
+    function renderRepairOutcome(v, meta, rec) {
+        var blocked = repairBlockedReason(rec);
+        if (!v) {
+            if (blocked) {
+                meta.tdAttr = 'data-qtip="' + enc(blocked) + '"';
+                return muted(enc(t('cannot be repaired')));
+            }
+            return muted('—');
+        }
+        var color = v.level === 'ok' ? 'var(--anas-ok,#1f9c56)' : 'var(--anas-warn,#b06a12)';
+        meta.tdAttr = 'data-qtip="' + enc(v.detail || v.text) + '"';
+        return '<span style="color:' + color + ';">' + enc(v.text) + '</span>';
+    }
+
+    // The rows the daemon is asked about — full paths and the exact 4 KiB block
+    // indexes the scrub probed, never "everything you think is bad".
+    function repairSelection(grid) {
+        var out = [];
+        var sel = grid.getSelection() || [];
+        for (var i = 0; i < sel.length; i++) {
+            if (!repairableRow(sel[i])) {
+                continue;
+            }
+            out.push({ path: sel[i].get('path'), blocks: (sel[i].get('blockArray') || []).slice() });
+        }
+        return out;
+    }
+
+    function updateRepairButton(win) {
+        var btn = win.down('#repairFromParity');
+        var grid = win.down('#findingsGrid');
+        if (!btn || !grid) {
+            return;
+        }
+        var picked = repairSelection(grid);
+        btn.setDisabled(!picked.length);
+        btnSetTip(btn, picked.length
+            ? ''
+            : t('tick the files to repair — a finding with no live file under the mountpoint cannot be'));
+    }
+
+    // The job's answer, in the window the request was made from: the three
+    // buckets, and each file's own outcome on its own row.
+    function showRepairResult(win, job) {
+        var panel = win.down('#repairResult');
+        var grid = win.down('#findingsGrid');
+        if (!panel) {
+            return;
+        }
+        panel.setHidden(false);
+        if (!job || job.status !== 'completed' || !job.result) {
+            // A repair outruns the poll budget the same way a scrub does. Say
+            // where the answer will be rather than inventing one here.
+            panel.update(enc(t('The repair is still running. Its outcome arrives as a PVE notification, '
+                + 'and the files above keep the findings that started it.')));
+            return;
+        }
+        var res = job.result;
+        var files = res.files || [];
+        if (grid) {
+            var store = grid.getStore();
+            for (var i = 0; i < files.length; i++) {
+                var idx = store.findExact('path', files[i].path);
+                if (idx < 0) {
+                    continue;
+                }
+                store.getAt(idx).set('outcome', fileOutcome(files[i]));
+            }
+        }
+        var counts = Number(res.repaired || 0) + ' ' + t('repaired')
+            + ' · ' + Number(res.unrepairable || 0) + ' ' + t('unrepairable')
+            + ' · ' + Number(res.aboveMd || 0) + ' ' + t('above md')
+            + ' (' + t('of') + ' ' + Number(res.blocks || 0) + ' ' + t('4 KiB block(s)') + ')';
+        var lines = [enc(counts)];
+        if (Number(res.unrepairable || 0) > 0) {
+            lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
+                + 'those blocks — restore this file from backup.')));
+        }
+        if (Number(res.aboveMd || 0) > 0) {
+            lines.push(enc(t('Above md: parity already agreed with the bad data — this implicates '
+                + 'something other than the disks (memory, controller, software). Nothing was written.')));
+        }
+        panel.update(lines.join('<br>'));
+    }
+
+    // One file's blocks, counted by bucket: "2 repaired", "1 repaired, 1
+    // unrepairable". mapping-abort keeps its own name here — the count it feeds
+    // is unrepairable, and the operator still sees "not corrupt here".
+    function fileOutcome(file) {
+        var blocks = file.blocks || [];
+        var order = [];
+        var byKind = {};
+        var detail = [];
+        for (var i = 0; i < blocks.length; i++) {
+            var kind = blocks[i].outcome;
+            if (!byKind[kind]) {
+                byKind[kind] = 0;
+                order.push(kind);
+            }
+            byKind[kind] += 1;
+            detail.push(t('block') + ' ' + blocks[i].block + ': ' + kind + ' — ' + (blocks[i].reason || ''));
+        }
+        var parts = [];
+        for (var j = 0; j < order.length; j++) {
+            parts.push(byKind[order[j]] + ' ' + order[j]);
+        }
+        return {
+            text: parts.join(', '),
+            level: (order.length === 1 && order[0] === 'repaired') ? 'ok' : 'warn',
+            detail: detail.join('\n')
+        };
+    }
+
+    function repairFromParity(node, pool, win) {
+        var grid = win.down('#findingsGrid');
+        if (!grid) {
+            return;
+        }
+        var files = repairSelection(grid);
+        if (!files.length) {
+            return;
+        }
+        var blocks = 0;
+        for (var i = 0; i < files.length; i++) {
+            blocks += files[i].blocks.length;
+        }
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/ahr/' + encodeURIComponent(pool) + '/repair',
+            body: { files: files },
+            view: win,
+            // A repair runs a bounded md check per block, so the budget is
+            // minutes rather than the default seconds — and when it still runs
+            // out, the window says so instead of claiming a result.
+            maxMs: 120000,
+            confirmTitle: t('Repair from parity'),
+            confirmIntro: enc(t('Repairing') + ' ' + blocks + ' ' + t('block(s) in') + ' '
+                + files.length + ' ' + t('file(s) on pool') + ' ' + pool + '. '
+                + t('The daemon will:')),
+            confirmButtonText: t('Repair'),
+            failTitle: t('Repair failed'),
+            onSubmitted: function () {
+                ANAS.toast(t('Repair started on') + ' ' + pool);
+                updateRepairButton(win);
+            },
+            onComplete: function (job) {
+                try {
+                    showRepairResult(win, job);
+                } catch (e) {
+                    ANAS.warn('repair result failed: ' + ANAS.errText(e));
+                }
+            }
+        });
+    }
+
     // The row's findings indicator is the door — a click anywhere ELSE on the
     // row is a plain selection. One door, one window.
-    function onScrubItemClick(view, rec, item, index, e) {
+    function onScrubItemClick(node, view, rec, item, index, e) {
         var entry = rec ? rec.get('findings') : null;
         if (!entry) {
             return;
@@ -630,13 +825,13 @@
             return;
         }
         try {
-            showScrubFindings(rec.get('pool'), entry.result);
+            showScrubFindings(node, rec.get('pool'), entry.result);
         } catch (eW) {
             ANAS.warn('scrub findings failed: ' + ANAS.errText(eW));
         }
     }
 
-    function showScrubFindings(pool, result) {
+    function showScrubFindings(node, pool, result) {
         var findings = (result && result.findings) || [];
         if (!findings.length) {
             return false;
@@ -651,9 +846,13 @@
                 inode: f.inode,
                 blocks: blocks.length,
                 blockList: blocks.join(', '),
+                // The numbers themselves: what a repair request names, verbatim
+                // from the probe — never re-derived here.
+                blockArray: blocks.slice(),
                 stripes: (f.stripes || []).length,
                 missing: !!f.missing,
-                outsideMount: !!f.outsideMount
+                outsideMount: !!f.outsideMount,
+                outcome: null
             });
         }
 
@@ -673,22 +872,53 @@
                 },
                 {
                     xtype: 'gridpanel',
+                    itemId: 'findingsGrid',
                     cls: 'anas-grid-scrub-findings',
                     flex: 1,
                     border: false,
+                    // Repair is a per-file choice, so the rows are ticked one by
+                    // one. SIMPLE mode: a click toggles, no modifier key to know.
+                    selModel: { selType: 'checkboxmodel', mode: 'SIMPLE' },
                     store: Ext.create('Ext.data.Store', {
-                        fields: ['path', 'subvolume', 'inode', 'blocks', 'blockList', 'stripes', 'missing', 'outsideMount'],
+                        fields: ['path', 'subvolume', 'inode', 'blocks', 'blockList', 'stripes',
+                            'missing', 'outsideMount',
+                            { name: 'blockArray', type: 'auto' },
+                            { name: 'outcome', type: 'auto' }],
                         data: rows
                     }),
                     columns: [
                         { text: t('File'), dataIndex: 'path', flex: 1, minWidth: 320,
                             sortable: false, menuDisabled: true, renderer: renderFindingPath },
-                        { text: t('Bad 4K blocks'), dataIndex: 'blocks', width: 170, align: 'center',
-                            sortable: false, menuDisabled: true, renderer: renderFindingBlocks }
-                    ]
+                        { text: t('Bad 4K blocks'), dataIndex: 'blocks', width: 150, align: 'center',
+                            sortable: false, menuDisabled: true, renderer: renderFindingBlocks },
+                        { text: t('Repair'), dataIndex: 'outcome', width: 190,
+                            sortable: false, menuDisabled: true, renderer: renderRepairOutcome }
+                    ],
+                    listeners: {
+                        // A row with nothing to repair cannot be ticked at all —
+                        // the Repair column carries the reason.
+                        beforeselect: function (sm, rec) { return repairableRow(rec); },
+                        selectionchange: function () { updateRepairButton(win); }
+                    }
+                },
+                {
+                    xtype: 'component',
+                    itemId: 'repairResult',
+                    cls: 'anas-scrub-repair-result',
+                    hidden: true,
+                    padding: '6 12 10 12',
+                    html: ''
                 }
             ],
             buttons: [
+                {
+                    text: t('Repair from parity'),
+                    itemId: 'repairFromParity',
+                    cls: 'anas-btn-repair-parity',
+                    iconCls: 'fa fa-wrench',
+                    disabled: true,
+                    handler: function () { repairFromParity(node, pool, win); }
+                },
                 {
                     text: t('Close'),
                     handler: function () { win.close(); }
@@ -696,6 +926,7 @@
             ]
         });
         win.show();
+        updateRepairButton(win);
         return true;
     }
 
@@ -747,7 +978,7 @@
                     return;
                 }
                 try {
-                    showScrubFindings(pool, job.result);
+                    showScrubFindings(node, pool, job.result);
                 } catch (e) {
                     ANAS.warn('scrub findings failed: ' + ANAS.errText(e));
                 }
@@ -863,7 +1094,9 @@
                     ]),
                     listeners: {
                         selectionchange: function () { updateScrubButtons(this); },
-                        itemclick: onScrubItemClick
+                        itemclick: function (view, rec, item, index, e) {
+                            onScrubItemClick(node, view, rec, item, index, e);
+                        }
                     }
                 }
             ],

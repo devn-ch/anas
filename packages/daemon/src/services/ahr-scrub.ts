@@ -473,8 +473,12 @@ async function probeStripe(executor: CommandExecutor, path: string, offset: numb
   return bad
 }
 
-/** Does the path still exist? A file deleted since the scrub is reported, not probed. */
-async function pathExists(executor: CommandExecutor, path: string): Promise<boolean> {
+/**
+ * Does the path still exist? A file deleted since the scrub is reported, not
+ * probed — and, from selfheal.6, a repair request naming it is refused rather
+ * than run (the route imports this one copy).
+ */
+export async function pathExists(executor: CommandExecutor, path: string): Promise<boolean> {
   try {
     return (await executor.exec(STAT, ['-c', '%s', path])).exitCode === 0
   }

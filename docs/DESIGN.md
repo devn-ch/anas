@@ -412,6 +412,7 @@ Operations that are valid but have consequences. Requires acknowledgment.
 - Remove share with active connections
 - Export pool with active shares
 - Rollback snapshot (destroys newer data)
+- Repair an AHR file's named blocks from parity (writes reconstructed data through md; `AHR-DESIGN.md` §4)
 
 ```
 DELETE /v1/pools/tank → 409 Conflict
