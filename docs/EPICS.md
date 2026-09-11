@@ -198,6 +198,19 @@ One line each. These are decisions, not history; the rationale is in `EPICS-HIST
 
 ---
 
+### Self-heal — userspace AHR repair *(new; ground truth only)*
+
+> **Epic intent:** a userspace repair path where the btrfs csum arbitrates an md
+> reconstruction on AHR arrays — md knows parity groups, btrfs knows what the data
+> should be. This epic holds ONLY the ground-truth story; any product story
+> (detection surface, repair job, safety gates) is a separate authorization.
+> Converged design + harness rules live in the session record; the loop-device
+> suite (parity trap with a different-member failure, zero-block mapping,
+> compressed-extent cold read, sync_max restore after an exception, above-md
+> diagnosis) is the next story if authorized.
+
+**selfheal.1** `[done 2026-09-11]` As a dev, I want ground truth for a userspace AHR self-heal repair path (btrfs csum arbitrating md reconstruction) on loop devices — result: docs/AHR-SELF-HEAL-GROUND-TRUTH.md. Rig + stages in `test/self-heal/gt/` (00–08, loop devices only, disposable); 13 verdicts on kernel 7.0.14: GT-7 PROVEN — naive repair through md at default `rmw_level=1` restores the data block AND poisons parity (`mismatch_cnt` stays 8; failed-member stripe read returns exactly 1 wrong 4K block); GT-8/GT-11 PROVEN — `rmw_level=0` + XOR-of-other-members candidate + crc32c arbitration vs the stored csum leaves the array clean (`mismatch_cnt=0`, snapshot cold read matches, scrub 0 errors, failed-member stripe bit-identical); GT-12 PROVEN for RAID6 (kept-original write under `rmw_level=0`; P-member failure fully correct via Q; same poison at default rmw); GT-5/GT-6 PROVEN (md check sees below-md rot, blind to through-md rot); GT-13 PROVEN (`sync_max` trap: check suspends at the knob, the knob persists across re-runs). Kernel facts recorded: scrub dmesg names the 64K stripe + path but no csum values and not the failing 4K; filefrag "physical_offset" is the btrfs logical bytenr (chain needs the chunk-tree hop, per-chunk delta); stored csum leaf is readable through md and equals crc32c LE.
+
 ## 4. Candidates (serious; not authorized)
 
 One paragraph each. Promotion to §3 is an operator call.
