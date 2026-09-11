@@ -1,0 +1,139 @@
+{
+ "chunk_root": 22052864,
+ "csum_root": 30670848,
+ "fs_root": 32538624,
+ "subvolid": 256,
+ "big_inode": 257,
+ "small_inode": 1761,
+ "targets": [
+  {
+   "tree": "fs",
+   "file": "big1.bin",
+   "inode": 257,
+   "block": 20000,
+   "key": [
+    257,
+    108,
+    81920000
+   ],
+   "path": [
+    32538624,
+    32620544
+   ],
+   "logical_byte": 164298752,
+   "target_logical": 164298752,
+   "md_byte": 225968128,
+   "disk": 4,
+   "moff": 46202880,
+   "stripe": 689
+  },
+  {
+   "tree": "csum",
+   "for": "big1.bin",
+   "block": 20000,
+   "key": [
+    "18446744073709551606",
+    128,
+    164298752
+   ],
+   "path": [
+    30670848,
+    30834688
+   ],
+   "logical": 164298752,
+   "stored_csum": "0x776b78a6"
+  },
+  {
+   "tree": "chunk",
+   "key": [
+    256,
+    228,
+    164298752
+   ],
+   "path": [
+    22052864
+   ],
+   "logical": 164298752,
+   "chunk_logical": 82378752,
+   "chunk_device": 142737408
+  },
+  {
+   "tree": "fs",
+   "file": "big4.bin",
+   "inode": 260,
+   "block": 100,
+   "key": [
+    260,
+    108,
+    409600
+   ],
+   "path": [
+    32538624,
+    32620544
+   ],
+   "logical_byte": 410206208,
+   "target_logical": 410206208,
+   "md_byte": 471875584,
+   "disk": 0,
+   "moff": 95436800,
+   "stripe": 1440
+  },
+  {
+   "tree": "csum",
+   "for": "big4.bin",
+   "block": 100,
+   "key": [
+    "18446744073709551606",
+    128,
+    410206208
+   ],
+   "path": [
+    30670848,
+    30769152
+   ],
+   "logical": 410206208,
+   "stored_csum": "0xe56731e4"
+  },
+  {
+   "tree": "chunk",
+   "key": [
+    256,
+    228,
+    410206208
+   ],
+   "path": [
+    22052864
+   ],
+   "logical": 410206208,
+   "chunk_logical": 317259776,
+   "chunk_device": 377618432
+  }
+ ],
+ "inline": {
+  "file": "many/f1500.txt",
+  "inode": 1761,
+  "key": [
+   1761,
+   108,
+   0
+  ],
+  "path": [
+   32538624,
+   31834112
+  ]
+ },
+ "last_child": {
+  "tree": "csum",
+  "key": [
+   "18446744073709551606",
+   128,
+   568762368
+  ],
+  "path": [
+   30670848,
+   31309824
+  ],
+  "expected_leaf": 31309824,
+  "children_in_root": 28
+ }
+}

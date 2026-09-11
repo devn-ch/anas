@@ -418,6 +418,17 @@ export {
   SnapshotTarget,
 } from './schemas/schedules.js'
 
+// Self-heal repair engine schemas (story selfheal.5)
+export {
+  SelfhealDiagnostics,
+  SelfhealMapping,
+  SelfhealOutcome,
+  SelfhealOutcomeKind,
+  SelfhealReconstruction,
+  SelfhealStep,
+  SelfhealStepName,
+} from './schemas/selfheal.js'
+
 // Share schemas (SMB + NFS)
 export {
   CreateNfsExportRequest,

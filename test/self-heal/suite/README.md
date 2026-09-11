@@ -28,14 +28,21 @@ From the dev box:
 ```sh
 test/self-heal/suite/run-suite.sh                 # NODE=root@192.168.200.50
 NODE=root@someother test/self-heal/suite/run-suite.sh
+
+# the ANAS repair engine (selfheal.5), deployed by test/stunt-node/deploy-anas.sh
+REPAIR_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-repair.js" \
+REPORT_NAME=LAST-RUN-engine.md test/self-heal/suite/run-suite.sh
 ```
 
 `run-suite.sh` rsyncs this directory (+ `../gt/lib.sh` and `../gt/00-rig.sh`)
 to `/root/gtsh/` on the node, runs `python3 /root/gtsh/suite/suite.py` there
 over ssh, pulls `report.md`/`report.json` back into `out/`, and copies the
-report to `LAST-RUN.md` (the committed record of the last full run). Exit code
-is the suite's. (This dev-box-entry shape is the story's chosen convention:
-run from the dev box, everything else happens on the node.)
+report to `LAST-RUN.md` (the committed record of the last full run) — or to
+`REPORT_NAME` when one is given, so a run with a different `REPAIR_CMD` does not
+overwrite the reference implementation's record. Exit code is the suite's.
+(This dev-box-entry shape is the story's chosen convention: run from the dev
+box, everything else happens on the node.) `REPAIR_CMD` is exported across the
+ssh boundary explicitly — ssh carries no environment of its own.
 
 Requires on the node: python3, mdadm, lvm2, btrfs-progs, ~5 GB free under
 `/root`, and 7 loop devices.
@@ -64,6 +71,32 @@ Optional env the suite sets:
 A custom `REPAIR_CMD` only needs to honor the three-argument invocation and
 the exit codes; the injected-failure and report envs are honored by the
 reference implementation and checked when present.
+
+## Implementations that have passed
+
+| REPAIR_CMD | report | result |
+|---|---|---|
+| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 28/28 cases, 9/9 controls |
+| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 28/28 cases, 9/9 controls |
+
+The engine covers everything the reference does and adds the RAID6 Q-syndrome
+reconstruction as a fallback when the P-based XOR fails arbitration (a stripe
+whose P member is damaged too), plus RAID1 bands, which this suite has no case
+for. It has one step the reference does not — `gates`, ahead of `pin` — so
+`REPAIR_FAIL_AT=gates` is accepted by it and meaningless to the reference;
+case 4 injects into the eleven steps both share.
+
+Two differences the suite cannot see, both about scale and layout rather than
+correctness on a rig:
+
+- the engine never DUMPS a btrfs tree. The reference's `dump_tree(dev, 7)` is
+  fine on a 1 GB rig and impossible on a real pool (8 TB of data carries ~8 GB
+  of checksums); the engine reads tree roots from `dump-tree -r` and then walks
+  one 16 KiB node at a time with `dump-tree -b`, descending by key.
+- on an AHR pool in the §12 layout the engine pins through `@snapshots` and the
+  pool's on-demand top-level mount, exactly as a backup run does. These rigs are
+  FLAT filesystems with no `@snapshots`, so they exercise the in-place fallback
+  — the §12 branch is covered by unit tests, not here.
 
 ## What the reference repair does NOT cover
 

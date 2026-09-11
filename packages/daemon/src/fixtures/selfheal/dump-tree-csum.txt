@@ -1,0 +1,31 @@
+btrfs-progs v6.14
+checksum tree key (CSUM_TREE ROOT_ITEM 0) 
+leaf 30834688 items 11 free space 7688 generation 10 owner CSUM_TREE
+leaf 30834688 flags 0x1(WRITTEN) backref revision 1
+fs uuid 442a5183-8298-4fab-9135-e79d36e891b7
+chunk uuid b73f5b86-3b4c-4437-9977-435692c1139b
+	item 0 key (EXTENT_CSUM EXTENT_CSUM 13631488) itemoff 8091 itemsize 8192
+		range start 13631488 end 22020096 length 8388608
+	item 1 key (EXTENT_CSUM EXTENT_CSUM 82378752) itemoff 8079 itemsize 12
+		range start 82378752 end 82391040 length 12288
+	item 2 key (EXTENT_CSUM EXTENT_CSUM 82391040) itemoff 8051 itemsize 28
+		range start 82391040 end 82419712 length 28672
+	item 3 key (EXTENT_CSUM EXTENT_CSUM 82419712) itemoff 8043 itemsize 8
+		range start 82419712 end 82427904 length 8192
+	item 4 key (EXTENT_CSUM EXTENT_CSUM 82427904) itemoff 8035 itemsize 8
+		range start 82427904 end 82436096 length 8192
+	item 5 key (EXTENT_CSUM EXTENT_CSUM 82436096) itemoff 8023 itemsize 12
+		range start 82436096 end 82448384 length 12288
+	item 6 key (EXTENT_CSUM EXTENT_CSUM 82448384) itemoff 8015 itemsize 8
+		range start 82448384 end 82456576 length 8192
+	item 7 key (EXTENT_CSUM EXTENT_CSUM 82456576) itemoff 8011 itemsize 4
+		range start 82456576 end 82460672 length 4096
+	item 8 key (EXTENT_CSUM EXTENT_CSUM 82460672) itemoff 7991 itemsize 20
+		range start 82460672 end 82481152 length 20480
+	item 9 key (EXTENT_CSUM EXTENT_CSUM 82481152) itemoff 7971 itemsize 20
+		range start 82481152 end 82501632 length 20480
+	item 10 key (EXTENT_CSUM EXTENT_CSUM 82501632) itemoff 7963 itemsize 8
+		range start 82501632 end 82509824 length 8192
+total bytes 1040187392
+bytes used 8683520
+uuid 442a5183-8298-4fab-9135-e79d36e891b7

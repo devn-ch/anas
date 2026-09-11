@@ -369,6 +369,43 @@ Consequence for the repair sequence: never rely on cache residency between a
 pre-check and the write — `rmw_level=0` for the write window, as designed.
 The suite's parity-trap negative control is cache-cold by construction.
 
+## GT-15 — md's RAID6 Q syndrome convention — PROVEN (engine probe, three stripes)
+
+Q is `Σ gᵈ · Dᵈ` over GF(2^8) with the primitive polynomial x⁸+x⁴+x³+x²+1
+(**0x11D**, not AES's 0x11B) and generator g = 2, where *d* is the data disk's
+position in md's stripe order counting from the first disk **after Q** — the same
+index the left-symmetric placement formula produces. Verified on a fresh RAID6
+loop rig (7 members, chunk 64 K, left-symmetric, `--assume-clean`): P and Q
+computed from the member blocks matched the array's own P and Q members
+byte-for-byte on stripes 49, 58 and 63, and the Q-only reconstruction of a data
+member (`D_f = g^(−f) · (Q ⊕ Σ_{i≠f} gⁱ·Dᵢ)`, P never consulted) reproduced that
+member exactly in all three. GT-12 proves Q reconstruction works *through md*;
+this is the arithmetic itself, which a userspace reconstruction needs when the P
+member of a stripe is damaged too. (`selfheal.5`, `selfheal-repair.ts`.)
+
+## GT-16 — RAID1 arrays do not have the RAID5/6 knobs at all — PROVEN
+
+On a 2 × 64 MiB RAID1 loop array (kernel 7.0.14-12-pve), `rmw_level` and
+`stripe_cache_size` are **absent** from `/sys/block/mdN/md/` — not zero, not
+present-and-ignored. `chunk_size` reads 0 and `layout` reads 0 while meaning
+nothing by it (0 is `left-asymmetric` on RAID5/6, so decoding it as a parity
+layout would wrongly refuse the array). `sync_min=128` / `sync_max=256` are
+accepted: md's "sync_max must be a multiple of the chunk" rule only applies when
+`chunk_sectors` is non-zero. Any code that reads those four attributes
+unconditionally breaks on an AHR RAID1 band. (`selfheal.5` fixture
+`fixtures/selfheal/`.)
+
+## GT-17 — `array_state` is `clean` or `active` on a healthy array — PROVEN
+
+The freshly built RAID6 rig reported `array_state=clean` and the RAID5 rig, after
+marker writes, reported `active`. Both are healthy and writable — `active` only
+means the array has dirty stripes. A gate that demands the literal string `clean`
+refuses a perfectly writable array; the states that actually bar a write are
+`inactive`, `clear`, `readonly`, `read-auto`, `suspended` and `broken`. Adjacent:
+`mdadm --detail --export` emits `MD_DEVICE_<name>_ROLE` / `_DEV` pairs — genuine
+structured output for the role → device map, so nothing parses `--detail`'s
+prose table.
+
 ---
 
 ## Drill notes (factual, no recommendations)

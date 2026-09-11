@@ -11,6 +11,9 @@ export default antfu({
     'docs/**',
     // Captured command output — verbatim fixtures, never reformat
     'packages/daemon/src/fixtures/**/*.json',
+    // Self-heal suite run artifacts pulled back from the node (gitignored, and
+    // written by the suite — running it must not turn the lint red)
+    'test/self-heal/suite/out/**',
     'tests/integration/fixtures/**',
     'playwright-report/**',
     // PVE web-UI injection scripts: plain ES5 that must match Proxmox's

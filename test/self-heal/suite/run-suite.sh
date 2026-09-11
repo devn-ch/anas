@@ -22,7 +22,16 @@ rsync -a --delete --exclude out/ --exclude LAST-RUN.md \
 rsync -a "$GTDIR/lib.sh" "$GTDIR/00-rig.sh" "$NODE:/root/gtsh/"
 
 set +e
-ssh "$NODE" "python3 /root/gtsh/suite/suite.py"
+# REPAIR_CMD has to cross the ssh boundary explicitly — ssh carries no
+# environment of its own, and the README has always said this script passes it
+# through (selfheal.5: it did not, so an alternative repair could only be run by
+# hand on the node). Quoted so a multi-word command (`node /opt/…/x.js`) stays
+# one value.
+if [ -n "${REPAIR_CMD:-}" ]; then
+    ssh "$NODE" "REPAIR_CMD=$(printf '%q' "$REPAIR_CMD") python3 /root/gtsh/suite/suite.py"
+else
+    ssh "$NODE" "python3 /root/gtsh/suite/suite.py"
+fi
 RC=$?
 set -e
 
@@ -30,6 +39,12 @@ rsync -a "$NODE:/root/gtsh/suite-out/report.md" "$NODE:/root/gtsh/suite-out/repo
     "$HERE/out/" 2>/dev/null || true
 mkdir -p "$HERE/out"
 if [ -f "$HERE/out/report.md" ]; then
-    cp "$HERE/out/report.md" "$HERE/LAST-RUN.md"
+    # LAST-RUN.md is the reference implementation's record; a run with another
+    # REPAIR_CMD gets its own file so neither overwrites the other.
+    if [ -n "${REPORT_NAME:-}" ]; then
+        cp "$HERE/out/report.md" "$HERE/$REPORT_NAME"
+    else
+        cp "$HERE/out/report.md" "$HERE/LAST-RUN.md"
+    fi
 fi
 exit "$RC"
