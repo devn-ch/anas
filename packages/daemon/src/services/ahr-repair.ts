@@ -53,6 +53,22 @@ const ABOVE_MD_SENTENCE = 'parity already agreed with the bad data — this impl
 /** Unrepairable wording — there is one action left, and it is not another repair. */
 const UNREPAIRABLE_SENTENCE = 'restore this file from backup'
 
+/**
+ * Mapping-abort wording (selfheal.7 live proof, F2).
+ *
+ * A `mapping-abort` counts in the `unrepairable` bucket — that is the
+ * selfheal.6 contract, and it is right: the block was not repaired. But it
+ * means the OPPOSITE of the other members of that bucket. The bytes at the
+ * computed member location still pass the checksum btrfs stored for them, so
+ * there is nothing wrong with the block and nothing was written. Telling the
+ * operator to restore that file from backup is advice to overwrite good data,
+ * so the tail says what actually happened instead.
+ */
+const MAPPING_ABORT_SENTENCE = 'Blocks reported "not corrupt here" were left alone: the bytes on '
+  + 'the member still pass their stored checksum, so there was nothing to reconstruct — either '
+  + 'the block was already repaired or the finding no longer describes it. Nothing was written, '
+  + 'and they need no restore.'
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -80,8 +96,18 @@ function repairBody(pool: string, result: AhrRepairResult): string {
   if (result.files.length > NOTIFY_FILE_LIMIT)
     lines.push(`  …and ${result.files.length - NOTIFY_FILE_LIMIT} more`)
   const tail: string[] = []
-  if (result.unrepairable > 0)
+  // The `unrepairable` bucket holds two different answers. Count the
+  // mapping-aborts so each gets its own sentence and neither is given the
+  // other's advice (F2): "restore from backup" is only for blocks that really
+  // have no source of truth left.
+  const aborted = result.files.reduce(
+    (n, f) => n + f.blocks.filter(b => b.outcome === 'mapping-abort').length,
+    0,
+  )
+  if (result.unrepairable - aborted > 0)
     tail.push(`Unrepairable blocks have no source of truth left below the checksum tree — ${UNREPAIRABLE_SENTENCE}.`)
+  if (aborted > 0)
+    tail.push(MAPPING_ABORT_SENTENCE)
   if (result.aboveMd > 0)
     tail.push(`Blocks diagnosed above md were not written: ${ABOVE_MD_SENTENCE}.`)
   return [`${head}\n\nFiles:\n${lines.join('\n')}`, ...tail].join('\n\n')

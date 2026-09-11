@@ -209,6 +209,48 @@ describe('AHR repair job — the one notification', () => {
     assert.doesNotMatch(notify.body, /proves|definitely/)
   })
 
+  it('a mapping-abort is never told to restore from backup — it means the block is FINE (selfheal.7 F2)', async () => {
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1, 2] }],
+      () => {},
+      { repair: async (_e, req) => outcome(req.file, req.block, 'mapping-abort', 'not corrupt here') },
+    )
+    const notify = notification(exec)!
+    // Still a warning and still counted as unrepairable — nothing was repaired.
+    assert.equal(notify.severity, 'warning')
+    assert.match(notify.body, /0 repaired, 2 unrepairable, 0 above md/)
+    assert.match(notify.body, /\/a\.bin — 2 mapping-abort/)
+    // But the advice is the opposite of "restore from backup".
+    assert.doesNotMatch(notify.body, /restore this file from backup/)
+    assert.match(notify.body, /still pass their stored checksum/)
+    assert.match(notify.body, /they need no restore/)
+  })
+
+  it('a mix keeps each sentence with the blocks it belongs to (selfheal.7 F2)', async () => {
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1] }, { path: '/b.bin', blocks: [2] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(
+          req.file,
+          req.block,
+          req.file === '/a.bin' ? 'unrepairable' : 'mapping-abort',
+          'because',
+        ),
+      },
+    )
+    const notify = notification(exec)!
+    assert.match(notify.body, /0 repaired, 2 unrepairable, 0 above md/)
+    assert.match(notify.body, /restore this file from backup/)
+    assert.match(notify.body, /they need no restore/)
+  })
+
   it('caps the file list at 20 and says how many more', async () => {
     const exec = executor()
     const files = Array.from({ length: 23 }, (_, i) => ({ path: `/f${i}.bin`, blocks: [1] }))
