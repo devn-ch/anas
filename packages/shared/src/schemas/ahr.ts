@@ -564,3 +564,102 @@ export const AhrCreateSnapshotRequest = z.object({
   name: AhrSnapshotName.optional(),
 })
 export type AhrCreateSnapshotRequest = z.infer<typeof AhrCreateSnapshotRequest>
+
+// ---- Scrub result (story selfheal.3, §4) ------------------------------------
+
+/**
+ * One 64 KiB btrfs stripe the kernel named in a scrub warning (GT-3).
+ *
+ * `logical` is the filesystem-logical bytenr the kernel printed; `offset` is
+ * the byte offset WITHIN the file, which kernel 7.0 reports 64 KiB-aligned —
+ * it names the stripe, not the failing 4 KiB block. `length` is the length the
+ * kernel printed for the error (4096 on the drill), kept verbatim rather than
+ * rounded up to the stripe it actually covers.
+ */
+export const AhrScrubStripe = z.object({
+  logical: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  length: z.number().int().nonnegative(),
+})
+export type AhrScrubStripe = z.infer<typeof AhrScrubStripe>
+
+/**
+ * One corrupt file an AHR scrub attributed — the answer to "WHAT is corrupt",
+ * which `Error summary: csum=2` never gives (story selfheal.3).
+ *
+ * `path` is the full path on the node: `<mountpoint>/<subvolume>/<kernel path>`.
+ * The kernel prints a subvolume-relative path plus a numeric `root`, so the
+ * subvolume id is resolved (`btrfs inspect-internal subvolid-resolve`) and the
+ * resolved name kept in `subvolume` — null when it could not be resolved (the
+ * subvolume was deleted since the scrub), in which case `path` is the raw
+ * subvolume-relative one the kernel printed and `missing` is true.
+ *
+ * `badBlocks` are 4 KiB FILE block indexes (offset/4096), found by reading each
+ * of the 16 blocks inside a named stripe with O_DIRECT — the kernel names the
+ * stripe but not the block (GT-3), so the block is evidence ANAS gathered, not
+ * something the kernel said. An empty array means no block inside the named
+ * stripe read back with an error: the file was repaired, rewritten or removed
+ * between the scrub and the probe — never assumed to be a lie about the stripe.
+ */
+export const AhrScrubFinding = z.object({
+  path: z.string(),
+  /** The resolved subvolume (`@data`), or null when the id no longer resolves. */
+  subvolume: z.string().nullable(),
+  inode: z.number().int().nonnegative(),
+  /** Every stripe the kernel named for this file, in the order it named them. */
+  stripes: z.array(AhrScrubStripe),
+  /** 4 KiB file block indexes that read back with an error. */
+  badBlocks: z.array(z.number().int().nonnegative()),
+  /**
+   * The path does not exist any more (deleted between the scrub and the probe,
+   * or an unresolvable subvolume). The finding is still reported — the kernel
+   * saw the error — but no blocks were probed.
+   */
+  missing: z.boolean().optional(),
+  /**
+   * The file is OUTSIDE the pool's mounted tree. A scrub covers the whole
+   * filesystem, and an AHR pool in the §12 layout mounts `@data` while
+   * `@snapshots` sits beside it — so a corrupt block in a snapshot is a real,
+   * expected finding with no path under the mountpoint. `path` is then
+   * filesystem-relative (`@snapshots/<name>/…`) and nothing was probed: it is
+   * reachable only through a top-level mount the scrub job does not take.
+   * Distinct from `missing`, which means the file is gone.
+   */
+  outsideMount: z.boolean().optional(),
+})
+export type AhrScrubFinding = z.infer<typeof AhrScrubFinding>
+
+/**
+ * The result of an AHR scrub job (POST /v1/ahr/:name/scrub).
+ *
+ * Everything past `checkedArrays` is story selfheal.3 and OPTIONAL: a result
+ * from an older daemon (or a clean scrub, which attributes nothing) parses
+ * unchanged, and the UI renders the verdict it always rendered.
+ *
+ * The honesty pair is `errorsReported` vs `errorsAttributed`. The kernel's
+ * scrub warnings are rate-limited, so under many errors the journal carries
+ * FEWER lines than the scrub's own `Error summary` counted. ANAS reports both
+ * numbers rather than presenting the attributed list as the whole story.
+ */
+export const AhrScrubResult = z.object({
+  scrubbed: PoolName,
+  /** btrfs `Error summary:` line when errors were found, else null (raw, verbatim). */
+  btrfsErrors: z.string().nullable(),
+  /** Number of md arrays checked. */
+  checkedArrays: z.number().int().nonnegative(),
+  /** The corrupt files, grouped per file, capped at the first 200 (see `truncated`). */
+  findings: z.array(AhrScrubFinding).optional(),
+  /** Total errors the btrfs scrub summary counted (the sum of its `key=N` counters). */
+  errorsReported: z.number().int().nonnegative().optional(),
+  /** Kernel warnings that named a path — what the findings above are built from. */
+  errorsAttributed: z.number().int().nonnegative().optional(),
+  /**
+   * Kernel scrub errors with NO path: read/IO errors, super-block errors, and
+   * metadata whose owner the kernel could not name. Counted, never attributed;
+   * the raw evidence stays in `btrfsErrors`.
+   */
+  unattributed: z.number().int().nonnegative().optional(),
+  /** True when more files were attributed than the 200 the list carries. */
+  truncated: z.boolean().optional(),
+})
+export type AhrScrubResult = z.infer<typeof AhrScrubResult>

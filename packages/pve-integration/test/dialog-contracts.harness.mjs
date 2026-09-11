@@ -6965,6 +6965,217 @@ async function taskDoorOnDoneCheck() {
   }
 }
 
+// ============================================================================
+//  Scrubs: the AHR scrub's FINDINGS reach the row (story selfheal.3)
+// ============================================================================
+//
+// A real scrub runs for hours — the Run now that started it stopped polling
+// long before it finished — so the findings have to be recoverable afterwards.
+// They are, from the daemon's own completed-job list, filtered in the view. The
+// checks below hold that contract: both reads happen, the newest job per pool
+// wins, everything that is not a completed AHR scrub WITH findings is ignored,
+// the indicator is the one door to the one window, and a jobs list that cannot
+// be read costs the indicator and nothing else.
+
+const SCRUB_STATES = {
+  data: [
+    { target: { kind: 'zfs', pool: 'tank' }, enabled: true, cadence: 'monthly', mechanism: 'org.debian:periodic-scrub', lastScrub: null, running: null },
+    { target: { kind: 'ahr', pool: 'ahr0' }, enabled: false, cadence: 'monthly', mechanism: 'mdcheck timers', note: 'node-global', lastScrub: null, running: null },
+    { target: { kind: 'ahr', pool: 'ahr1' }, enabled: false, cadence: 'monthly', mechanism: 'mdcheck timers', note: 'node-global', lastScrub: null, running: null },
+  ],
+}
+
+const FINDING_A = {
+  path: '/mnt/anas-ahr/ahr0/@data/movies/a very long name.mkv',
+  subvolume: '@data',
+  inode: 257,
+  stripes: [{ logical: 14811136, offset: 1179648, length: 4096 }],
+  badBlocks: [300],
+}
+const FINDING_B = {
+  path: '/mnt/anas-ahr/ahr0/gone.bin',
+  subvolume: '@data',
+  inode: 258,
+  stripes: [{ logical: 19005440, offset: 1179648, length: 4096 }],
+  badBlocks: [],
+  missing: true,
+}
+// A scrub covers the WHOLE filesystem, so a corrupt block inside a snapshot is
+// a real finding with no path under the mountpoint — said as such, never as
+// "deleted" and never as "0 bad blocks".
+const FINDING_C = {
+  path: '@snapshots/nightly/movies/a very long name.mkv',
+  subvolume: '@snapshots/nightly',
+  inode: 601,
+  stripes: [{ logical: 22000000, offset: 65536, length: 4096 }],
+  badBlocks: [],
+  outsideMount: true,
+}
+
+function scrubJob(over) {
+  return {
+    id: over.id,
+    status: 'completed',
+    operation: 'ahr.scrub',
+    progress: null,
+    createdAt: over.at,
+    createdBy: 'harness',
+    startedAt: over.at,
+    completedAt: over.at,
+    result: over.result,
+    error: null,
+    ...over.extra,
+  }
+}
+
+const SCRUB_JOBS = {
+  data: [
+    // The NEWEST job for ahr0 is not last in the list — the view must order by
+    // time, not by position.
+    scrubJob({
+      id: 'j2',
+      at: '2026-09-11T09:00:00.000Z',
+      result: { scrubbed: 'ahr0', btrfsErrors: 'csum=3', checkedArrays: 3, findings: [FINDING_A, FINDING_B, FINDING_C], errorsReported: 3, errorsAttributed: 3, unattributed: 0, truncated: false },
+    }),
+    scrubJob({
+      id: 'j1',
+      at: '2026-09-10T09:00:00.000Z',
+      result: { scrubbed: 'ahr0', btrfsErrors: 'csum=9', checkedArrays: 3, findings: [FINDING_A], errorsReported: 9, errorsAttributed: 1, unattributed: 0, truncated: false },
+    }),
+    // A FAILED scrub that still carries findings — never the row's answer.
+    scrubJob({
+      id: 'j3',
+      at: '2026-09-11T10:00:00.000Z',
+      result: { scrubbed: 'ahr0', btrfsErrors: 'csum=3', checkedArrays: 3, findings: [FINDING_A] },
+      extra: { status: 'failed' },
+    }),
+    // Another operation whose result happens to look similar.
+    scrubJob({
+      id: 'j4',
+      at: '2026-09-11T11:00:00.000Z',
+      result: { scrubbed: 'ahr0', findings: [FINDING_A] },
+      extra: { operation: 'ahr.create' },
+    }),
+    // ahr1's last scrub was CLEAN — an empty findings list is not a finding.
+    scrubJob({
+      id: 'j5',
+      at: '2026-09-11T09:30:00.000Z',
+      result: { scrubbed: 'ahr1', btrfsErrors: null, checkedArrays: 2, findings: [] },
+    }),
+  ],
+}
+
+const SCRUB_ROUTES = {
+  'GET /scrub': SCRUB_STATES,
+  'GET /jobs': SCRUB_JOBS,
+}
+
+function scrubCell(grid, rec) {
+  const col = (grid.columns || []).find(c => c.dataIndex === 'lastScrub')
+  return col && col.renderer ? col.renderer(rec.get('lastScrub'), {}, rec) : ''
+}
+
+function rowFor(grid, pool) {
+  const idx = grid.getStore().findExact('pool', pool)
+  return idx >= 0 ? grid.getStore().getAt(idx) : null
+}
+
+/** A click that landed ON the findings link, and one that did not. */
+const onLink = { getTarget: sel => (sel === '.anas-scrub-findings-link' ? { dom: true } : null) }
+const offLink = { getTarget: () => null }
+
+async function scrubFindingsChecks() {
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], SCRUB_ROUTES)
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  ok('scrubs: the grid exists', !!grid)
+  if (!grid) { return }
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  // --- The two reads ---------------------------------------------------------
+  ok('scrubs: reads the uniform scrub state', apiGets.includes('/scrub'))
+  ok('scrubs: reads the daemon\'s COMPLETED jobs for the findings (no new endpoint)',
+    apiGets.includes('/jobs?status=completed'))
+
+  // --- The indicator ---------------------------------------------------------
+  const ahr0 = rowFor(grid, 'ahr0')
+  const ahr1 = rowFor(grid, 'ahr1')
+  const tank = rowFor(grid, 'tank')
+  ok('scrubs: every pool is a row', !!ahr0 && !!ahr1 && !!tank)
+  if (!ahr0 || !ahr1 || !tank) { return }
+
+  const found = ahr0.get('findings')
+  ok('scrubs: the AHR row carries its last scrub\'s findings', !!found)
+  eq('scrubs: the NEWEST completed scrub wins', found && found.result.btrfsErrors, 'csum=3')
+  eq('scrubs: …with all of its files', found && found.result.findings.length, 3)
+  eq('scrubs: a CLEAN last scrub is not a finding', ahr1.get('findings'), null)
+  eq('scrubs: a ZFS row never carries AHR findings', tank.get('findings'), null)
+
+  const cell = scrubCell(grid, ahr0)
+  ok('scrubs: the row says how many files, labelled', /3 files with checksum errors/.test(cell), cell)
+  ok('scrubs: …and says the list is only what the daemon still holds',
+    /last completed scrub since the daemon started/.test(cell), cell)
+  ok('scrubs: the indicator is the door (carries the link class)',
+    /anas-scrub-findings-link/.test(cell), cell)
+  const cleanCell = scrubCell(grid, ahr1)
+  ok('scrubs: an AHR row with nothing found keeps the md-keeps-no-record line',
+    /md keeps no completion record/.test(cleanCell) && !/anas-scrub-findings-link/.test(cleanCell), cleanCell)
+
+  // A pass in flight still OUTRANKS the findings: it is what is true now.
+  ahr0.set('running', { percent: 12.5 })
+  ok('scrubs: a running pass outranks the findings cell',
+    !/anas-scrub-findings-link/.test(scrubCell(grid, ahr0)))
+  ahr0.set('running', null)
+
+  // --- The one window --------------------------------------------------------
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, ahr0, null, 0, offLink)
+  await settle()
+  eq('scrubs: a click OFF the indicator opens nothing', created.windows.length, 0)
+
+  grid.fireEvent('itemclick', grid, tank, null, 0, onLink)
+  await settle()
+  eq('scrubs: a row with no findings opens nothing', created.windows.length, 0)
+
+  grid.fireEvent('itemclick', grid, ahr0, null, 0, onLink)
+  await settle()
+  const win = openWindow()
+  ok('scrubs: the indicator opens the findings window', !!win && win.cls === 'anas-win-scrub-findings')
+  if (!win) { return }
+  const fGrid = findCmp(win, 'anas-grid-scrub-findings')
+  ok('scrubs: the window lists the files', !!fGrid)
+  if (!fGrid) { return }
+  eq('scrubs: one row per finding', fGrid.store.getCount(), 3)
+  eq('scrubs: the path is carried in FULL (never truncated)',
+    fGrid.store.getAt(0).get('path'), FINDING_A.path)
+  eq('scrubs: the bad-block count rides the row', fGrid.store.getAt(0).get('blocks'), 1)
+  ok('scrubs: a deleted file is marked missing, not 0 bad blocks',
+    fGrid.store.getAt(1).get('missing') === true)
+  // The three-way cell: a count, "deleted", and "in a snapshot" — never a 0
+  // that would read as "nothing wrong with it".
+  const blocksCol = (fGrid.columns || []).find(c => c.dataIndex === 'blocks')
+  const cellFor = i => blocksCol.renderer(null, {}, fGrid.store.getAt(i))
+  ok('scrubs: a probed file shows its bad-block count', /1/.test(cellFor(0)), cellFor(0))
+  ok('scrubs: a deleted file says so', /deleted since the scrub/.test(cellFor(1)), cellFor(1))
+  ok('scrubs: a snapshot finding says it is outside the mounted tree',
+    /in a snapshot, outside the mounted tree/.test(cellFor(2)), cellFor(2))
+  eq('scrubs: …and carries its filesystem-relative path in full',
+    fGrid.store.getAt(2).get('path'), FINDING_C.path)
+  const head = (win.items.getAt(0) || {}).html || ''
+  ok('scrubs: the window states reported vs attributed', /3 of 3 reported/.test(head), head)
+
+  // --- Fail-open -------------------------------------------------------------
+  const NO_JOBS = { 'GET /scrub': SCRUB_STATES }
+  const ANAS2 = loadSource(['69-schedules-common.js', '69-scrubs.js'], NO_JOBS)
+  const view2 = makeComponent(ANAS2.views.scrubs.factory('harness'), null)
+  const grid2 = view2.down('#scrubGrid')
+  view2.fireEvent('afterrender', view2)
+  await settle()
+  eq('scrubs: an unreadable job list still renders every row', grid2.getStore().getCount(), 3)
+  eq('scrubs: …and simply has no findings to show', rowFor(grid2, 'ahr0').get('findings'), null)
+}
+
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
@@ -7059,6 +7270,11 @@ await restoreRepoNamespacePrefillCheck()
 warnings.length = 0
 created.windows.length = 0
 await taskDoorOnDoneCheck()
+warnings.length = 0
+created.windows.length = 0
+// Story selfheal.3 — the AHR scrub's findings on the Scrubs row, and the one
+// window they open.
+await scrubFindingsChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

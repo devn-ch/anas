@@ -42,6 +42,7 @@
  *   PUT  /scrub/ahr/:pool  {enabled}  → flip the node's mdcheck timers (node-global)
  *   POST /pools/:pool/scrub {action}  → start/stop a ZFS scrub (Epic 4.12's route)
  *   POST /ahr/:pool/scrub   {}        → AHR scrub job (Epic 11's route; no stop)
+ *   GET  /jobs?status=completed       → the last AHR scrub's findings (selfheal.3)
  *
  * `running` is OPTIONAL on the wire: an older daemon omits it and every row then
  * renders exactly the verdict-only cell it renders today (additive-field skew rule).
@@ -50,9 +51,26 @@
  * fs-tag chip, the state pills, and the visibility-gated poll loop — one place so
  * the two views read identically and never drift.
  *
+ * SELFHEAL.3 — a finished AHR scrub names WHAT is corrupt. The daemon attributes
+ * each kernel scrub warning to a file and probes the named 64 KiB stripe for the
+ * exact failing 4 KiB blocks; the findings ride the scrub job's RESULT. A real
+ * scrub runs for hours, well past the job-poll budget of the Run now that
+ * started it, so the row finds them again through the daemon's own completed-job
+ * list (`GET /jobs?status=completed`, filtered here — no new endpoint): the Last
+ * scrub cell of an AHR pool whose last completed scrub found something says so
+ * and opens the findings window. ONE door, ONE window — no second surface.
+ *
+ * FOURTH VISIBLE DIVERGENCE — that job list is IN MEMORY. It holds what has run
+ * since anasd started and nothing older, and ANAS keeps no scrub history of its
+ * own (stateless — no shadow state, nothing persisted), so the cell says "last
+ * completed scrub since the daemon started" in those words rather than implying
+ * a record the system does not keep. The PVE warning notification carries the
+ * same paths and is what survives a restart.
+ *
  * Test hooks: view cls 'anas-view anas-view-scrubs', grid cls 'anas-grid-scrub',
  * scrub toggle 'anas-btn-scrub-toggle', run 'anas-btn-scrub-run', stop
- * 'anas-btn-scrub-stop'.
+ * 'anas-btn-scrub-stop', findings window 'anas-win-scrub-findings' with grid
+ * 'anas-grid-scrub-findings'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  * Fail-open everywhere: a broken view renders an error panel, never breaks PVE.
@@ -134,12 +152,13 @@
 
     // ---- Row shape + renderers ---------------------------------------------
 
-    function scrubRow(state) {
+    function scrubRow(state, findingsByPool) {
         state = state || {};
         var target = state.target || {};
+        var kind = target.kind || 'zfs';
         return {
             pool: target.pool,
-            kind: target.kind || 'zfs',
+            kind: kind,
             enabled: !!state.enabled,
             cadence: state.cadence || 'monthly',
             mechanism: state.mechanism || '',
@@ -150,9 +169,53 @@
             // The pass running RIGHT NOW, or null when the pool is idle (and
             // always null against a daemon too old to report it).
             running: state.running || null,
+            // The findings of this pool's last COMPLETED AHR scrub job, when the
+            // daemon still holds one (selfheal.3). Null for ZFS, and null for an
+            // AHR pool whose last scrub found nothing or has aged out.
+            findings: (kind === 'ahr' && findingsByPool) ? (findingsByPool[target.pool] || null) : null,
             // A stable per-row key (kind+pool) so selection survives a poll.
-            rowKey: (target.kind || 'zfs') + ':' + (target.pool || '')
+            rowKey: kind + ':' + (target.pool || '')
         };
+    }
+
+    // ---- Findings from the daemon's own job list (selfheal.3) ---------------
+    //
+    // A real scrub runs for hours — far past the job-poll budget of the Run now
+    // that started it — so the findings have to be found again later. They are:
+    // the AHR scrub job carries them in its RESULT, and the daemon already
+    // exposes `GET /v1/jobs?status=completed`. The filtering (operation, pool,
+    // has-findings, newest-per-pool) is done here rather than asking the route
+    // for a filter it does not have.
+    //
+    // The job queue is IN MEMORY: it holds what has run since anasd started and
+    // nothing older, and ANAS keeps no scrub history of its own (stateless — no
+    // shadow state). So the row says exactly that and never implies a record
+    // the system does not keep.
+    function jobTime(job) {
+        var t = Date.parse(job.completedAt || job.startedAt || job.createdAt || '');
+        return isFinite(t) ? t : 0;
+    }
+
+    function latestScrubFindings(res) {
+        var byPool = {};
+        var list = (res && res.data) || [];
+        for (var i = 0; i < list.length; i++) {
+            var job = list[i] || {};
+            if (job.operation !== 'ahr.scrub' || job.status !== 'completed') {
+                continue;
+            }
+            var result = job.result;
+            var findings = result && result.findings;
+            var pool = result && result.scrubbed;
+            if (!pool || !findings || !findings.length) {
+                continue;
+            }
+            var prior = byPool[pool];
+            if (!prior || jobTime(job) >= prior.at) {
+                byPool[pool] = { at: jobTime(job), result: result };
+            }
+        }
+        return byPool;
     }
 
     // Pool: the shared fs-tag chip ("zfs"/"ahr") + the full pool name — reads
@@ -241,6 +304,24 @@
             return renderRunning(running, rec.get('kind'));
         }
 
+        // An AHR scrub that FOUND something outranks the "md keeps no record"
+        // line: it is the one thing on this row an operator has to act on, and
+        // it is the door to the file list (selfheal.3). The md caveat and the
+        // in-memory scope both ride the tooltip rather than a second cell.
+        var findings = rec.get('findings');
+        if (findings) {
+            var files = (findings.result.findings || []).length;
+            return '<span class="anas-scrub-findings-link" style="color:var(--anas-warn,#b06a12);'
+                + 'cursor:pointer;text-decoration:underline;" title="'
+                + enc(t('the last AHR scrub that completed since the daemon started found checksum errors — '
+                    + 'click to see the files and their bad blocks. ANAS keeps no scrub history of its own, '
+                    + 'and md records no completion time or result for a check.')) + '">'
+                + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
+                + enc(files + ' ' + (files === 1 ? t('file with checksum errors') : t('files with checksum errors')))
+                + '</span> <span style="color:var(--anas-muted,gray);">'
+                + enc(t('— last completed scrub since the daemon started')) + '</span>';
+        }
+
         var last = rec.get('lastScrub');
         if (!last) {
             if (rec.get('kind') === 'ahr') {
@@ -313,17 +394,32 @@
         } catch (eS) {
             priorKey = null;
         }
-        ANAS.api.get(node, '/scrub').then(function (res) {
+        // Two reads, one render: the uniform scrub state, and the daemon's
+        // completed jobs for the last AHR scrub findings (selfheal.3). The jobs
+        // read is FAIL-OPEN — an older daemon, or a list that cannot be read,
+        // costs the indicator and nothing else.
+        var jobsRead = ANAS.api.get(node, '/jobs?status=completed').then(
+            function (r) { return r; },
+            function () { return null; }
+        );
+        Promise.all([ANAS.api.get(node, '/scrub'), jobsRead]).then(function (both) {
+            var res = both[0];
             if (scrubGrid.destroyed || scrubGrid.destroying) {
                 return;
             }
             if (!quiet) {
                 try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
             }
+            var findingsByPool = {};
+            try {
+                findingsByPool = latestScrubFindings(both[1]);
+            } catch (eJ) {
+                ANAS.warn('scrub findings read failed: ' + ANAS.errText(eJ));
+            }
             var list = (res && res.data) || [];
             var rows = [];
             for (var i = 0; i < list.length; i++) {
-                rows.push(scrubRow(list[i]));
+                rows.push(scrubRow(list[i], findingsByPool));
             }
             try {
                 scrubGrid.getStore().loadData(rows);
@@ -450,6 +546,159 @@
         doToggle();
     }
 
+    // ---- Scrub findings (story selfheal.3) ---------------------------------
+
+    // A finished AHR scrub says WHAT is corrupt, not just how many errors: the
+    // daemon attributes each kernel scrub warning to a file and reads the named
+    // 64 KiB stripe block by block to find the failing 4 KiB ones. Those
+    // findings ride the job result this screen ALREADY polls in runScrub, so
+    // this is the one and only place they are shown — no second surface, no new
+    // menu, and nothing at all when the scrub came back clean.
+    //
+    // Paths are never truncated. The line above the list carries the
+    // reported-vs-attributed counts, because the kernel rate-limits its scrub
+    // warnings: the attributed list is not always the whole story, and saying
+    // so is the point.
+    function findingsCounts(result, shown) {
+        var parts = [];
+        var attributed = Number(result.errorsAttributed);
+        var reported = Number(result.errorsReported);
+        if (isFinite(attributed) && isFinite(reported)) {
+            parts.push(attributed + ' ' + t('of') + ' ' + reported + ' ' + t('reported error(s) attributed to a file'));
+        }
+        var orphans = Number(result.unattributed);
+        if (isFinite(orphans) && orphans > 0) {
+            parts.push(orphans + ' ' + t('error(s) name no file (read/IO or metadata)'));
+        }
+        if (result.truncated) {
+            parts.push(t('only the first') + ' ' + shown + ' ' + t('files are listed'));
+        }
+        return parts.join(' · ');
+    }
+
+    function renderFindingPath(v, meta, rec) {
+        var title = t('inode') + ' ' + rec.get('inode')
+            + (rec.get('subvolume') ? (' · ' + t('subvolume') + ' ' + rec.get('subvolume')) : '');
+        meta.tdAttr = 'data-qtip="' + enc(title) + '"';
+        return '<span style="font-family:monospace;font-size:0.92em;">' + enc(rec.get('path')) + '</span>';
+    }
+
+    // The bad-block count, labelled by its column. Two findings have no count to
+    // give and say WHY instead of showing a 0: a file deleted between the scrub
+    // and the probe, and a file outside the pool's mounted tree — a scrub covers
+    // the whole filesystem, so a corrupt block inside a snapshot is a real
+    // finding with no path under the mountpoint to read.
+    function renderFindingBlocks(v, meta, rec) {
+        if (rec.get('outsideMount')) {
+            return '<span style="color:var(--anas-muted,gray);" title="'
+                + enc(t('the file is in a snapshot, beside the mounted subvolume — the scrub covers the '
+                    + 'whole filesystem, and ANAS did not mount the top level to read it')) + '">'
+                + enc(t('in a snapshot, outside the mounted tree')) + '</span>';
+        }
+        if (rec.get('missing')) {
+            return '<span style="color:var(--anas-muted,gray);" title="'
+                + enc(t('the path no longer exists — deleted since the scrub')) + '">'
+                + enc(t('deleted since the scrub')) + '</span>';
+        }
+        var n = Number(rec.get('blocks')) || 0;
+        var list = rec.get('blockList');
+        var tip = n
+            ? (t('failing 4 KiB file blocks') + ': ' + list)
+            : t('no block inside the reported stripe failed to read — the file was rewritten or repaired since the scrub');
+        meta.tdAttr = 'data-qtip="' + enc(tip) + '"';
+        return n
+            ? '<span style="color:var(--anas-warn,#b06a12);">' + n + '</span>'
+            : muted('0');
+    }
+
+    // The row's findings indicator is the door — a click anywhere ELSE on the
+    // row is a plain selection. One door, one window.
+    function onScrubItemClick(view, rec, item, index, e) {
+        var entry = rec ? rec.get('findings') : null;
+        if (!entry) {
+            return;
+        }
+        var onLink = true;
+        try {
+            if (e && typeof e.getTarget === 'function') {
+                onLink = !!e.getTarget('.anas-scrub-findings-link');
+            }
+        } catch (eT) {
+            onLink = true;
+        }
+        if (!onLink) {
+            return;
+        }
+        try {
+            showScrubFindings(rec.get('pool'), entry.result);
+        } catch (eW) {
+            ANAS.warn('scrub findings failed: ' + ANAS.errText(eW));
+        }
+    }
+
+    function showScrubFindings(pool, result) {
+        var findings = (result && result.findings) || [];
+        if (!findings.length) {
+            return false;
+        }
+        var rows = [];
+        for (var i = 0; i < findings.length; i++) {
+            var f = findings[i] || {};
+            var blocks = f.badBlocks || [];
+            rows.push({
+                path: f.path || '',
+                subvolume: f.subvolume || '',
+                inode: f.inode,
+                blocks: blocks.length,
+                blockList: blocks.join(', '),
+                stripes: (f.stripes || []).length,
+                missing: !!f.missing,
+                outsideMount: !!f.outsideMount
+            });
+        }
+
+        var win = Ext.create('Ext.window.Window', {
+            cls: 'anas-win-scrub-findings',
+            title: t('Scrub findings') + ' — ' + pool,
+            modal: true,
+            width: 720,
+            height: 420,
+            resizable: true,
+            layout: { type: 'vbox', align: 'stretch' },
+            items: [
+                {
+                    xtype: 'component',
+                    padding: '10 12 6 12',
+                    html: enc(t('These files failed checksum verification.') + ' ' + findingsCounts(result, rows.length))
+                },
+                {
+                    xtype: 'gridpanel',
+                    cls: 'anas-grid-scrub-findings',
+                    flex: 1,
+                    border: false,
+                    store: Ext.create('Ext.data.Store', {
+                        fields: ['path', 'subvolume', 'inode', 'blocks', 'blockList', 'stripes', 'missing', 'outsideMount'],
+                        data: rows
+                    }),
+                    columns: [
+                        { text: t('File'), dataIndex: 'path', flex: 1, minWidth: 320,
+                            sortable: false, menuDisabled: true, renderer: renderFindingPath },
+                        { text: t('Bad 4K blocks'), dataIndex: 'blocks', width: 170, align: 'center',
+                            sortable: false, menuDisabled: true, renderer: renderFindingBlocks }
+                    ]
+                }
+            ],
+            buttons: [
+                {
+                    text: t('Close'),
+                    handler: function () { win.close(); }
+                }
+            ]
+        });
+        win.show();
+        return true;
+    }
+
     // ---- Run now / Stop -----------------------------------------------------
 
     // The on-demand verbs, driving the EXISTING per-filesystem scrub endpoints
@@ -485,7 +734,24 @@
                 ANAS.toast((stop ? t('Stopping scrub on') : t('Scrub started on')) + ' ' + pool);
                 loadScrub(scrubGrid, node, true);
             },
-            onComplete: function () { loadScrub(scrubGrid, node, true); }
+            onComplete: function (job) {
+                loadScrub(scrubGrid, node, true);
+                // An AHR scrub that FINISHED while this screen was still
+                // polling opens its findings straight away. A scrub still
+                // running when the budget ends (the usual case on real disks:
+                // the budget is seconds, the scrub is hours) reaches the row
+                // instead — the reload above re-reads the completed-job list,
+                // so the findings land in the Last scrub cell the moment the
+                // job finishes, and in the PVE notification either way.
+                if (zfs || stop || !job || job.status !== 'completed') {
+                    return;
+                }
+                try {
+                    showScrubFindings(pool, job.result);
+                } catch (e) {
+                    ANAS.warn('scrub findings failed: ' + ANAS.errText(e));
+                }
+            }
         });
     }
 
@@ -496,7 +762,8 @@
             fields: ['pool', 'kind', 'cadence', 'mechanism', 'note', 'rowKey',
                 { name: 'enabled', type: 'auto' },
                 { name: 'lastScrub', type: 'auto' },
-                { name: 'running', type: 'auto' }],
+                { name: 'running', type: 'auto' },
+                { name: 'findings', type: 'auto' }],
             data: [],
             sorters: [{ property: 'kind', direction: 'ASC' }, { property: 'pool', direction: 'ASC' }]
         });
@@ -595,7 +862,8 @@
                         }
                     ]),
                     listeners: {
-                        selectionchange: function () { updateScrubButtons(this); }
+                        selectionchange: function () { updateScrubButtons(this); },
+                        itemclick: onScrubItemClick
                     }
                 }
             ],
