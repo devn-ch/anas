@@ -54,3 +54,36 @@ only state in which a key-directed descent is exercised at all.
 The two rigs are different filesystems, so the bytenrs in the tree-walk
 fixtures have nothing to do with those in the mapping fixtures above; each set
 is self-consistent and the tests keep them apart.
+
+## Compressed-extent attribution fixtures (selfheal.8)
+
+A THIRD capture, from a throwaway 256 MiB single-device loop rig on the same
+stunt node on 2026-09-11 (kernel `7.0.14-12-pve`, btrfs-progs `v6.14`;
+`mkfs.btrfs -m dup -d single`, subvolume `@data` mounted `compress=zstd`,
+`f.bin` = 2 MiB of repeating text → 16 zstd extents of 128 KiB, each a single
+4 KiB on-disk blob). One blob (logical 13635584 — the extent covering file
+bytes 131072–262143) was overwritten with junk, the file read cold, and
+`btrfs scrub start -B` run. The rig was torn down afterwards.
+
+| file | what it is |
+|------|------------|
+| `dump-tree-roots-compressed.txt` | `dump-tree -r` of that filesystem. Names the EXTENT_TREE root — the one tree the selfheal.5 walk never needed and selfheal.8 does: it is keyed by DEVICE logical, the only btrfs index answering "which extent owns this on-disk byte". |
+| `dump-tree-extent.txt` | `dump-tree -b <extent-root>` — the whole extent tree (one leaf). Every EXTENT_ITEM carries its `extent data backref root R objectid I offset O count C`; `O` is the extent's real FILE offset — for the corrupt extent, `offset 131072` while the scrub warning printed `offset 0`. |
+| `dump-tree-subvol-compressed.txt` | `dump-tree -b <file-tree-root>` — the subvolume tree leaf holding f.bin's 16 zstd EXTENT_DATA items (inode 257). |
+
+Kernel facts the capture settled (they are not in the GT drill, which never
+scrubbed a compressed file on its rig):
+
+- The scrub warning's `logical` is the **64 KiB stripe** containing the failing
+  blob, not the blob itself: a corrupt blob at 13635584 was reported at
+  `logical 13631488` — and an earlier probe run that corrupted a second blob
+  (13651968, 16 KiB further) was reported at the SAME `logical 13631488`. The
+  kernel does not say which blob inside the stripe failed.
+- The scrub warning's `offset` is **extent-relative** for compressed extents
+  (`0` here, and `0` in the live-proof F3 line for an extent starting 128 KiB
+  into the file), while the read-time `csum failed` lines print the true
+  FILE offset (`off 131072`). Probing the file at the scrub warning's offset
+  reads the wrong 64 KiB — the F3 trap.
+- The route from a named logical to the corrupt extent is the kernel's own:
+  the extent tree at that logical, whose data backrefs name the owning
+  (subvolume, inode, FILE OFFSET).

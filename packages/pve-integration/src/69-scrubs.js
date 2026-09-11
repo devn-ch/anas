@@ -672,11 +672,14 @@
         return '<span style="font-family:monospace;font-size:0.92em;">' + enc(rec.get('path')) + '</span>';
     }
 
-    // The bad-block count, labelled by its column. Two findings have no count to
-    // give and say WHY instead of showing a 0: a file deleted between the scrub
-    // and the probe, and a file outside the pool's mounted tree — a scrub covers
-    // the whole filesystem, so a corrupt block inside a snapshot is a real
-    // finding with no path under the mountpoint to read.
+    // The bad-block count, labelled by its column. Four findings have no plain
+    // count to give and say WHY instead of showing a bare 0: a file deleted
+    // between the scrub and the probe, a file outside the pool's mounted tree
+    // (a scrub covers the whole filesystem, so a corrupt block inside a
+    // snapshot is a real finding with no path under the mountpoint to read), a
+    // COMPRESSED extent — the kernel's offset is extent-relative there, so the
+    // count is the whole extent's blast radius, not a stripe probe (selfheal.8)
+    // — and one whose corrupt block could not be named at all.
     function renderFindingBlocks(v, meta, rec) {
         if (rec.get('outsideMount')) {
             return '<span style="color:var(--anas-muted,gray);" title="'
@@ -688,6 +691,21 @@
             return '<span style="color:var(--anas-muted,gray);" title="'
                 + enc(t('the path no longer exists — deleted since the scrub')) + '">'
                 + enc(t('deleted since the scrub')) + '</span>';
+        }
+        if (rec.get('unidentified')) {
+            var why = rec.get('reason') || '';
+            return '<span style="color:var(--anas-muted,gray);" title="'
+                + enc(t('the corruption is real — the kernel named this file — but no bad block could be named')
+                    + (why ? (': ' + why) : '')) + '">'
+                + enc(t('corrupt, block not identified')) + '</span>';
+        }
+        if (rec.get('compressed')) {
+            var n = Number(rec.get('extentCount')) || 0;
+            var tip = t('one corrupt sector of a compressed extent takes out the whole extent — its failing 4 KiB file blocks')
+                + ': ' + (rec.get('blockList') || '');
+            meta.tdAttr = 'data-qtip="' + enc(tip) + '"';
+            return '<span style="color:var(--anas-warn,#b06a12);">'
+                + enc(t('compressed extent — ') + n + t(' blocks')) + '</span>';
         }
         var n = Number(rec.get('blocks')) || 0;
         var list = rec.get('blockList');
@@ -708,9 +726,12 @@
     // the live @data tree in this cut). Both are refused by the daemon too —
     // this is the same rule said early, on the checkbox, so the operator is not
     // told after choosing. A finding whose probe found no bad block has nothing
-    // to write either.
+    // to write either. A COMPRESSED finding repairs like any other — the
+    // engine repairs the whole blob when handed any block of the extent, so
+    // the request carries the extent's FIRST block (selfheal.8).
     function repairableRow(rec) {
-        return !rec.get('missing') && !rec.get('outsideMount') && Number(rec.get('blocks')) > 0;
+        return !rec.get('missing') && !rec.get('outsideMount') && !rec.get('unidentified')
+            && Number(rec.get('blocks')) > 0;
     }
 
     function repairBlockedReason(rec) {
@@ -720,6 +741,11 @@
         }
         if (rec.get('missing')) {
             return t('the file no longer exists — it was deleted since the scrub named it');
+        }
+        if (rec.get('unidentified')) {
+            var why = rec.get('reason') || '';
+            return t('no bad block could be named for this corruption')
+                + (why ? (' — ' + why) : '');
         }
         if (!Number(rec.get('blocks'))) {
             return t('no block inside the reported stripe failed to read — there is nothing to repair');
@@ -745,12 +771,19 @@
     }
 
     // The rows the daemon is asked about — full paths and the exact 4 KiB block
-    // indexes the scrub probed, never "everything you think is bad".
+    // indexes the scrub probed, never "everything you think is bad". A
+    // compressed finding rides as its extent's FIRST block: the engine repairs
+    // the whole on-disk blob when handed any block of the extent, and one
+    // request per extent says exactly what was asked, not 32 copies of it.
     function repairSelection(grid) {
         var out = [];
         var sel = grid.getSelection() || [];
         for (var i = 0; i < sel.length; i++) {
             if (!repairableRow(sel[i])) {
+                continue;
+            }
+            if (sel[i].get('compressed') && Number(sel[i].get('extentFirst')) >= 0) {
+                out.push({ path: sel[i].get('path'), blocks: [Number(sel[i].get('extentFirst'))] });
                 continue;
             }
             out.push({ path: sel[i].get('path'), blocks: (sel[i].get('blockArray') || []).slice() });
@@ -932,6 +965,14 @@
                 stripes: (f.stripes || []).length,
                 missing: !!f.missing,
                 outsideMount: !!f.outsideMount,
+                // selfheal.8: the compressed extent's file block range (a
+                // repair is handed its FIRST block), and the plain statement
+                // of a corruption whose block could not be named.
+                compressed: !!f.compressed,
+                extentFirst: f.extentBlocks ? f.extentBlocks.first : -1,
+                extentCount: f.extentBlocks ? f.extentBlocks.count : 0,
+                unidentified: !!f.unidentified,
+                reason: f.reason || '',
                 outcome: null
             });
         }
@@ -961,7 +1002,8 @@
                     selModel: { selType: 'checkboxmodel', mode: 'SIMPLE' },
                     store: Ext.create('Ext.data.Store', {
                         fields: ['path', 'subvolume', 'inode', 'blocks', 'blockList', 'stripes',
-                            'missing', 'outsideMount',
+                            'missing', 'outsideMount', 'compressed', 'extentFirst', 'extentCount',
+                            'unidentified', 'reason',
                             { name: 'blockArray', type: 'auto' },
                             { name: 'outcome', type: 'auto' }],
                         data: rows

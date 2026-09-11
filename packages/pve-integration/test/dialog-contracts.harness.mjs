@@ -7212,6 +7212,30 @@ const FINDING_D = {
   stripes: [{ logical: 30000000, offset: 0, length: 4096 }],
   badBlocks: [12, 13],
 }
+// selfheal.8 — a COMPRESSED extent: the kernel's offset is extent-relative, so
+// the probe named the extent's whole file range and the finding carries it.
+// Repairable — the engine repairs the blob when handed any block of the
+// extent, and the request carries the extent's FIRST block.
+const FINDING_E = {
+  path: '/mnt/anas-ahr/ahr0/comp/text.bin',
+  subvolume: '@data',
+  inode: 259,
+  stripes: [{ logical: 953155584, offset: 0, length: 4096 }],
+  badBlocks: Array.from({ length: 32 }, (_, i) => 32 + i),
+  compressed: true,
+  extentBlocks: { first: 32, count: 32 },
+}
+// …and one whose corrupt block could not be named at all: said plainly, with
+// the reason, instead of an empty badBlocks that reads as "nothing found".
+const FINDING_F = {
+  path: '/mnt/anas-ahr/ahr0/comp/other.bin',
+  subvolume: '@data',
+  inode: 260,
+  stripes: [{ logical: 953283584, offset: 0, length: 4096 }],
+  badBlocks: [],
+  unidentified: true,
+  reason: 'no block of the reported stripe read back with an error — the file was rewritten or repaired since the scrub',
+}
 
 const REPAIR_ROUTES = {
   'GET /scrub': SCRUB_STATES,
@@ -7221,11 +7245,11 @@ const REPAIR_ROUTES = {
       at: '2026-09-11T09:00:00.000Z',
       result: {
         scrubbed: 'ahr0',
-        btrfsErrors: 'csum=4',
+        btrfsErrors: 'csum=6',
         checkedArrays: 3,
-        findings: [FINDING_A, FINDING_B, FINDING_C, FINDING_D],
-        errorsReported: 4,
-        errorsAttributed: 4,
+        findings: [FINDING_A, FINDING_B, FINDING_C, FINDING_D, FINDING_E, FINDING_F],
+        errorsReported: 6,
+        errorsAttributed: 6,
         unattributed: 0,
         truncated: false,
       },
@@ -7263,8 +7287,9 @@ async function repairFromParityChecks() {
   ok('repair: …and says so on the button', /tick the files/.test(btn.tooltip || ''), btn.tooltip)
 
   // --- Selection rules -------------------------------------------------------
-  // Row order: A (repairable, 1 block), B (missing), C (outsideMount), D (2 blocks).
-  eq('repair: every finding is a row', fGrid.getStore().getCount(), 4)
+  // Row order: A (repairable, 1 block), B (missing), C (outsideMount), D (2
+  // blocks), E (compressed extent), F (unidentified).
+  eq('repair: every finding is a row', fGrid.getStore().getCount(), 6)
   eq('repair: a DELETED file cannot be ticked', fGrid.selectRows([1]).length, 0)
   eq('repair: a finding inside a SNAPSHOT cannot be ticked', fGrid.selectRows([2]).length, 0)
   eq('repair: …and the verb stays off', btn.disabled, true)
@@ -7281,10 +7306,31 @@ async function repairFromParityChecks() {
     /cannot be repaired/.test(repairCell(2)) && /live @data tree only/.test(repairCell(2)), repairCell(2))
   ok('repair: a repairable file shows nothing yet, not a verdict', /—/.test(repairCell(0)), repairCell(0))
 
+  // selfheal.8 — the two new findings render what they are, never a bare 0.
+  const blocksCol = (fGrid.columns || []).find(c => c.dataIndex === 'blocks')
+  const blockCell = (i) => {
+    const meta = {}
+    const html = blocksCol.renderer(null, meta, fGrid.getStore().getAt(i))
+    return `${html} ${meta.tdAttr || ''}`
+  }
+  ok('repair: a COMPRESSED extent says what it is, with the extent\'s block count',
+    /compressed extent — 32 blocks/.test(blockCell(4)), blockCell(4))
+  ok('repair: …and its tooltip names the failing blocks', /failing 4 KiB file blocks: 32/.test(blockCell(4)), blockCell(4))
+  ok('repair: an UNIDENTIFIED corruption says so instead of showing 0',
+    /corrupt, block not identified/.test(blockCell(5)) && !/>0</.test(blockCell(5)), blockCell(5))
+  ok('repair: …and carries the reason as its tooltip',
+    /rewritten or repaired since the scrub/.test(blockCell(5)), blockCell(5))
+
+  eq('repair: a COMPRESSED extent ticks — the engine repairs the blob from any block of it',
+    fGrid.selectRows([4]).length, 1)
+  eq('repair: an UNIDENTIFIED finding cannot be ticked', fGrid.selectRows([5]).length, 0)
+  ok('repair: …and says why, with the reason', /no bad block could be named/.test(repairCell(5)) &&
+    /rewritten or repaired since the scrub/.test(repairCell(5)), repairCell(5))
+
   eq('repair: two repairable files tick', fGrid.selectRows([0, 3]).length, 2)
   eq('repair: …and the verb lights up', btn.disabled, false)
   eq('repair: an unrepairable row ticked ALONGSIDE them is dropped, not carried',
-    fGrid.selectRows([0, 1, 3]).length, 2)
+    fGrid.selectRows([0, 1, 3, 4]).length, 3)
 
   // --- The confirm-gated request --------------------------------------------
   let sent = null
@@ -7296,11 +7342,14 @@ async function repairFromParityChecks() {
   eq('repair: …to the pool\'s own repair endpoint', sent.path, '/ahr/ahr0/repair')
   eq('repair: …as a POST', sent.method, 'post')
   eq('repair: the request names the files IN FULL, never truncated',
-    sent.body.files.map(f => f.path), [FINDING_A.path, FINDING_D.path])
+    sent.body.files.map(f => f.path), [FINDING_A.path, FINDING_D.path, FINDING_E.path])
   eq('repair: …and the exact 4 KiB blocks the scrub probed',
-    sent.body.files.map(f => f.blocks), [[300], [12, 13]])
+    sent.body.files.map(f => f.blocks), [[300], [12, 13], [32]])
+  ok('repair: …the compressed extent rides as ONE block — its first, not 32 copies of the blob',
+    sent.body.files[2].blocks.length === 1 && sent.body.files[2].blocks[0] === FINDING_E.extentBlocks.first,
+    JSON.stringify(sent.body.files[2]))
   ok('repair: the confirm dialog says how many blocks in how many files',
-    /3 block\(s\) in 2 file\(s\)/.test(sent.confirmIntro || ''), sent.confirmIntro)
+    /4 block\(s\) in 3 file\(s\)/.test(sent.confirmIntro || ''), sent.confirmIntro)
   ok('repair: the poll budget is raised past the 15 s default (a repair is minutes)',
     Number(sent.maxMs) > 15000, sent.maxMs)
   ok('repair: the poll rides the window, not a component that closes', sent.view === win)

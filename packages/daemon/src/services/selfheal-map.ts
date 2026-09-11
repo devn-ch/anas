@@ -1,7 +1,7 @@
 import type { CommandExecutor } from '../executor/types.js'
 import type { TreeRoots } from './selfheal-btree.js'
 import type { CsumItem } from './selfheal-csum.js'
-import { chunkItemKey, extentDataKey, findLeaf, readTreeRoots } from './selfheal-btree.js'
+import { chunkItemKey, extentDataKey, extentItemKey, findLeaf, readTreeRoots } from './selfheal-btree.js'
 import { BLOCK_BYTES, kernelName, mdSysPath, readMdAttrOrNull } from './selfheal-io.js'
 
 /**
@@ -427,6 +427,134 @@ export function extentForFileOffset(items: ExtentItem[], fileOffset: number): Ex
   if (!hit)
     throw new SelfhealMapError(`file offset ${fileOffset} is in no extent of this file`)
   return hit
+}
+
+/**
+ * btrfs scrub checks and reports in 64 KiB stripes (GT-3) — the kernel names
+ * one of these in every scrub warning, for compressed extents and plain ones
+ * alike. Verified live on kernel 7.0.14-12-pve: two corrupt blobs 16 KiB apart
+ * inside one stripe were both reported at the stripe's start.
+ */
+export const BTRFS_STRIPE_BYTES = 65536
+
+/** One `extent data backref` line of an EXTENT_ITEM. */
+export interface ExtentDataBackref {
+  /** The subvolume id holding the file. */
+  root: number
+  /** The file's inode number. */
+  objectid: number
+  /** The offset within the file where the extent starts. */
+  offset: number
+  /** How many references this file makes to the extent. */
+  count: number
+}
+
+/**
+ * One EXTENT_ITEM of the extent tree — an on-disk extent keyed by DEVICE
+ * logical byte, the only btrfs index that answers "which extent owns this
+ * on-disk byte". The EXTENT_DATA items of a file tree are keyed by file offset
+ * instead, which is why a logical byte cannot be traced to its extent through
+ * them alone.
+ */
+export interface ExtentTreeItem {
+  /** btrfs logical bytenr of the extent's first on-disk sector. */
+  logical: number
+  /** On-disk length (the key's offset field — the compressed blob when compressed). */
+  length: number
+  /** The data backrefs: every (subvolume, inode, file offset) that owns a piece. */
+  backrefs: ExtentDataBackref[]
+}
+
+/** `item N key (<logical> EXTENT_ITEM <length>)`. */
+const EXTENT_TREE_ITEM_RE = /item \d+ key \((\d+) EXTENT_ITEM (\d+)\)/
+/** `(178 0x…) extent data backref root <r> objectid <i> offset <o> count <c>`. */
+const EXTENT_DATA_BACKREF_RE = /extent data backref root (\d+) objectid (\d+) offset (\d+) count (\d+)/
+
+/**
+ * Parse the EXTENT_ITEMs (with their data backrefs) out of an extent tree dump.
+ *
+ * Body lines attach only within their own item, as in every parser here: the
+ * next `item N key (…)` closes the previous one, and a block group or a
+ * metadata tree-block item (which share the extent tree) is skipped by the key
+ * regex itself.
+ */
+export function parseExtentTreeItems(dump: string): ExtentTreeItem[] {
+  const items: ExtentTreeItem[] = []
+  let current: ExtentTreeItem | null = null
+  for (const line of dump.split('\n')) {
+    const key = EXTENT_TREE_ITEM_RE.exec(line)
+    if (key) {
+      current = { logical: Number(key[1]), length: Number(key[2]), backrefs: [] }
+      items.push(current)
+      continue
+    }
+    if (!current)
+      continue
+    const ref = EXTENT_DATA_BACKREF_RE.exec(line)
+    if (ref)
+      current.backrefs.push({ root: Number(ref[1]), objectid: Number(ref[2]), offset: Number(ref[3]), count: Number(ref[4]) })
+  }
+  return items
+}
+
+/**
+ * The file's extents whose ON-DISK bytes intersect the 64 KiB stripe the
+ * kernel named (selfheal.8).
+ *
+ * The route is the kernel's own: the extent tree at the named logical (two
+ * bounded walks — the stripe may straddle a leaf boundary), whose EXTENT_ITEM
+ * data backrefs carry the real FILE offset of every owning extent, then one
+ * fs-tree walk per owner for its full EXTENT_DATA item. Backrefs are filtered
+ * to the (subvolume, inode) the kernel printed — a blob shared with a snapshot
+ * or another file contributes only this file's extents.
+ *
+ * An empty result means nothing of THIS file lives in the named stripe; a
+ * thrown {@link SelfhealMapError} means the chain could not be followed at
+ * all. Both are the caller's cue to fall back — never a reason to guess.
+ */
+export async function extentsForStripe(
+  executor: CommandExecutor,
+  ctx: SelfhealContext,
+  root: number,
+  inode: number,
+  logical: number,
+): Promise<ExtentItem[]> {
+  if (ctx.roots.extent === null)
+    throw new SelfhealMapError('btrfs dump-tree -r named no extent tree root — a logical byte cannot be traced to its extent without it')
+  const fsRoot = ctx.roots.bySubvolume.get(root)
+  if (fsRoot === undefined)
+    throw new SelfhealMapError(`btrfs names no tree root for subvolume ${root}`)
+
+  // The stripe's first and last items: the leaf holding the stripe's start and
+  // the leaf holding its end. Deduped, the two cover the stripe — items are
+  // contiguous and ordered in device space.
+  const stripeStart = Math.floor(logical / BTRFS_STRIPE_BYTES) * BTRFS_STRIPE_BYTES
+  const stripeEnd = stripeStart + BTRFS_STRIPE_BYTES
+  const seen = new Set<number>()
+  const owners: { fileOffset: number }[] = []
+  for (const target of [stripeStart, stripeEnd - 1]) {
+    const leaf = await findLeaf(executor, ctx.srcDevice, ctx.roots.extent, extentItemKey(target))
+    for (const item of parseExtentTreeItems(leaf)) {
+      if (item.logical >= stripeEnd || item.logical + item.length <= stripeStart)
+        continue
+      for (const ref of item.backrefs) {
+        if (ref.root !== root || ref.objectid !== inode || seen.has(ref.offset))
+          continue
+        seen.add(ref.offset)
+        owners.push({ fileOffset: ref.offset })
+      }
+    }
+  }
+
+  // One fs-tree walk per owning file offset, reusing the extent resolver the
+  // repair engine uses — the EXTENT_DATA item is the single source of truth
+  // for the extent's file range and its compression.
+  const extents: ExtentItem[] = []
+  for (const owner of owners) {
+    const leaf = await findLeaf(executor, ctx.srcDevice, fsRoot, extentDataKey(inode, owner.fileOffset))
+    extents.push(extentForFileOffset(parseExtentItems(leaf, inode), owner.fileOffset))
+  }
+  return extents
 }
 
 /**

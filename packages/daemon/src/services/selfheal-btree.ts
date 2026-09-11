@@ -212,6 +212,9 @@ export function chunkItemKey(logical: number): BtrfsKey {
 export function csumItemKey(logical: number): BtrfsKey {
   return { objectid: BTRFS_OBJECTIDS.EXTENT_CSUM, type: BTRFS_KEY_TYPES.EXTENT_CSUM, offset: BigInt(logical) }
 }
+export function extentItemKey(logical: number): BtrfsKey {
+  return { objectid: BigInt(logical), type: BTRFS_KEY_TYPES.EXTENT_ITEM, offset: 0n }
+}
 export function extentDataKey(inode: number, fileOffset: number): BtrfsKey {
   return { objectid: BigInt(inode), type: BTRFS_KEY_TYPES.EXTENT_DATA, offset: BigInt(fileOffset) }
 }
@@ -274,6 +277,12 @@ export interface TreeRoots {
   chunk: number
   /** The checksum tree (tree 7). */
   csum: number
+  /**
+   * The extent tree (tree 2) — keyed by DEVICE logical, the only btrfs index
+   * that answers "which extent owns this on-disk byte". Null when the roots
+   * dump does not name it; lookups that need it refuse rather than guess.
+   */
+  extent: number | null
   /** Subvolume id → its fs tree root. `FS_TREE` is recorded under id 5. */
   bySubvolume: Map<number, number>
 }
@@ -286,12 +295,15 @@ export interface TreeRoots {
 export function parseTreeRoots(dump: string): TreeRoots {
   let chunk: number | null = null
   let csum: number | null = null
+  let extent: number | null = null
   const bySubvolume = new Map<number, number>()
   for (const line of dump.split('\n')) {
     const bare = BARE_ROOT_RE.exec(line.trim())
     if (bare) {
       if (bare[1] === 'chunk')
         chunk = Number(bare[2])
+      else if (bare[1] === 'extent')
+        extent = Number(bare[2])
       continue
     }
     const keyed = KEYED_ROOT_RE.exec(line)
@@ -301,6 +313,8 @@ export function parseTreeRoots(dump: string): TreeRoots {
     const bytenr = Number(keyed[2])
     if (objectid === 'CSUM_TREE')
       csum = bytenr
+    else if (objectid === 'EXTENT_TREE')
+      extent = bytenr
     else if (objectid === 'FS_TREE')
       bySubvolume.set(5, bytenr)
     else if (INTEGER_RE.test(objectid))
@@ -310,7 +324,7 @@ export function parseTreeRoots(dump: string): TreeRoots {
     throw new SelfhealTreeError('btrfs dump-tree -r named no chunk tree root')
   if (csum === null)
     throw new SelfhealTreeError('btrfs dump-tree -r named no checksum tree root — a filesystem with no csum tree has nothing to arbitrate against')
-  return { chunk, csum, bySubvolume }
+  return { chunk, csum, extent, bySubvolume }
 }
 
 /** Read every tree root of the filesystem on `device`. One bounded exec. */

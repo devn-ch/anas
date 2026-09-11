@@ -153,6 +153,21 @@ describe('selfheal btree — nodes and roots', () => {
     assert.equal(executor.calls.length, 1)
   })
 
+  // selfheal.8 — the extent tree root rides along. The selfheal.5 walk never
+  // needed it; a logical byte can only be traced to its extent through it.
+  it('reads the extent tree root from the compressed-rig capture (selfheal.8)', () => {
+    const roots = parseTreeRoots(fixture('dump-tree-roots-compressed.txt'))
+    assert.equal(roots.chunk, 22036480)
+    assert.equal(roots.csum, 30441472)
+    assert.equal(roots.extent, 30457856)
+    assert.equal(roots.bySubvolume.get(256), 30539776)
+  })
+
+  it('the selfheal.2 rig capture names its extent tree too — always present on a real fs', () => {
+    const roots = parseTreeRoots(fixture('dump-tree-roots.txt'))
+    assert.equal(roots.extent, 32505856)
+  })
+
   it('refuses a filesystem whose roots it cannot find', () => {
     assert.throws(() => parseTreeRoots('btrfs-progs v6.14\n'), /named no chunk tree root/)
     assert.throws(

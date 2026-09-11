@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { describe, it } from 'node:test'
+import process from 'node:process'
+import { after, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { AhrPool, AhrScrubResult } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
@@ -806,6 +808,26 @@ describe('AhrScrubResult schema (shared, additive)', () => {
           badBlocks: [],
           missing: true,
         },
+        // selfheal.8 — a compressed finding names its extent's block range;
+        // an unidentified one says plainly that no block could be named.
+        {
+          path: '/mnt/anas-ahr/t2/@data/comp/text.bin',
+          subvolume: '@data',
+          inode: 259,
+          stripes: [{ logical: 953155584, offset: 0, length: 4096 }],
+          badBlocks: [32, 33, 34],
+          compressed: true,
+          extentBlocks: { first: 32, count: 32 },
+        },
+        {
+          path: '/mnt/anas-ahr/t2/@data/comp/other.bin',
+          subvolume: '@data',
+          inode: 260,
+          stripes: [{ logical: 953283584, offset: 0, length: 4096 }],
+          badBlocks: [],
+          unidentified: true,
+          reason: 'no block of the reported stripe read back with an error — the file was rewritten or repaired since the scrub',
+        },
       ],
       errorsReported: 2,
       errorsAttributed: 2,
@@ -823,5 +845,242 @@ describe('AhrScrubResult schema (shared, additive)', () => {
       checkedArrays: 1,
       findings: [{ path: '/x', subvolume: '@data', inode: 1, badBlocks: [] }],
     }).success, false)
+  })
+})
+
+/**
+ * Story selfheal.8 — a COMPRESSED file's finding names its bad blocks, or says
+ * plainly that it cannot.
+ *
+ * The kernel's scrub warning for a compressed extent reports `offset` relative
+ * to the extent, not the file, and names the 64 KiB stripe the failing blob
+ * sits in — neither says which extent inside the stripe it was. Every input
+ * below is the verbatim capture of a live rig that did exactly this (a 2 MiB
+ * compressed file, one blob overwritten, one scrub — see
+ * fixtures/selfheal/PROVENANCE.md): the kernel line from
+ * `fixtures/ahr/scrub-dmesg-compressed.txt`, the extent tree, the file tree
+ * and the roots from `fixtures/selfheal/dump-tree-*compressed.txt`. The
+ * mapping itself is resolved through the selfheal.5 engine's helpers — the
+ * same code the repair runs on.
+ */
+describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
+  const COMPRESSED_DMESG = readFileSync(join(fixturesDir, 'scrub-dmesg-compressed.txt'), 'utf-8')
+    .split('\n')
+    .filter(l => l.trim() !== '')
+  // The scrub warning line — the read-time `csum failed` lines around it are
+  // part of the capture and parse to nothing, as on a real journal.
+  const SCRUB_LINE = COMPRESSED_DMESG.find(l => l.includes('scrub: checksum error'))!
+  const F = `${MOUNTPOINT}/f.bin`
+  const selfhealFixtures = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/selfheal')
+  const selfhealFixture = (name: string): string => readFileSync(join(selfhealFixtures, name), 'utf-8')
+
+  /**
+   * The rig's md geometry files, as REAL files in a temp tree — the engine's
+   * sysfs reads go through node:fs with `ANAS_SELFHEAL_KERNEL_ROOT` as the
+   * prefix (selfheal-io), and `resolveContext` needs a geometry to finish.
+   */
+  let kernelRoot: string | null = null
+  const realKernelRoot = process.env.ANAS_SELFHEAL_KERNEL_ROOT
+  const realRuntimeDir = process.env.ANAS_SELFHEAL_RUNTIME_DIR
+
+  after(() => {
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = realKernelRoot
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = realRuntimeDir
+    if (kernelRoot)
+      rmSync(kernelRoot, { recursive: true, force: true })
+  })
+
+  /** Write the rig's sysfs capture into the kernel-root temp tree, once. */
+  function useKernelRoot(): void {
+    if (kernelRoot)
+      return
+    kernelRoot = mkdtempSync(join(tmpdir(), 'anas-sh8-'))
+    const sys = join(kernelRoot, 'sys/block/md127/md')
+    mkdirSync(sys, { recursive: true })
+    for (const line of selfhealFixture('md-sysfs-raid5.txt').split('\n')) {
+      const eq = line.indexOf('=')
+      if (eq <= 0 || line.slice(eq + 1) === '<absent>')
+        continue
+      const path = join(sys, line.slice(0, eq))
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(path, `${line.slice(eq + 1)}\n`)
+    }
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = kernelRoot
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR ??= join(kernelRoot, 'run')
+  }
+
+  /** Journalctl -o json envelopes around the captured kernel lines. */
+  function journal(lines: string[]): string {
+    return `${lines.map(l => JSON.stringify({ _TRANSPORT: 'kernel', MESSAGE: l })).join('\n')}\n`
+  }
+
+  /** `findmnt --json --real <mountpoint>` for the pool mounted `subvol=/@data`. */
+  function findmntJson(subvol: string): string {
+    return `${JSON.stringify({
+      filesystems: [{
+        target: MOUNTPOINT,
+        source: `/dev/loop0[${subvol}]`,
+        fstype: 'btrfs',
+        options: `rw,relatime,space_cache=v2,subvol=${subvol}`,
+      }],
+    })}\n`
+  }
+
+  /** The bytenrs the tree walks will ask for, read out of the roots capture. */
+  function rigRoots(): { extent: number, subvol: number } {
+    const text = selfhealFixture('dump-tree-roots-compressed.txt')
+    const extent = /extent tree key \(EXTENT_TREE ROOT_ITEM 0\) (\d+)/.exec(text)![1]
+    const subvol = /file tree key \(256 ROOT_ITEM 0\) (\d+)/.exec(text)![1]
+    return { extent: Number(extent), subvol: Number(subvol) }
+  }
+
+  /**
+   * The whole scrub, on an executor whose mapping layer answers with the
+   * rig's captured trees: phase 1, the btrfs scrub, the journal with the
+   * verbatim scrub warning, and everything `resolveContext` reads.
+   */
+  function compressedExecutor(): MockExecutor {
+    useKernelRoot()
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal(COMPRESSED_DMESG), stderr: '', exitCode: 0 } })
+    // The pool LV resolves to the rig's loop device — the device the kernel
+    // lines name, so the journal filter keeps them.
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/loop0\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real', MOUNTPOINT], result: { stdout: findmntJson('/@data'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'subvolid-resolve', '256', MOUNTPOINT], result: { stdout: '@data\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F], result: { stdout: '2097152\n', stderr: '', exitCode: 0 } })
+    // The probe: every block of the file reads, unless a test says otherwise.
+    executor.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // --- what resolveContext reads (selfheal-map) ---
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE', '-T', MOUNTPOINT], result: { stdout: '/dev/loop0\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/dmsetup', args: ['table', '/dev/loop0'], result: { stdout: selfhealFixture('dmsetup-table-lv.txt'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', '/sys/dev/block/9:127'], result: { stdout: '/sys/devices/virtual/block/md127\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', '/dev/md127'], result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: selfhealFixture('mdadm-detail-export-raid5.txt'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'dump-tree', '-r', '/dev/loop0'], result: { stdout: selfhealFixture('dump-tree-roots-compressed.txt'), stderr: '', exitCode: 0 } })
+    const roots = rigRoots()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'dump-tree', '-b', String(roots.extent), '/dev/loop0'], result: { stdout: selfhealFixture('dump-tree-extent.txt'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'dump-tree', '-b', String(roots.subvol), '/dev/loop0'], result: { stdout: selfhealFixture('dump-tree-subvol-compressed.txt'), stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  /** The corrupt extent's 32 file blocks read back EIO — the blob is junk. */
+  function corruptExtent(executor: MockExecutor): void {
+    for (let block = 32; block < 64; block++) {
+      executor.addFixture({
+        command: '/usr/bin/dd',
+        args: [`if=${F}`, 'iflag=direct', 'bs=4096', `skip=${block}`, 'count=1', 'of=/dev/null'],
+        result: { stdout: '', stderr: 'dd: error reading', exitCode: 1 },
+      })
+    }
+  }
+
+  it('a compressed extent is probed over its REAL file range and names every failing block', async () => {
+    const executor = compressedExecutor()
+    corruptExtent(executor)
+
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const finding = result.findings?.[0]
+    assert.equal(finding?.path, F)
+    assert.deepEqual(finding?.stripes, [{ logical: 13631488, offset: 0, length: 4096 }])
+    // One corrupt 4 KiB blob takes out its whole 128 KiB logical extent
+    // (GT-9b): blocks 32..63, the extent starting at file offset 131072 —
+    // NOT the blocks at the kernel's `offset 0`.
+    assert.deepEqual(finding?.badBlocks, Array.from({ length: 32 }, (_, i) => 32 + i))
+    assert.equal(finding?.compressed, true)
+    assert.deepEqual(finding?.extentBlocks, { first: 32, count: 32 })
+    assert.equal(finding?.unidentified, undefined)
+
+    // The probe read the file's whole extent range — every one of the 16
+    // compressed blobs lives inside the one named stripe — and nothing at the
+    // kernel-offset stripe alone.
+    const dd = executor.calls.filter(c => c.command === '/usr/bin/dd' && c.args[0] === `if=${F}`)
+    assert.equal(dd.length, 512)
+    assert.deepEqual(dd.map(c => c.args[3]), Array.from({ length: 512 }, (_, i) => `skip=${i}`))
+
+    const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
+    assert.ok(body.includes('compressed extent, 32 blocks'), body)
+  })
+
+  it('nothing in the resolved range failing is said plainly — never an empty badBlocks that reads as nothing found', async () => {
+    const executor = compressedExecutor()
+
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const finding = result.findings?.[0]
+    assert.deepEqual(finding?.badBlocks, [])
+    assert.equal(finding?.unidentified, true)
+    assert.match(finding?.reason ?? '', /no block of the reported stripe read back with an error/)
+    // The probe still happened — this is "looked and found nothing", not
+    // "never looked".
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/dd' && c.args[0] === `if=${F}`).length, 512)
+
+    const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
+    assert.ok(body.includes('block not identified'), body)
+  })
+
+  it('the kernel-offset probe stands when the mapping cannot resolve the stripe — and its blocks are named', async () => {
+    // No mapping fixtures: resolveContext fails at its first findmnt, the
+    // pass falls back to the plain probe at the kernel's printed offset
+    // (exact for an uncompressed extent, GT-3), and a failing block there is
+    // named exactly as selfheal.3 named it.
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([SCRUB_LINE]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/loop0\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real', MOUNTPOINT], result: { stdout: findmntJson('/@data'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'subvolid-resolve', '256', MOUNTPOINT], result: { stdout: '@data\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F], result: { stdout: '2097152\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({
+      command: '/usr/bin/dd',
+      args: [`if=${F}`, 'iflag=direct', 'bs=4096', 'skip=5', 'count=1', 'of=/dev/null'],
+      result: { stdout: '', stderr: 'dd: error reading', exitCode: 1 },
+    })
+
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const finding = result.findings?.[0]
+    assert.deepEqual(finding?.badBlocks, [5])
+    assert.equal(finding?.compressed, undefined, 'an unresolved stripe claims no compression')
+    assert.equal(finding?.unidentified, undefined)
+    const dd = executor.calls.filter(c => c.command === '/usr/bin/dd' && c.args[0] === `if=${F}`)
+    assert.equal(dd.length, 16, 'the stripe the kernel named, and only it')
+  })
+
+  it('unresolvable AND nothing failing → unidentified, with the mapping error as the reason', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([SCRUB_LINE]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/loop0\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real', MOUNTPOINT], result: { stdout: findmntJson('/@data'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'subvolid-resolve', '256', MOUNTPOINT], result: { stdout: '@data\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F], result: { stdout: '2097152\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const finding = result.findings?.[0]
+    assert.deepEqual(finding?.badBlocks, [])
+    assert.equal(finding?.unidentified, true)
+    assert.match(finding?.reason ?? '', /extent could not be resolved/)
+    const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
+    assert.ok(body.includes('block not identified'), body)
+  })
+
+  it('the verbatim scrub warning parses field for field — the F3 shape, captured again', () => {
+    assert.deepEqual(parseScrubWarning(SCRUB_LINE), {
+      device: 'loop0',
+      logical: 13631488,
+      dev: '/dev/loop0',
+      physical: 13631488,
+      root: 256,
+      inode: 257,
+      offset: 0,
+      length: 4096,
+      links: 1,
+      path: 'f.bin',
+    })
   })
 })

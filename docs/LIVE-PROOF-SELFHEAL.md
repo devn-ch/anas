@@ -718,7 +718,7 @@ stored checksum, so there was nothing to reconstruct — either the block was al
 the finding no longer describes it. Nothing was written, and they need no restore.
 ```
 
-### F3 — MEDIUM — a COMPRESSED file's finding carries no bad block, so the Repair action cannot reach it (OPEN)
+### F3 — MEDIUM — a COMPRESSED file's finding carries no bad block, so the Repair action cannot reach it (OPEN at capture; fixed by `selfheal.8`)
 
 For the corrupted zstd extent the kernel's scrub warning was:
 
@@ -767,7 +767,8 @@ extent the named logical falls in is `encoded`), resolve the extent's real file 
 extent item rather than from the kernel's `offset`, probe that range, and — when it still cannot
 name a block — carry a flag that the window renders as "corrupt, block not identified (compressed
 extent)" with Repair disabled and the reason stated, instead of an empty list that reads as
-"nothing found".
+"nothing found". Fixed as `selfheal.8` (2026-09-11): the finding carries the extent's real file
+blocks plus `compressed`/`extentBlocks`, or `unidentified` with a stated reason.
 
 ### F4 — observation — the suite's bounded check assumes the loop rig's 64 KiB chunk
 

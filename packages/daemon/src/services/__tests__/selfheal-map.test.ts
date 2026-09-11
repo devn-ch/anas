@@ -3,15 +3,19 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { MockExecutor } from '../../executor/mock.js'
+import { parseTreeRoots } from '../selfheal-btree.js'
 import {
   chunkForLogical,
   extentForFileOffset,
+  extentsForStripe,
   geometryFromAttributes,
   locateLogicalIn,
   logicalToLvByte,
   parseChunkItems,
   parseDmTable,
   parseExtentItems,
+  parseExtentTreeItems,
   parseMdDetailExport,
   placeMdByte,
   repairUnitFor,
@@ -320,5 +324,92 @@ describe('selfheal mapping — the whole chain', () => {
       assert.equal(unit.blobLogical, expected.target_logical, `${expected.file} ${expected.block}`)
       assert.equal(unit.logicalByte, expected.logical_byte)
     }
+  })
+})
+
+/**
+ * selfheal.8 — tracing a DEVICE logical byte back to the extent that owns it.
+ * Everything below is fed the verbatim capture of a live rig with a compressed
+ * file whose second extent's blob was corrupted and scrubbed (see
+ * fixtures/selfheal/PROVENANCE.md, "Compressed-extent attribution fixtures").
+ */
+describe('selfheal mapping — the extent tree (selfheal.8)', () => {
+  const EXTENT_TREE = fixture('dump-tree-extent.txt')
+
+  it('parses the EXTENT_ITEMs with their data backrefs, and nothing else', () => {
+    const items = parseExtentTreeItems(EXTENT_TREE)
+    // 16 data extents of the rig's one file; the BLOCK_GROUP_ITEM and the
+    // metadata TREE_BLOCK items sharing the tree create no item.
+    assert.equal(items.length, 16)
+    assert.deepEqual(items[1], {
+      logical: 13635584,
+      length: 4096,
+      backrefs: [{ root: 256, objectid: 257, offset: 131072, count: 1 }],
+    })
+    assert.ok(items.every(i => i.backrefs.length === 1))
+    // The backref offset is the extent's REAL file offset — the number the
+    // kernel's scrub warning does not carry for a compressed extent.
+    assert.deepEqual(items.map(i => i.backrefs[0].offset), Array.from({ length: 16 }, (_, k) => k * 131072))
+  })
+
+  /** The captured rig's mapping context — trees only; the md half is unused here. */
+  function compressedRigContext(): Parameters<typeof extentsForStripe>[1] {
+    const roots = parseTreeRoots(fixture('dump-tree-roots-compressed.txt'))
+    return {
+      mountpoint: '/mnt/sh8',
+      srcDevice: '/dev/loop0',
+      segments: [],
+      geometry: {} as never,
+      roots,
+      chunks: [],
+      csums: [],
+    }
+  }
+
+  function treeExecutor(): MockExecutor {
+    const executor = new MockExecutor()
+    const roots = parseTreeRoots(fixture('dump-tree-roots-compressed.txt'))
+    executor.addFixture({
+      command: '/usr/bin/btrfs',
+      args: ['inspect-internal', 'dump-tree', '-b', String(roots.extent), '/dev/loop0'],
+      result: { stdout: EXTENT_TREE, stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({
+      command: '/usr/bin/btrfs',
+      args: ['inspect-internal', 'dump-tree', '-b', String(roots.bySubvolume.get(256)), '/dev/loop0'],
+      result: { stdout: fixture('dump-tree-subvol-compressed.txt'), stderr: '', exitCode: 0 },
+    })
+    return executor
+  }
+
+  it('resolves the extents owning the named stripe, with their real file ranges', async () => {
+    const executor = treeExecutor()
+    const extents = await extentsForStripe(executor, compressedRigContext(), 256, 257, 13631488)
+    // All 16 of the file's zstd blobs live inside that one 64 KiB stripe.
+    assert.equal(extents.length, 16)
+    assert.ok(extents.every(e => e.compression === 'zstd' && e.length === 131072 && e.diskLength === 4096))
+    assert.deepEqual(extents.map(e => e.fileOffset), Array.from({ length: 16 }, (_, k) => k * 131072))
+    // The extent whose blob sits 4 KiB into the stripe — the corrupt one in
+    // the capture — resolves to file bytes 131072..262143, NOT to what the
+    // kernel's `offset 0` would have pointed at.
+    const corrupt = extentForFileOffset(extents, 131072)
+    assert.equal(corrupt.diskByte, 13635584)
+    // Two walks for the extent tree (stripe start and stripe end land in the
+    // same leaf) plus one per owning file offset.
+    assert.equal(executor.calls.length, 2 + 16)
+  })
+
+  it('names no extent where this file owns none — and refuses a foreign subvolume', async () => {
+    const executor = treeExecutor()
+    const ctx = compressedRigContext()
+    assert.deepEqual(
+      await extentsForStripe(executor, ctx, 256, 257, 97533952),
+      [],
+      'the metadata region at the top of the address space is nobody\'s data extent',
+    )
+    await assert.rejects(
+      extentsForStripe(executor, ctx, 999, 257, 13631488),
+      SelfhealMapError,
+    )
   })
 })

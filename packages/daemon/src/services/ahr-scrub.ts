@@ -1,5 +1,6 @@
 import type { AhrPool, AhrScrubFinding, AhrScrubResult, AhrScrubStripe } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { ExtentItem, SelfhealContext } from './selfheal-map.js'
 import { AhrScrubResult as AhrScrubResultSchema } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
@@ -8,6 +9,7 @@ import { ahrLvPath } from './ahr-paths.js'
 import { SUBVOL_DATA, subvolFromMountOptions } from './ahr-snapshots.js'
 import { pveNotify } from './pve-notify.js'
 import { mismatchCntArgs } from './scrub-schedules.js'
+import { BTRFS_STRIPE_BYTES, extentsForStripe, resolveContext } from './selfheal-map.js'
 
 /**
  * AHR pool scrub (Epic 11 + AHR, docs/AHR-DESIGN.md §4) — behind
@@ -146,6 +148,15 @@ export async function mismatchCount(
  *   - `root N` is a subvolume id, so the printed path is subvolume-relative
  *     and names nothing on the node until `btrfs inspect-internal
  *     subvolid-resolve` turns the id into a name (GT-3/GT-6).
+ *
+ * A third fact shapes the compressed case (selfheal.8, live-proven twice):
+ * when the failing extent is COMPRESSED the printed `offset` is extent-
+ * relative — `0` for a corrupt extent starting 128 KiB into the file — and the
+ * named logical is the 64 KiB stripe the failing blob sits in, not the blob
+ * itself (two corrupt blobs 16 KiB apart were both reported at their stripe's
+ * start). The kernel does not say which extent inside the stripe it was, so
+ * the engine's mapping answers: the extents owning the stripe, resolved from
+ * the extent tree's backrefs, and their real file ranges probed whole.
  */
 
 /** One kernel scrub error line that named a file. */
@@ -170,8 +181,8 @@ export interface ScrubErrorLine {
 
 /** btrfs file geometry the attribution walks in (GT-3). */
 const BLOCK_BYTES = 4096
-const STRIPE_BYTES = 65536
-const BLOCKS_PER_STRIPE = STRIPE_BYTES / BLOCK_BYTES
+/** Blocks inside one btrfs scrub stripe — the 16 the probe reads. */
+const BLOCKS_PER_STRIPE = BTRFS_STRIPE_BYTES / BLOCK_BYTES
 
 /** At most this many FILES ride in a result; the counts always tell the truth. */
 export const AHR_SCRUB_FINDINGS_CAP = 200
@@ -482,10 +493,27 @@ async function resolveSubvolume(
 }
 
 /**
+ * Read ONE 4 KiB file block with O_DIRECT and report whether it errored.
+ *
+ * O_DIRECT is what makes this a real read: a cached page would answer from
+ * memory and every block would look fine (GT-9a).
+ */
+async function probeBlock(executor: CommandExecutor, path: string, block: number): Promise<boolean> {
+  const r = await executor.exec(DD, [
+    `if=${path}`,
+    'iflag=direct',
+    `bs=${BLOCK_BYTES}`,
+    `skip=${block}`,
+    'count=1',
+    'of=/dev/null',
+  ])
+  return r.exitCode !== 0
+}
+
+/**
  * The failing 4 KiB blocks inside ONE named 64 KiB stripe: read each of the 16
- * blocks with O_DIRECT and collect the ones that error (GT-3 — the kernel names
- * the stripe, never the block). O_DIRECT is what makes this a real read: a
- * cached page would answer from memory and every block would look fine.
+ * blocks and collect the ones that error (GT-3 — the kernel names the stripe,
+ * never the block).
  *
  * A block past EOF reads zero bytes and exits 0, so a file that shrank is not
  * reported as sixteen bad blocks.
@@ -495,18 +523,79 @@ async function probeStripe(executor: CommandExecutor, path: string, offset: numb
   const base = Math.floor(offset / BLOCK_BYTES)
   for (let i = 0; i < BLOCKS_PER_STRIPE; i++) {
     const block = base + i
-    const r = await executor.exec(DD, [
-      `if=${path}`,
-      'iflag=direct',
-      `bs=${BLOCK_BYTES}`,
-      `skip=${block}`,
-      'count=1',
-      'of=/dev/null',
-    ])
-    if (r.exitCode !== 0)
+    if (await probeBlock(executor, path, block))
       bad.push(block)
   }
   return bad
+}
+
+/** A compressed extent's file block range, as `extentBlocks` carries it. */
+interface ExtentBlockRange {
+  first: number
+  count: number
+}
+
+/**
+ * The failing 4 KiB blocks of the extents that own ONE named stripe
+ * (selfheal.8).
+ *
+ * For a COMPRESSED extent the kernel's `offset` is extent-relative, not
+ * file-relative, so the stripe it names cannot be probed at the printed
+ * offset. The extent's real file range comes from its EXTENT_DATA item, and
+ * THAT range is probed whole: one bad on-disk sector of a compressed blob
+ * makes every block of the logical extent read back EIO (GT-9b), so the
+ * honest answer is expected to be the whole extent — all of its failing
+ * blocks recorded. Uncompressed extents sharing the stripe keep the kernel's
+ * own geometry: the stripe-window they cover is what is probed, bounded to
+ * the 16 blocks the plain probe reads.
+ *
+ * `extentRange` describes the compressed extent containing the first failing
+ * block — the block a repair is handed (the engine repairs the whole blob
+ * when given any block of the extent).
+ */
+async function probeStripeExtents(
+  executor: CommandExecutor,
+  path: string,
+  candidates: ExtentItem[],
+  stripeLogical: number,
+): Promise<{ badBlocks: number[], extentRange: ExtentBlockRange | null }> {
+  const stripeStart = Math.floor(stripeLogical / BTRFS_STRIPE_BYTES) * BTRFS_STRIPE_BYTES
+  const bad = new Set<number>()
+  let extentRange: ExtentBlockRange | null = null
+  for (const extent of candidates) {
+    const compressed = extent.compression !== 'none'
+    // The file block range to read: the WHOLE extent when compressed; the
+    // part inside the named stripe when not. A range past EOF reads zero
+    // bytes and exits 0 — a shrunken file is not a wall of failures.
+    const length = extent.length ?? 0
+    let firstBlock: number
+    let lastBlock: number
+    if (compressed) {
+      firstBlock = Math.floor(extent.fileOffset / BLOCK_BYTES)
+      lastBlock = Math.ceil((extent.fileOffset + length) / BLOCK_BYTES)
+    }
+    else {
+      const within = stripeStart - (extent.diskByte ?? 0)
+      const fileStart = extent.fileOffset + Math.max(0, within)
+      const fileEnd = extent.fileOffset + Math.min(length, within + BTRFS_STRIPE_BYTES)
+      if (fileEnd <= fileStart)
+        continue
+      firstBlock = Math.floor(fileStart / BLOCK_BYTES)
+      lastBlock = Math.ceil(fileEnd / BLOCK_BYTES)
+    }
+    for (let block = firstBlock; block < lastBlock; block++) {
+      if (bad.has(block))
+        continue
+      if (await probeBlock(executor, path, block)) {
+        bad.add(block)
+        if (compressed && extentRange === null) {
+          extentRange = { first: Math.floor(extent.fileOffset / BLOCK_BYTES), count: Math.ceil(length / BLOCK_BYTES) }
+        }
+      }
+    }
+  }
+  // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
+  return { badBlocks: [...bad].sort((a, b) => a - b), extentRange }
 }
 
 /**
@@ -526,6 +615,16 @@ export async function pathExists(executor: CommandExecutor, path: string): Promi
 /**
  * Turn the grouped kernel reports into findings: resolve each subvolume once,
  * then probe every named stripe of every file that still exists.
+ *
+ * Each stripe is probed through the self-heal engine's mapping (selfheal.5) —
+ * the extents owning the stripe are resolved from the filesystem's trees, and
+ * a COMPRESSED one is probed over its real file range (selfheal.8: the
+ * kernel's `offset` is extent-relative there, so the printed offset points at
+ * the wrong 64 KiB). The mapping is built once per pass and a failure is
+ * permanent for the pass: such a stripe falls back to the plain probe at the
+ * kernel's offset — exact for an uncompressed extent (GT-3) — and when that
+ * names no block either, the finding says so (`unidentified`) instead of
+ * leaving an empty `badBlocks` that reads as "nothing found".
  */
 async function buildFindings(
   executor: CommandExecutor,
@@ -536,6 +635,14 @@ async function buildFindings(
   const subvols = new Map<number, string | null>()
   const findings: AhrScrubFinding[] = []
   const mounted = await mountedSubvolume(executor, pool)
+  let mapping: SelfhealContext | null = null
+  let mappingError: string | null = null
+  try {
+    mapping = await resolveContext(executor, pool.mountpoint)
+  }
+  catch (err) {
+    mappingError = err instanceof Error ? err.message : String(err)
+  }
   for (const [i, group] of groups.entries()) {
     const subvolume = await resolveSubvolume(executor, pool.mountpoint, group.root, subvols)
     // An unresolvable subvolume id (deleted since the scrub) leaves only the
@@ -560,9 +667,49 @@ async function buildFindings(
       continue
     }
     const badBlocks: number[] = []
-    for (const stripe of group.stripes)
-      badBlocks.push(...await probeStripe(executor, where.path, stripe.offset))
-    findings.push({ path: where.path, subvolume, inode: group.inode, stripes: group.stripes, badBlocks })
+    let extentRange: ExtentBlockRange | null = null
+    let unidentifiedReason: string | null = null
+    for (const stripe of group.stripes) {
+      let candidates: ExtentItem[] | null = null
+      if (mapping !== null) {
+        try {
+          candidates = await extentsForStripe(executor, mapping, group.root, group.inode, stripe.logical)
+        }
+        catch (err) {
+          unidentifiedReason ??= `extent could not be resolved (${err instanceof Error ? err.message : String(err)})`
+        }
+      }
+      else {
+        unidentifiedReason ??= `extent could not be resolved (${mappingError})`
+      }
+      if (candidates !== null && candidates.some(e => e.compression !== 'none')) {
+        const probed = await probeStripeExtents(executor, where.path, candidates, stripe.logical)
+        if (probed.badBlocks.length > 0) {
+          badBlocks.push(...probed.badBlocks)
+          extentRange ??= probed.extentRange
+        }
+        else {
+          unidentifiedReason ??= 'no block of the reported stripe read back with an error — the file was rewritten or repaired since the scrub'
+        }
+      }
+      else {
+        if (candidates !== null && candidates.length === 0)
+          unidentifiedReason ??= 'no extent of this file covers the reported stripe'
+        // No compressed extent in the named stripe — or the mapping is out:
+        // the plain probe, at the offset the kernel printed (the file offset
+        // of the stripe for an uncompressed extent, GT-3).
+        badBlocks.push(...await probeStripe(executor, where.path, stripe.offset))
+      }
+    }
+    findings.push({
+      path: where.path,
+      subvolume,
+      inode: group.inode,
+      stripes: group.stripes,
+      badBlocks,
+      ...(extentRange ? { compressed: true, extentBlocks: extentRange } : {}),
+      ...(badBlocks.length === 0 && unidentifiedReason ? { unidentified: true, reason: unidentifiedReason } : {}),
+    })
   }
   return findings
 }
@@ -609,7 +756,13 @@ function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult
   const lines = findings.slice(0, NOTIFY_PATH_LIMIT).map((f) => {
     const blocks = f.outsideMount
       ? 'in a snapshot, outside the mounted tree'
-      : (f.missing ? 'deleted since the scrub' : `${f.badBlocks.length} bad 4K block(s)`)
+      : f.missing
+        ? 'deleted since the scrub'
+        : f.compressed && f.extentBlocks
+          ? `compressed extent, ${f.extentBlocks.count} blocks`
+          : f.unidentified
+            ? `block not identified (${f.reason ?? 'no reason recorded'})`
+            : `${f.badBlocks.length} bad 4K block(s)`
     return `  ${f.path} — ${blocks}`
   })
   if (findings.length > NOTIFY_PATH_LIMIT)

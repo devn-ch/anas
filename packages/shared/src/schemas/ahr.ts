@@ -600,6 +600,12 @@ export type AhrScrubStripe = z.infer<typeof AhrScrubStripe>
  * something the kernel said. An empty array means no block inside the named
  * stripe read back with an error: the file was repaired, rewritten or removed
  * between the scrub and the probe — never assumed to be a lie about the stripe.
+ * That reading holds for an UNCOMPRESSED finding. A compressed one says so with
+ * `compressed`/`extentBlocks` (selfheal.8 — the kernel's `offset` is
+ * extent-relative there, so the stripe the kernel names is not the range that
+ * was probed), and one whose corrupt block could not be named at all says so
+ * with `unidentified` instead of leaving an empty list that reads as "nothing
+ * found".
  */
 export const AhrScrubFinding = z.object({
   path: z.string(),
@@ -610,6 +616,34 @@ export const AhrScrubFinding = z.object({
   stripes: z.array(AhrScrubStripe),
   /** 4 KiB file block indexes that read back with an error. */
   badBlocks: z.array(z.number().int().nonnegative()),
+  /**
+   * The corrupt extent is COMPRESSED (selfheal.8). The kernel's scrub warning
+   * then reports `offset` relative to the extent, not to the file, so the
+   * stripe it names cannot be probed directly: the extent's real file range is
+   * resolved from its EXTENT_DATA item and THAT range is probed — one bad
+   * on-disk sector of a compressed blob makes every block of the logical extent
+   * read back EIO (GT-9b), so the failing blocks are the whole extent.
+   */
+  compressed: z.boolean().optional(),
+  /**
+   * The corrupt extent's file block range: `first` is its first 4 KiB file
+   * block, `count` its length in 4 KiB blocks. Repair is handed `first` — the
+   * engine repairs a compressed blob when given any block of the extent.
+   */
+  extentBlocks: z.object({
+    first: z.number().int().nonnegative(),
+    count: z.number().int().positive(),
+  }).optional(),
+  /**
+   * The corruption is real (the kernel named this file) but no bad block could
+   * be named: the extent covering the error could not be resolved, or nothing
+   * in the resolved range read back with an error. An empty `badBlocks` alone
+   * would read as "repaired, rewritten or removed" — which is a reading that
+   * only holds when the probe knew where to look.
+   */
+  unidentified: z.boolean().optional(),
+  /** Why the block could not be named — the operator's reason, verbatim. */
+  reason: z.string().optional(),
   /**
    * The path does not exist any more (deleted between the scrub and the probe,
    * or an unresolvable subvolume). The finding is still reported — the kernel
