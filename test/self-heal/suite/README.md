@@ -102,13 +102,22 @@ reference implementation and checked when present.
   ±200 stripes while small; `bounded_window_check` calls it before every
   check. The same staleness affects degraded reads (`verify_stripe` sweeps
   first).
-- **RMW old-data read is cache-sensitive**: with the stripe cache-stale, a
-  default-`rmw_level` write-through reads the OLD (pre-corruption) bytes from
-  cache, leaves parity untouched — that IS the GT-7 poison the negative
-  control asserts. With the cache cold, md reads the member's actual junk and
-  the same write silently fixes parity. The negative control runs in the
-  suite's real sequence; the checks around it are cache-evicted so they
-  report member truth either way.
+- **The naive write-back poisons parity unless the stripe's SIBLING data
+  blocks are already in md's stripe cache** (settled by a dedicated 3-variant
+  probe, two identical runs, 2026-09-11 — see GT-14 in
+  `docs/AHR-SELF-HEAL-GROUND-TRUTH.md`). Cache-cold (the real-world case: rot
+  sits on disk, nobody has read the stripe through the cache), a default
+  `rmw_level` write-through of the correct block does read-modify-write
+  against the junk on disk → data member fixed, parity WRONG, a failed
+  different member reconstructs 1 wrong block. If a preceding md `check` has
+  loaded the stripe (all sibling data blocks up to date in cache), md's
+  RMW/RCW cost comparison comes out 0/0 and it takes the reconstruct path:
+  parity recomputed from the cached siblings plus the new block → CORRECT.
+  A plain aligned READ through md does NOT populate the stripe cache
+  (raid5's aligned-read bypass), so "I just read the file" does not protect
+  a later write. The suite's negative control runs cache-cold on purpose —
+  that is the only state in which it proves anything — and the reference
+  repair never relies on cache residency: `rmw_level=0` for the write.
 - **mismatch_cnt settles after sync_action**: on a small window the check op
   flips to `idle` slightly before `mismatch_cnt` is finalized for that op —
   reading immediately returns the PREVIOUS check's count. `bounded_window_check`

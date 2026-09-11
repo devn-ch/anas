@@ -343,6 +343,32 @@ recorded: while a check is suspended, a new `echo check > sync_action` is refuse
 bounded op that is ended with `idle` leaves `resync_start=none`, so the next run
 starts from `sync_min`.
 
+## GT-14 — The naive write-back poisons parity only when the stripe is cache-cold — PROVEN (probe, two identical runs)
+
+Follow-up to GT-7, run after the `selfheal.2` suite raised the question. Three
+variants, each on a fresh RAID5 rig (6 × 200 MiB loops, chunk 64K,
+left-symmetric, `rmw_level=1`, `stripe_cache_size=256`), f block 300 on member
+`m0` at stripe 49, parity on `m4`; the correct block written back through md
+with `oflag=direct conv=notrunc,fsync`; then an evicted bounded check and a
+failed-member (`m1`) stripe read (`probe-out/probe.json`, `run2.log` on the node).
+
+| variant | cache state at the write | post-write `mismatch_cnt` | wrong 4K blocks with `m1` failed (of 80) | verdict |
+|---|---|---|---|---|
+| V1 | cold (`drop_caches` + stripe-cache eviction, no check before the write) | **8** | **1** (in `m1`'s chunk) | POISONED |
+| V2 | a bounded `check` over the stripe ran first and was NOT evicted (all sibling data blocks up to date in the cache) | **0** | **0** | CORRECT |
+| V3 | the stripe row was READ through md before corrupting (`dd if=/dev/md127 bs=65536 count=5 skip=245 iflag=direct`), no eviction | **8** | **1** | POISONED |
+
+Reading: V1 is the real-world shape (rot on disk, stripe not cached) and it
+poisons — GT-7 stands. V2 shows WHY a naive write can come out clean: with
+every sibling data block already up to date in the stripe cache, md's
+RMW-vs-RCW cost comparison is 0 vs 0 and it takes the reconstruct path, so
+parity is recomputed from the cached siblings plus the new block. V3 shows
+that a plain aligned read through md does NOT populate the stripe cache
+(raid5's aligned-read bypass): "recently read" is still cold for this purpose.
+Consequence for the repair sequence: never rely on cache residency between a
+pre-check and the write — `rmw_level=0` for the write window, as designed.
+The suite's parity-trap negative control is cache-cold by construction.
+
 ---
 
 ## Drill notes (factual, no recommendations)
