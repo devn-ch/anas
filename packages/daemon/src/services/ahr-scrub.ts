@@ -7,23 +7,28 @@ import { run } from './ahr-exec.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { SUBVOL_DATA, subvolFromMountOptions } from './ahr-snapshots.js'
 import { pveNotify } from './pve-notify.js'
+import { mismatchCntArgs } from './scrub-schedules.js'
 
 /**
  * AHR pool scrub (Epic 11 + AHR, docs/AHR-DESIGN.md §4) — behind
- * POST /v1/ahr/:name/scrub. Two phases, strictly SEQUENTIAL — both are
- * full-device reads and would thrash each other concurrently (§4):
+ * POST /v1/ahr/:name/scrub. ONE scrub, TWO phases, strictly SEQUENTIAL and
+ * never severable (story selfheal.4) — both are full-device reads and would
+ * thrash each other concurrently (§4):
  *
- *   1. btrfs scrub (start + poll `btrfs scrub status`) — checksums the
- *      filesystem's view of the data.
- *   2. per-array `mdadm --action=check`, one band at a time, waiting on
+ *   1. per-array `mdadm --action=check`, one band at a time, waiting on
  *      /proc/mdstat between arrays — verifies parity/mirror consistency
- *      underneath the filesystem.
+ *      underneath the filesystem. A band whose check counted parity mismatches
+ *      (`/sys/block/<md>/md/mismatch_cnt` > 0, read once the check goes idle)
+ *      warns immediately: rot exists, and phase 2 is what names the files.
+ *   2. btrfs scrub (start + poll `btrfs scrub status`) — checksums the
+ *      filesystem's view of the data — then the ATTRIBUTION pass (story
+ *      selfheal.3) names the corrupt files and their failing 4 KiB blocks.
  *
- * Between them, when phase 1 found errors, the ATTRIBUTION pass (story
- * selfheal.3) names the corrupt files and their failing 4 KiB blocks. It runs
- * BETWEEN the phases deliberately: its probe reads are tiny, but they are
- * still reads of the array, and §4's rule is that nothing else reads while a
- * check runs.
+ * The attribution's probe reads are tiny, but they are still reads of the
+ * array: §4's rule is that nothing else reads while a check runs, and running
+ * it after phase 1 keeps that true (it used to sit between the phases when the
+ * order was reversed). The manual Scrub button and the periodic timer run this
+ * same code path — one job, one order.
  *
  * `btrfs scrub status` text is parsed minimally (Status / Bytes scrubbed % /
  * Error summary): like /proc/mdstat it has no structured alternative on the
@@ -48,9 +53,18 @@ export const AHR_SCRUB_FINDMNT_ARGS = ['--json', '--real']
 /** Default poll interval while waiting on scrub/check progress. */
 export const AHR_SCRUB_POLL_MS = 5000
 
+/**
+ * Pause between a band's check going idle and the mismatch_cnt read (story
+ * selfheal.4): md finalises the counter as the sync thread winds down, and the
+ * +1 s is the margin a just-finished check needs before its counter is final.
+ */
+export const AHR_SCRUB_MISMATCH_DELAY_MS = 1000
+
 export interface AhrScrubOptions {
   /** Poll interval override (tests use 1). */
   pollIntervalMs?: number
+  /** Delay before the mismatch_cnt read (tests use 1). */
+  mismatchDelayMs?: number
 }
 
 /** Minimal structured view of `btrfs scrub status`. */
@@ -84,6 +98,28 @@ function isCleanSummary(summary: string | null): boolean {
 
 async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/**
+ * The parity-mismatch counter md kept for a check on this array —
+ * `/sys/block/<kernelName>/md/mismatch_cnt`, the same sysfs file the 11.17 md
+ * event hook reads. Null when unreadable (fail-open: a missing counter costs
+ * the early warning, never a false "rot exists").
+ */
+export async function mismatchCount(
+  executor: CommandExecutor,
+  kernelName: string,
+): Promise<number | null> {
+  try {
+    const r = await executor.exec(CAT, mismatchCntArgs(kernelName))
+    if (r.exitCode !== 0)
+      return null
+    const n = Number.parseInt(r.stdout.trim(), 10)
+    return Number.isFinite(n) && n >= 0 ? n : null
+  }
+  catch {
+    return null
+  }
 }
 
 // ---- Attribution: WHAT is corrupt (story selfheal.3) ------------------------
@@ -587,9 +623,10 @@ function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult
 }
 
 /**
- * Scrub an AHR pool: btrfs first, THEN each md array's check — never
- * concurrent. Progress is reported on every poll (never an unbounded silent
- * wait); scrub duration itself is unbounded by design (hours on real disks).
+ * Scrub an AHR pool: phase 1 md parity (one band at a time), THEN phase 2 btrfs
+ * checksums + attribution — never concurrent (selfheal.4). Progress is
+ * reported on every poll (never an unbounded silent wait); each phase's
+ * duration is unbounded by design (hours on real disks).
  */
 export async function scrubAhrPool(
   executor: CommandExecutor,
@@ -599,61 +636,27 @@ export async function scrubAhrPool(
 ): Promise<AhrScrubResult> {
   const { name } = pool
   const interval = opts?.pollIntervalMs ?? AHR_SCRUB_POLL_MS
+  const mismatchDelay = opts?.mismatchDelayMs ?? AHR_SCRUB_MISMATCH_DELAY_MS
   if (!pool.mounted)
     throw new Error(`pool '${name}' is not mounted — btrfs scrub needs the filesystem online`)
 
-  // --- Phase 1: btrfs scrub ---------------------------------------------------
-  // Stamped BEFORE the scrub starts: the kernel journal read below is bounded to
-  // THIS scrub's window, so an older scrub's errors are never re-reported as
-  // this one's findings (selfheal.3).
-  const startedAt = new Date()
-  updateProgress('Starting btrfs scrub')
-  await run(executor, BTRFS, ['scrub', 'start', pool.mountpoint])
-  let btrfsErrors: string | null = null
-  for (;;) {
-    const st = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', pool.mountpoint])).stdout)
-    if (st.status === 'running') {
-      updateProgress(`btrfs scrub running${st.percent !== null ? ` (${st.percent.toFixed(1)}%)` : ''}`)
-      await sleep(interval)
-      continue
-    }
-    if (st.status === 'aborted')
-      throw new Error(`btrfs scrub on '${name}' was aborted${isCleanSummary(st.errorSummary) ? '' : ` (${st.errorSummary})`}`)
-    // finished — or no Status line at all (nothing to report): done either way.
-    if (!isCleanSummary(st.errorSummary))
-      btrfsErrors = st.errorSummary
-    break
-  }
-
-  // --- Attribution: which files, which blocks (selfheal.3) -------------------
-  let attribution: Pick<AhrScrubResult, 'findings' | 'errorsAttributed' | 'unattributed' | 'truncated'> = {}
-  if (btrfsErrors !== null) {
-    try {
-      attribution = await attributeScrub(executor, pool, startedAt, updateProgress)
-    }
-    catch (err) {
-      // Never fails the scrub: the count and the notification stand on their own.
-      console.error(`ahr-scrub: could not attribute '${name}' scrub errors: ${err instanceof Error ? err.message : String(err)}`)
-    }
-  }
-
-  // --- Phase 2: md checks, one array at a time (sequenced, §4) ----------------
+  // --- Phase 1/2: md parity checks, one band at a time (sequenced, §4) --------
   // Band-ascending order without copying the pool's array list.
   const order = pool.arrays.map((_, i) => i)
   order.sort((x, y) => pool.arrays[x].band - pool.arrays[y].band)
   for (const i of order) {
     const array = pool.arrays[i]
     const label = `${name}-r${array.band}`
-    updateProgress(`Starting md check on ${label}`)
+    updateProgress(`phase 1/2: md parity check on ${label}`)
     await run(executor, MDADM, ['--action=check', array.device])
 
     // /proc/mdstat keys arrays by transient kernel names (GT-2). Resolve the
     // CURRENT kernel name from the stable pin symlink (array.device is always
     // /dev/md/<pool>-r<band>) at point-of-use — NEVER trust array.kernelName
-    // from the route-time topology read: the btrfs scrub above is unbounded
-    // (hours), and md kernel numbers re-enumerate AND get reused across any
-    // reassembly in that window, so a stale md127 could match a DIFFERENT
-    // array in mdstat and make us wait on the wrong device (or none).
+    // from the route-time topology read: md kernel numbers re-enumerate AND get
+    // reused across any reassembly between the route read and this check, so a
+    // stale md127 could match a DIFFERENT array in mdstat and make us wait on
+    // the wrong device (or none).
     const rp = await executor.exec(REALPATH, [array.device])
     const kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
     if (!kernelName) {
@@ -673,6 +676,57 @@ export async function scrubAhrPool(
         break
       updateProgress(`md check on ${label}${md.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
       await sleep(interval)
+    }
+
+    // The check's verdict: md counted parity mismatches ⇒ rot EXISTS in this
+    // band. Phase 2 is what names the files, and it starts right now — say so
+    // in one warning rather than leaving the operator staring at a number (§e).
+    await sleep(mismatchDelay)
+    const mismatches = await mismatchCount(executor, kernelName)
+    if (mismatches !== null && mismatches > 0) {
+      await pveNotify(
+        executor,
+        'warning',
+        `AHR scrub: parity mismatch on ${label}`,
+        `rot exists in ${label} — phase 2 (running now) will name the files`,
+      )
+    }
+  }
+
+  // --- Phase 2/2: btrfs checksum scrub ----------------------------------------
+  // Stamped BEFORE the scrub starts: the kernel journal read below is bounded to
+  // THIS scrub's window, so an older scrub's errors are never re-reported as
+  // this one's findings (selfheal.3).
+  const startedAt = new Date()
+  updateProgress('phase 2/2: btrfs checksum scrub')
+  await run(executor, BTRFS, ['scrub', 'start', pool.mountpoint])
+  let btrfsErrors: string | null = null
+  for (;;) {
+    const st = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', pool.mountpoint])).stdout)
+    if (st.status === 'running') {
+      updateProgress(`btrfs scrub running${st.percent !== null ? ` (${st.percent.toFixed(1)}%)` : ''}`)
+      await sleep(interval)
+      continue
+    }
+    if (st.status === 'aborted')
+      throw new Error(`btrfs scrub on '${name}' was aborted${isCleanSummary(st.errorSummary) ? '' : ` (${st.errorSummary})`}`)
+    // finished — or no Status line at all (nothing to report): done either way.
+    if (!isCleanSummary(st.errorSummary))
+      btrfsErrors = st.errorSummary
+    break
+  }
+
+  // --- Attribution: which files, which blocks (selfheal.3) -------------------
+  // Runs AFTER phase 1 by construction now — its probe reads are tiny, but §4's
+  // rule is that nothing else reads the array while a check runs.
+  let attribution: Pick<AhrScrubResult, 'findings' | 'errorsAttributed' | 'unattributed' | 'truncated'> = {}
+  if (btrfsErrors !== null) {
+    try {
+      attribution = await attributeScrub(executor, pool, startedAt, updateProgress)
+    }
+    catch (err) {
+      // Never fails the scrub: the count and the notification stand on their own.
+      console.error(`ahr-scrub: could not attribute '${name}' scrub errors: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
 

@@ -8,9 +8,13 @@
  * enables/disables a periodic scrub on a ZFS pool and an AHR pool through IDENTICAL
  * controls; only the backend differs.
  *
- * VISIBLE DIVERGENCE (never hidden): AHR mdcheck is NODE-GLOBAL — one toggle
- * governs md checks for EVERY AHR pool on the host. Surfaced per-row (the Scope
- * column's note) and confirmed on toggle.
+ * VISIBLE DIVERGENCE (never hidden): the AHR periodic scrub runs on ANAS's OWN
+ * node-level `anas-scrub.timer` (story selfheal.4) — the WHOLE two-phase scrub
+ * (phase 1 md parity, then phase 2 btrfs checksums + attribution) for every
+ * enabled AHR pool, one pool at a time (pools share spindles), on a monthly or
+ * quarterly cadence chosen in the toolbar beside the toggle. Enabling it takes
+ * md checks over from mdadm's mdcheck timers (never double-scheduled); the
+ * honest notes ride the Scope column and the toggle-confirm dialog.
  *
  * SECOND VISIBLE DIVERGENCE — the "Last scrub" column. ZFS records the verdict of
  * the last completed pass and we say it in words ("repaired 0 B, 0 errors — <date>
@@ -26,20 +30,20 @@
  *     instead of going quiet: ZFS keeps ONE scan record per pool, so during a pass
  *     there IS no verdict to print.
  *   - THIRD VISIBLE DIVERGENCE — Stop is ZFS-only. `zpool scrub -s` stops a scrub;
- *     the AHR scrub is a multi-phase JOB (btrfs scrub, then a per-band md check)
- *     with no cancel path in the daemon, and this story does not build one. The
- *     AHR row's Stop is disabled with the reason in its tooltip rather than
- *     silently missing.
+ *     the AHR scrub is a two-phase JOB (each band's md parity check, then the
+ *     btrfs checksum scrub) with no cancel path in the daemon, and this story
+ *     does not build one. The AHR row's Stop is disabled with the reason in its
+ *     tooltip rather than silently missing.
  *
  * Data (paths relative to /v1 — see routes/scrub.ts):
  *   GET  /scrub                → { data: [ { target:{kind,pool}, enabled,
- *                                   cadence:'monthly', mechanism, note?,
- *                                   lastScrub: {function,state,finishedAt,
- *                                     durationSeconds,repairedBytes,errors}|null,
+ *                                   cadence, mechanism, note?, nextRun?,
+ *                                   phases?, lastScrub: {…}|null,
  *                                   running?: {function?,percent?,speedBytesSec?,
  *                                     etaSeconds?} } ] }
  *   PUT  /scrub/zfs/:pool  {enabled}  → flip the ZFS periodic-scrub property
- *   PUT  /scrub/ahr/:pool  {enabled}  → flip the node's mdcheck timers (node-global)
+ *   PUT  /scrub/ahr/:pool  {enabled, cadence?}  → edit the node timer's pool
+ *                                   list (cadence is node-level, optional)
  *   POST /pools/:pool/scrub {action}  → start/stop a ZFS scrub (Epic 4.12's route)
  *   POST /ahr/:pool/scrub   {}        → AHR scrub job (Epic 11's route; no stop)
  *   GET  /jobs?status=completed       → the last AHR scrub's findings (selfheal.3)
@@ -159,6 +163,37 @@
         }
     }
 
+    // Enable/disable any toolbar component (buttons AND the cadence combo) —
+    // guarded so a component without Ext's method degrades to the property.
+    function cmpSetDisabled(cmp, disabled) {
+        try {
+            if (!cmp) { return; }
+            if (typeof cmp.setDisabled === 'function') {
+                cmp.setDisabled(!!disabled);
+            } else {
+                cmp.disabled = !!disabled;
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // Read a combobox's value through Ext's accessor, falling back to the raw
+    // property — the value belongs to the component, whichever shape it ships in.
+    function comboValue(cmp) {
+        try {
+            if (cmp && typeof cmp.getValue === 'function') { return cmp.getValue(); }
+        } catch (e) { /* fall through */ }
+        return cmp ? cmp.value : undefined;
+    }
+
+    function comboSetValue(cmp, v) {
+        try {
+            if (cmp && typeof cmp.setValue === 'function') { cmp.setValue(v); return; }
+        } catch (e) { /* fall through */ }
+        if (cmp) { cmp.value = v; }
+    }
+
     // ---- Row shape + renderers ---------------------------------------------
 
     function scrubRow(state, findingsByPool) {
@@ -172,6 +207,11 @@
             cadence: state.cadence || 'monthly',
             mechanism: state.mechanism || '',
             note: state.note || '',
+            // The node timer's next fire (AHR; ISO, or null when off/unreadable)
+            // and the two phases one scrub consists of (selfheal.4). Both absent
+            // against an older daemon — the skew rule.
+            nextRun: state.nextRun || null,
+            phases: state.phases || null,
             // The last completed verify pass, or null when the filesystem keeps
             // no record of one (always so for AHR — see the header).
             lastScrub: state.lastScrub || null,
@@ -334,9 +374,20 @@
         var last = rec.get('lastScrub');
         if (!last) {
             if (rec.get('kind') === 'ahr') {
-                return '<span title="' + enc(t('md records no completion time or result for a check; '
-                    + 'ANAS reports only what the system records')) + '">'
-                    + muted('&mdash; ' + enc(t('(md keeps no completion record)'))) + '</span>';
+                // What the periodic scrub IS now (selfheal.4): the two phases it
+                // runs, in order, and when the node timer fires next. "next"
+                // only when the timer reports one (off/unreadable → absent).
+                var phases = 'phase 1 parity (md) → phase 2 checksums (btrfs)';
+                var next = rec.get('nextRun');
+                var when = next ? '; ' + t('next') + ' ' + absTime(next) : '';
+                var phaseTip = t('the periodic AHR scrub runs both phases, in this order: each band\'s '
+                    + 'md parity check, then the btrfs checksum scrub that names corrupt files. '
+                    + 'md records no completion time or result for a check; ANAS reports only '
+                    + 'what the system records.');
+                return '<span title="' + enc(phaseTip) + '">'
+                    + enc(phases + when)
+                    + ' <span style="color:var(--anas-muted,gray);">'
+                    + '&mdash; ' + enc(t('(md keeps no completion record)')) + '</span></span>';
             }
             return '<span title="' + enc(t('ZFS reports no completed scrub or resilver for this pool')) + '">'
                 + muted(enc(t('never scrubbed'))) + '</span>';
@@ -472,6 +523,7 @@
         var rec = selectedScrub(scrubGrid);
         var running = rec ? rec.get('running') : null;
         var kind = rec ? rec.get('kind') : null;
+        var isAhr = !!rec && kind === 'ahr';
 
         var btn = scrubGrid.down('#scrubToggle');
         if (btn) {
@@ -480,6 +532,23 @@
                 var on = rec.get('enabled');
                 btn.setText(on ? t('Disable scrub') : t('Enable scrub'));
                 btn.setIconCls(on ? 'fa fa-pause' : 'fa fa-play');
+                // The toggle's meaning, ON the button (selfheal.4): the ANAS
+                // timer runs the whole two-phase scrub and takes mdcheck over.
+                btnSetTip(btn, !isAhr ? '' : (on
+                    ? t('removes this pool from the node\'s anas-scrub timer; the mdcheck timers stay off')
+                    : t('adds this pool to the node\'s anas-scrub timer — phase 1 md parity, '
+                        + 'then phase 2 btrfs checksums; mdadm\'s mdcheck timers are turned off')));
+            }
+        }
+
+        // The cadence selector lives exactly where the toggle does — the toolbar,
+        // enabled only for an AHR row (ZFS's cadence is PVE's monthly cron). It
+        // rides the toggle body; there is no second control, no second dialog.
+        var cad = scrubGrid.down('#scrubCadence');
+        if (cad) {
+            cmpSetDisabled(cad, !isAhr);
+            if (isAhr) {
+                comboSetValue(cad, rec.get('cadence') || 'monthly');
             }
         }
 
@@ -490,9 +559,10 @@
         }
 
         // Stop is ZFS-only, and that asymmetry is STATED, never silent: `zpool
-        // scrub -s` stops a scrub, while the AHR scrub is a multi-phase job
-        // (btrfs scrub, then a per-band md check) the daemon has no cancel path
-        // for. A resilver cannot be stopped at all — same rule as the Pools view.
+        // scrub -s` stops a scrub, while the AHR scrub is a two-phase job (each
+        // band's md parity check, then the btrfs checksum scrub) the daemon has
+        // no cancel path for. A resilver cannot be stopped at all — same rule as
+        // the Pools view.
         var stopBtn = scrubGrid.down('#scrubStop');
         if (stopBtn) {
             var reason = '';
@@ -502,7 +572,8 @@
                 reason = t('nothing is running on this pool');
             } else if (kind === 'ahr') {
                 reason = t('an AHR scrub cannot be stopped: it is a two-phase job '
-                    + '(btrfs scrub, then each band\'s md check) with no cancel path');
+                    + '(each band\'s md parity check, then the btrfs checksum scrub) '
+                    + 'with no cancel path');
             } else if (running.function === 'RESILVER') {
                 reason = t('a resilver cannot be stopped — only a scrub can');
             }
@@ -519,13 +590,18 @@
         var pool = rec.get('pool');
         var next = !rec.get('enabled');
         var path = '/scrub/' + (kind === 'ahr' ? 'ahr' : 'zfs') + '/' + encodeURIComponent(pool);
+        // The cadence rides the toggle body (node-level — the one timer carries
+        // it); ZFS's request has no cadence, so its body stays { enabled }.
+        var cadence = kind === 'ahr'
+            ? (comboValue(scrubGrid.down('#scrubCadence')) || 'monthly')
+            : undefined;
 
         var doToggle = function () {
             ANAS.runJob({
                 node: node,
                 method: 'put',
                 path: path,
-                body: { enabled: next },
+                body: kind === 'ahr' ? { enabled: next, cadence: cadence } : { enabled: next },
                 view: scrubGrid,
                 failTitle: 'Scrub toggle failed',
                 successMsg: (next ? t('Periodic scrub enabled') : t('Periodic scrub disabled'))
@@ -534,15 +610,19 @@
             });
         };
 
-        // AHR mdcheck is NODE-GLOBAL — confirm the scope before flipping it, so the
-        // operator sees that this governs md checks for EVERY AHR pool on the host.
+        // The AHR toggle edits the NODE-LEVEL anas-scrub timer — confirm the
+        // scope before flipping it: every enabled AHR pool is scrubbed by the
+        // one timer, and enabling takes mdcheck over (never double-scheduled).
         if (kind === 'ahr') {
             try {
                 Ext.Msg.confirm(
-                    t('Periodic scrub (node-global)'),
+                    t('Periodic scrub (node-level timer)'),
                     (rec.get('note') ? (enc(rec.get('note')) + '<br><br>') : '')
                         + (next ? t('Enable') : t('Disable')) + ' '
-                        + t('md periodic checks for ALL AHR pools on this node?'),
+                        + t('the ANAS scrub timer for this pool — the timer runs the whole scrub '
+                            + '(phase 1 md parity, then phase 2 btrfs checksums) for every enabled '
+                            + 'AHR pool on this node, one at a time?')
+                        + (next ? '<br><br>' + enc(t('mdadm\'s mdcheck timers will be turned off.')) : ''),
                     function (btn) {
                         if (btn === 'yes') { doToggle(); }
                     }
@@ -992,6 +1072,8 @@
         var store = Ext.create('Ext.data.Store', {
             fields: ['pool', 'kind', 'cadence', 'mechanism', 'note', 'rowKey',
                 { name: 'enabled', type: 'auto' },
+                { name: 'nextRun', type: 'auto' },
+                { name: 'phases', type: 'auto' },
                 { name: 'lastScrub', type: 'auto' },
                 { name: 'running', type: 'auto' },
                 { name: 'findings', type: 'auto' }],
@@ -1017,7 +1099,9 @@
             border: false,
             items: [
                 {
-                    xtype: 'gridpanel',
+                    // xtype 'grid' (= Ext.grid.Panel; 'gridpanel' is its alias) —
+                    // the toolbar handlers resolve their grid via up('grid').
+                    xtype: 'grid',
                     itemId: 'scrubGrid',
                     cls: 'anas-grid-scrub',
                     flex: 1,
@@ -1051,9 +1135,25 @@
                         },
                         '-',
                         {
+                            // The cadence of the node's AHR scrub timer — node-level,
+                            // so ONE selector beside the toggle covers every pool; it
+                            // rides the toggle body rather than being a second verb.
+                            xtype: 'combobox',
+                            itemId: 'scrubCadence',
+                            cls: 'anas-cmb-scrub-cadence',
+                            width: 110,
+                            editable: false,
+                            forceSelection: true,
+                            queryMode: 'local',
+                            store: [['monthly', t('Monthly')], ['quarterly', t('Quarterly')]],
+                            value: 'monthly',
+                            disabled: true
+                        },
+                        {
                             xtype: 'component',
-                            html: enc(t('Verify pools on a monthly cadence. ZFS: per-pool. '
-                                + 'AHR: node-global (mdcheck covers every array).')),
+                            html: enc(t('Verify pools periodically. ZFS: PVE\'s monthly cron, per-pool. '
+                                + 'AHR: the ANAS timer (monthly/quarterly) — phase 1 md parity, then '
+                                + 'phase 2 btrfs checksums, pools one at a time.')),
                             style: 'color:var(--anas-muted,gray);font-size:11px;'
                         },
                         '->',

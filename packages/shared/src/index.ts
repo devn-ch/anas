@@ -397,6 +397,9 @@ export {
 
 // Schedule schemas (Epic 17 — uniform ANAS-owned snapshot schedules)
 export {
+  AhrScrubPhase,
+  AhrScrubSchedule,
+  AhrScrubToggleRequest,
   LastScrub,
   PeriodicScrubState,
   RetentionBucket,
@@ -405,6 +408,7 @@ export {
   ScheduledSnapshot,
   ScheduleId,
   ScheduleRunResult,
+  ScrubCadence,
   ScrubMechanism,
   ScrubRunning,
   ScrubTarget,

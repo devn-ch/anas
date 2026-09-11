@@ -2,7 +2,8 @@ import type { AhrPool, LastScrub, PeriodicScrubState, ScrubRunning } from '@anas
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
-import { PoolName, ScrubToggleRequest } from '@anas/shared'
+import { AhrScrubToggleRequest, PoolName, ScrubToggleRequest } from '@anas/shared'
+import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseScrubScans } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -13,19 +14,24 @@ import {
   setAhrScrubEnabled,
   setZfsScrubEnabled,
 } from '../services/scrub-schedules.js'
+import { DEFAULT_SYSTEMD_DIR } from '../services/snapshot-schedule-units.js'
 import { requireIdentity } from './identity.js'
 
 const ZPOOL = '/usr/sbin/zpool'
+const CAT = '/usr/bin/cat'
 
 /**
- * Periodic SCRUB — uniform surface, filesystem-native backend (Epic 17.5,
- * docs/SCHEDULES-DESIGN.md §Scrub). One "periodic scrub: on/off (monthly)"
- * control for a ZFS pool and an AHR pool; the toggle flips the filesystem's own
- * switch (ZFS: `org.debian:periodic-scrub` property; AHR: mdadm's mdcheck timers).
+ * Periodic SCRUB — uniform surface, filesystem-native backend (Epic 17.5 +
+ * story selfheal.4, docs/SCHEDULES-DESIGN.md §Scrub). One "periodic scrub:
+ * on/off" control for a ZFS pool and an AHR pool; the toggle flips the
+ * filesystem's own mechanism (ZFS: `org.debian:periodic-scrub` property; AHR:
+ * ANAS's node-level `anas-scrub.timer`, the whole two-phase scrub).
  *
  *   GET /v1/scrub                → uniform state for every ZFS + AHR pool
- *   PUT /v1/scrub/zfs/:pool  {enabled}  → flip the ZFS property (202 job)
- *   PUT /v1/scrub/ahr/:pool  {enabled}  → flip the node's mdcheck timers (202 job)
+ *   PUT /v1/scrub/zfs/:pool  {enabled}         → flip the ZFS property (202 job)
+ *   PUT /v1/scrub/ahr/:pool  {enabled, cadence?} → edit the node timer's pool
+ *                                 list + cadence; disables mdcheck on enable
+ *                                 (202 job)
  *
  * Each state also carries `lastScrub` — the pool's last COMPLETED verify pass
  * (17.3's "`zpool status` scrub dates"). ZFS records one; md records NONE, so an
@@ -42,16 +48,20 @@ const ZPOOL = '/usr/sbin/zpool'
  *
  * Toggles are jobs (Principle 4). ANAS deliberately does NOT touch the (disabled)
  * systemd `zfs-scrub-*@.timer` for ZFS, so the property remains the single lever
- * and there is no double-scrub (GT-4). The AHR toggle is NODE-GLOBAL (mdcheck
- * checks every array) — surfaced in each state's `note`.
+ * and there is no double-scrub (GT-4). The AHR toggle edits the node-level
+ * timer's embedded schedule (selfheal.4) — its `note` stays honest about an
+ * mdcheck timer still on, and about md arrays that are no AHR band.
  */
 export interface ScrubRouteOptions {
   executor: CommandExecutor
   jobQueue: JobQueue
+  /** systemd unit dir for the `anas-scrub` units (tests override). */
+  systemdDir?: string
 }
 
 export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptions) {
   const { executor, jobQueue } = opts
+  const systemdDir = opts.systemdDir ?? DEFAULT_SYSTEMD_DIR
 
   /** Live ZFS pool names (fail-open to []). */
   async function zfsPoolNames(): Promise<string[]> {
@@ -98,7 +108,19 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
 
   // --- GET /scrub — uniform periodic-scrub state across ZFS + AHR pools ------
   server.get('/scrub', async () => {
-    const [zfsPools, ahr, scans] = await Promise.all([zfsPoolNames(), ahrPools(), zfsScrubScans()])
+    const [zfsPools, ahr, scans, mdstat] = await Promise.all([
+      zfsPoolNames(),
+      ahrPools(),
+      zfsScrubScans(),
+      // The node's md arrays — diffed against the AHR bands so a foreign array
+      // (one ANAS's scrub never covers) is said in the note, never silent.
+      executor.exec(CAT, MDSTAT_CAT_ARGS).then(r => r.exitCode === 0 ? parseMdstat(r.stdout) : []).catch(() => []),
+    ])
+    const ctx = {
+      dir: systemdDir,
+      mdKernelNames: mdstat.map(a => a.kernelName),
+      ahrKernelNames: ahr.flatMap(p => p.arrays.map(a => a.kernelName).filter((n): n is string => !!n)),
+    }
     const states: PeriodicScrubState[] = [
       ...await Promise.all(zfsPools.map(p => readZfsScrubState(
         executor,
@@ -108,7 +130,7 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
       ))),
       // The AHR running check comes out of the topology read this route already
       // makes to enumerate the pools — no extra mdstat read for it.
-      ...await Promise.all(ahr.map(p => readAhrScrubState(executor, p.name, ahrScrubRunning(p)))),
+      ...await Promise.all(ahr.map(p => readAhrScrubState(executor, p.name, ahrScrubRunning(p), ctx))),
     ]
     return { data: states }
   })
@@ -149,20 +171,20 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     return { job }
   })
 
-  // --- PUT /scrub/ahr/:pool — flip the node's mdcheck timers (node-global) ---
+  // --- PUT /scrub/ahr/:pool — edit the node timer's pool list (+ cadence) ----
   server.put<{ Params: { pool: string } }>('/scrub/ahr/:pool', async (request, reply) => {
     const poolParsed = PoolName.safeParse(request.params.pool)
     if (!poolParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${poolParsed.error.issues[0]?.message}` } }
     }
-    const bodyParsed = ScrubToggleRequest.safeParse(request.body ?? {})
+    const bodyParsed = AhrScrubToggleRequest.safeParse(request.body ?? {})
     if (!bodyParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid toggle: ${bodyParsed.error.issues[0]?.message}` } }
     }
     const pool = poolParsed.data
-    const { enabled } = bodyParsed.data
+    const { enabled, cadence } = bodyParsed.data
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -175,11 +197,12 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
 
     const job = jobQueue.submit(
       'scrub.ahr.toggle',
-      { ...identity, params: { pool, enabled: String(enabled) } },
+      { ...identity, params: { pool, enabled: String(enabled), ...(cadence ? { cadence } : {}) } },
       async () => {
-        // NODE-GLOBAL: this governs md periodic checks for every array on the host.
-        await setAhrScrubEnabled(executor, enabled)
-        return { pool, periodicScrub: enabled, scope: 'node-global' }
+        // Node-level: edits the ONE anas-scrub timer's pool list; enabling also
+        // takes mdcheck over (disable) — ANAS owns md checks on this node.
+        await setAhrScrubEnabled(executor, pool, enabled, { dir: systemdDir, cadence })
+        return { pool, periodicScrub: enabled, ...(cadence ? { cadence } : {}), scope: 'node-level' }
       },
     )
     reply.code(202)

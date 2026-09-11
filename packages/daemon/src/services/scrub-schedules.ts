@@ -1,40 +1,43 @@
-import type { AhrPool, LastScrub, PeriodicScrubState, ScrubRunning } from '@anas/shared'
+import type { AhrPool, LastScrub, PeriodicScrubState, ScrubCadence, ScrubRunning } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import { readScrubSchedule, readScrubTimerNext, removeScrubUnits, SCRUB_TIMER_NAME, writeScrubUnits } from './scrub-schedule-units.js'
+// The ONE systemd unit dir constant (env-overridable for tests) — reused, not
+// duplicated: the snapshot store owns it.
+import { DEFAULT_SYSTEMD_DIR } from './snapshot-schedule-units.js'
 
 /**
- * Periodic SCRUB — uniform surface, filesystem-native backend (Epic 17.5,
- * docs/SCHEDULES-DESIGN.md §Scrub). The operator sees one "periodic scrub:
- * on/off (monthly)" control for a ZFS pool and an AHR pool; ANAS flips the
- * filesystem's OWN switch behind it (guest philosophy — we surface + adjust the
- * distro's existing mechanism, never build a parallel one, never double-schedule):
+ * Periodic SCRUB — uniform surface, filesystem-native backend (Epic 17.5 +
+ * story selfheal.4, docs/SCHEDULES-DESIGN.md §Scrub). The operator sees one
+ * "periodic scrub: on/off" control for a ZFS pool and an AHR pool; each flips
+ * its own backend:
  *
  *   | fs  | read state            | mechanism                                   |
  *   |-----|-----------------------|---------------------------------------------|
  *   | ZFS | org.debian:periodic-scrub property (GT-2) | PVE's monthly cron, per-pool-gated |
- *   | AHR | mdcheck_start.timer is-enabled            | mdadm's mdcheck timers (NODE-GLOBAL) |
+ *   | AHR | anas-scrub.service marker + timer is-enabled | ANAS's node-level two-phase scrub timer |
  *
  * ZFS: the property gates PVE's 2nd-Sunday monthly cron. `-`/unset, `auto`,
  * `enable` all SCRUB (default = on); only `disable` turns it off. ANAS sets
  * `enable`/`disable` — a surgical property write, never a config/unit edit, and
  * never touches the (disabled) systemd `zfs-scrub-*@.timer` so no collision (GT-4).
  *
- * AHR/md: mdadm ships `mdcheck_start.timer` + `mdcheck_continue.timer` (1st
- * Sunday monthly, Persistent). They are NODE-GLOBAL — a check verifies every md
- * array on the host — so this toggle governs md checks for ALL AHR pools at once
- * (the one visible divergence from ZFS's per-pool knob; surfaced via `note`). The
- * on-demand AHR Scrub verb (11.x) is untouched — this is the PERIODIC toggle only.
+ * AHR (selfheal.4): the periodic AHR scrub is the WHOLE two-phase scrub —
+ * phase 1 md parity per band, then phase 2 btrfs checksums + attribution — run
+ * by ONE node-level `anas-scrub.timer` (services/scrub-schedule-units.ts) whose
+ * embedded schedule lists the enabled pools. Enabling a pool adds it to that
+ * list AND disables mdadm's mdcheck timers (ANAS owns md checks on the node —
+ * never double-scheduled); disabling the last pool removes the units and leaves
+ * mdcheck OFF (the operator asked for no scrubbing). The `cadence` is
+ * node-level: monthly (1st Sunday 03:00) or quarterly.
  */
 
 const ZFS = '/usr/sbin/zfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
 const SCRUB_PROPERTY = 'org.debian:periodic-scrub'
-/** The mdadm timers to toggle together (`start` fires the check, `continue` resumes it). */
+/** The mdadm timers ANAS takes over (`start` fires the check, `continue` resumes it). */
 const MDCHECK_TIMERS = ['mdcheck_start.timer', 'mdcheck_continue.timer']
-/** The one we READ state from (`Also=mdcheck_continue.timer` keeps them in lockstep). */
+/** The one we READ mdcheck state from (`Also=` keeps them in lockstep). */
 const MDCHECK_PRIMARY = 'mdcheck_start.timer'
-
-const MDCHECK_NOTE
-  = 'md checks are node-global (every array on the host); this toggle governs md periodic checks for all AHR pools.'
 
 // --- ZFS: org.debian:periodic-scrub property --------------------------------
 
@@ -102,12 +105,193 @@ export async function setZfsScrubEnabled(
     throw new Error(r.stderr.trim() || `zfs set ${SCRUB_PROPERTY} on '${pool}' exited with code ${r.exitCode}`)
 }
 
-// --- AHR/md: mdcheck timers -------------------------------------------------
+// --- AHR: the node-level anas-scrub timer (selfheal.4) ----------------------
+
+/** `systemctl is-enabled` output → on/off (`enabled`/`enabled-runtime` = on). */
+export function parseIsEnabled(isEnabledStdout: string): boolean {
+  // `enabled`, `enabled-runtime` → on; `disabled`, `static`, `masked`, '' → off.
+  return isEnabledStdout.trim().startsWith('enabled')
+}
 
 /** Interpret `systemctl is-enabled` output for the mdcheck timer as on/off. */
 export function parseMdcheckEnabled(isEnabledStdout: string): boolean {
-  // `enabled`, `enabled-runtime` → on; `disabled`, `static`, `masked`, '' → off.
-  return isEnabledStdout.trim().startsWith('enabled')
+  return parseIsEnabled(isEnabledStdout)
+}
+
+/** `systemctl is-enabled <unit>` argv. */
+export function isEnabledArgs(unit: string): string[] {
+  return ['is-enabled', unit]
+}
+
+/** An md array's mismatch counter after a check: `/sys/block/<md>/md/mismatch_cnt`. */
+export function mismatchCntArgs(kernelName: string): string[] {
+  return [`/sys/block/${kernelName}/md/mismatch_cnt`]
+}
+
+/** Context the AHR state read + toggle need beyond the executor itself. */
+export interface AhrScrubContext {
+  /** The systemd unit directory the `anas-scrub` units live in. */
+  dir: string
+  /**
+   * Kernel names (`md127`) of EVERY md array on the node (from /proc/mdstat)
+   * and of the AHR bands — the difference is the arrays ANAS does not scrub,
+   * which the state's `note` names rather than hides.
+   */
+  mdKernelNames?: string[]
+  ahrKernelNames?: string[]
+}
+
+/** Build the toggle's argv for both mdcheck timers. */
+export function mdcheckToggleArgs(enabled: boolean): string[] {
+  return [enabled ? 'enable' : 'disable', '--now', ...MDCHECK_TIMERS]
+}
+
+async function isMdcheckEnabled(executor: CommandExecutor): Promise<boolean> {
+  try {
+    const r = await executor.exec(SYSTEMCTL, isEnabledArgs(MDCHECK_PRIMARY))
+    // is-enabled exits nonzero for `disabled`/`static` but still prints the word.
+    return parseMdcheckEnabled(r.stdout)
+  }
+  catch {
+    return false
+  }
+}
+
+async function isTimerEnabled(executor: CommandExecutor): Promise<boolean> {
+  try {
+    const r = await executor.exec(SYSTEMCTL, isEnabledArgs(SCRUB_TIMER_NAME))
+    return parseIsEnabled(r.stdout)
+  }
+  catch {
+    return false
+  }
+}
+
+/**
+ * The honest `note` for an AHR state, from what the node actually shows:
+ *   - mdcheck still enabled ⇒ a warning: ANAS's phase 1 AND mdcheck would both
+ *     run parity checks — "double parity check — mdcheck is on".
+ *   - an md array that is no AHR band ⇒ "<mdN> is not an ANAS pool and is not
+ *     scrubbed by ANAS" — never silently.
+ * With neither, the node-level mechanism is described in one sentence.
+ */
+export function ahrScrubNote(
+  mdcheckOn: boolean,
+  foreignArrays: string[],
+): string {
+  const parts: string[] = []
+  if (mdcheckOn)
+    parts.push('double parity check — mdcheck is on')
+  for (const name of foreignArrays)
+    parts.push(`${name} is not an ANAS pool and is not scrubbed by ANAS`)
+  if (parts.length === 0)
+    parts.push('one node-level timer scrubs the enabled AHR pools sequentially (phase 1 md parity, then phase 2 btrfs checksums)')
+  return parts.join('; ')
+}
+
+/**
+ * The md arrays in `/proc/mdstat` that are NOT one of the AHR bands — the ones
+ * this node's scrub never covers. An unreadable mdstat yields none (fail-open:
+ * the filter's absence costs the note, never a false claim).
+ */
+export function foreignMdArrays(
+  mdKernelNames: string[] | undefined,
+  ahrKernelNames: string[] | undefined,
+): string[] {
+  if (!mdKernelNames?.length)
+    return []
+  const ours = new Set(ahrKernelNames ?? [])
+  return mdKernelNames.filter(name => !ours.has(name))
+}
+
+/**
+ * Read an AHR pool's periodic-scrub state (selfheal.4). `enabled` is the pool
+ * being IN the node timer's list AND the timer enabled — a pool left in a list
+ * whose units were removed by other means is not reported as on.
+ *
+ * `lastScrub` is ALWAYS null, and that is the honest answer, not a gap: md
+ * keeps no completion record of a check — no last-run timestamp, no verdict. We
+ * neither mine journald for one nor keep a state file to manufacture one
+ * (stateless — the system is the source of truth). The Scrubs screen says so in
+ * words rather than leaving the cell blank.
+ *
+ * `running` — what md IS willing to tell us — is passed in from the topology
+ * the caller already read (see {@link ahrScrubRunning}). The absence of a
+ * completion record does not mean md is silent while a check runs.
+ */
+export async function readAhrScrubState(
+  executor: CommandExecutor,
+  pool: string,
+  running: ScrubRunning | null = null,
+  ctx?: AhrScrubContext,
+): Promise<PeriodicScrubState> {
+  const schedule = ctx ? await readScrubSchedule(ctx.dir) : null
+  const [timerEnabled, mdcheckOn, nextRun] = await Promise.all([
+    isTimerEnabled(executor),
+    isMdcheckEnabled(executor),
+    readScrubTimerNext(executor),
+  ])
+  const enabled = timerEnabled && (schedule?.pools.includes(pool) ?? false)
+  const foreign = ctx ? foreignMdArrays(ctx.mdKernelNames, ctx.ahrKernelNames) : []
+  return {
+    target: { kind: 'ahr', pool },
+    enabled,
+    cadence: schedule?.cadence ?? 'monthly',
+    mechanism: 'anas-scrub-timer',
+    nextRun: enabled ? nextRun : null,
+    phases: ['md-parity', 'btrfs-checksums'],
+    note: ahrScrubNote(mdcheckOn, foreign),
+    lastScrub: null,
+    ...(running && { running }),
+  }
+}
+
+/**
+ * Toggle an AHR pool's periodic scrub (selfheal.4) — a surgical edit of the
+ * node timer's embedded schedule, with the units as the store:
+ *
+ *   enable  → add the pool to the list (units created if absent, timer enabled)
+ *             AND disable the mdcheck timers — ANAS owns md checks on this node,
+ *             never double-scheduled.
+ *   disable → remove the pool from the list; units removed when the list
+ *             empties; mdcheck stays OFF either way.
+ *
+ * `cadence` (optional, node-level) rewrites the one timer from any pool;
+ * absent means keep the current one (default `monthly`). Throws on unit-write
+ * failure so the mutation surfaces it. The mdcheck disable is best-effort —
+ * with our timer already on, a failed mdcheck disable must still be surfaced
+ * (journald line) rather than leave the job "failed" with BOTH mechanisms on.
+ */
+export async function setAhrScrubEnabled(
+  executor: CommandExecutor,
+  pool: string,
+  enabled: boolean,
+  opts?: { dir: string, cadence?: ScrubCadence },
+): Promise<void> {
+  const dir = opts?.dir ?? DEFAULT_SYSTEMD_DIR
+  const current = await readScrubSchedule(dir)
+  const pools = current?.pools ?? []
+  const cadence: ScrubCadence = opts?.cadence ?? current?.cadence ?? 'monthly'
+
+  if (enabled) {
+    const nextPools = pools.includes(pool) ? pools : [...pools, pool]
+    await writeScrubUnits(executor, dir, { kind: 'ahr-scrub', cadence, pools: nextPools })
+    try {
+      const r = await executor.exec(SYSTEMCTL, mdcheckToggleArgs(false))
+      if (r.exitCode !== 0)
+        console.error(`scrub-schedules: could not disable the mdcheck timers: ${r.stderr.trim() || `exit ${r.exitCode}`}`)
+    }
+    catch (err) {
+      console.error(`scrub-schedules: could not disable the mdcheck timers: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    return
+  }
+
+  const nextPools = pools.filter(p => p !== pool)
+  if (nextPools.length === 0)
+    await removeScrubUnits(executor, dir)
+  else
+    await writeScrubUnits(executor, dir, { kind: 'ahr-scrub', cadence, pools: nextPools })
 }
 
 /**
@@ -140,59 +324,4 @@ export function ahrScrubRunning(pool: AhrPool): ScrubRunning | null {
     ...(speeds.length > 0 && { speedBytesSec: speeds.reduce((sum, v) => sum + v, 0) }),
     ...(etas.length > 0 && { etaSeconds: Math.round(Math.max(...etas)) }),
   }
-}
-
-/**
- * Read the node's mdcheck (AHR periodic scrub) state for a given AHR pool. The
- * state is node-global (see MDCHECK_NOTE); each AHR pool reflects it. Fail-open
- * to disabled — an unreadable/absent mdcheck timer means no periodic md check.
- *
- * `lastScrub` is ALWAYS null here, and that is the honest answer, not a gap: md
- * keeps no completion record of a check — no last-run timestamp, no verdict. We
- * neither mine journald for one nor keep a state file to manufacture one
- * (stateless — the system is the source of truth). The Scrubs screen says so in
- * words rather than leaving the cell blank.
- *
- * `running` — what md IS willing to tell us — is passed in from the topology
- * the caller already read (see {@link ahrScrubRunning}). The absence of a
- * completion record does not mean md is silent while a check runs.
- */
-export async function readAhrScrubState(
-  executor: CommandExecutor,
-  pool: string,
-  running: ScrubRunning | null = null,
-): Promise<PeriodicScrubState> {
-  let enabled = false
-  try {
-    const r = await executor.exec(SYSTEMCTL, ['is-enabled', MDCHECK_PRIMARY])
-    // is-enabled exits nonzero for `disabled`/`static` but still prints the word.
-    enabled = parseMdcheckEnabled(r.stdout)
-  }
-  catch {
-    // fail-open to off
-  }
-  return {
-    target: { kind: 'ahr', pool },
-    enabled,
-    cadence: 'monthly',
-    mechanism: 'mdcheck-timer',
-    note: MDCHECK_NOTE,
-    lastScrub: null,
-    ...(running && { running }),
-  }
-}
-
-/**
- * Enable/disable the node's mdcheck timers (both, `--now`). NODE-GLOBAL — this is
- * the mdadm-shipped periodic md check for every array on the host. Throws on
- * failure so the mutation surfaces it.
- */
-export async function setAhrScrubEnabled(
-  executor: CommandExecutor,
-  enabled: boolean,
-): Promise<void> {
-  const verb = enabled ? 'enable' : 'disable'
-  const r = await executor.exec(SYSTEMCTL, [verb, '--now', ...MDCHECK_TIMERS])
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `systemctl ${verb} mdcheck timers exited with code ${r.exitCode}`)
 }

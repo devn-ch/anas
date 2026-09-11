@@ -136,6 +136,9 @@ describe('iscsi.6 — the backing-file-removal seam (no such path exists)', () =
     'backup-units.ts',
     'replication-units.ts',
     'snapshot-schedule-units.ts',
+    // selfheal.4: removes the anas-scrub units it rendered itself when the
+    // pool list empties — same unit-store teardown as snapshot-schedule-units.
+    'scrub-schedule-units.ts',
     'iscsi-mutate.ts',
     'iscsi-quarantine.ts',
     'backup-restore.ts',

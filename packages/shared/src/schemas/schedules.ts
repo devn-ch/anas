@@ -286,13 +286,33 @@ export type ScrubTarget = z.infer<typeof ScrubTarget>
  * The filesystem-native mechanism behind a pool's periodic scrub:
  * - `zfs-property` — PVE's monthly cron, per-pool-gated by the pool root's
  *   `org.debian:periodic-scrub` ZFS property (ANAS flips the property).
+ * - `anas-scrub-timer` — ANAS's own node-level `anas-scrub.timer` running the
+ *   WHOLE two-phase scrub (phase 1 md parity per band, phase 2 btrfs checksums
+ *   + attribution) for every enabled AHR pool, strictly sequentially. ANAS owns
+ *   md checks on the node: enabling it turns mdadm's mdcheck timers off
+ *   (selfheal.4) — never double-scheduled.
  * - `mdcheck-timer` — mdadm's shipped `mdcheck_start`/`mdcheck_continue` systemd
- *   timers (ANAS enables/disables them). NODE-GLOBAL: mdcheck verifies every md
- *   array on the host, so this toggle governs md checks for ALL AHR pools at
- *   once — the one place the uniform surface diverges from ZFS's per-pool knob.
+ *   timers (parity only, checksum-blind). Kept for states read from an older
+ *   daemon or before the first ANAS-unit write; the toggle no longer selects it.
  */
-export const ScrubMechanism = z.enum(['zfs-property', 'mdcheck-timer'])
+export const ScrubMechanism = z.enum(['zfs-property', 'mdcheck-timer', 'anas-scrub-timer'])
 export type ScrubMechanism = z.infer<typeof ScrubMechanism>
+
+/**
+ * The periodic scrub's cadence. ZFS has exactly one (PVE's monthly cron); the
+ * AHR ANAS timer offers `monthly` (1st Sunday 03:00 — matches both PVE's ZFS
+ * cron and mdcheck's old calendar) and `quarterly` (1st Sunday of Jan/Apr/Jul/Oct).
+ */
+export const ScrubCadence = z.enum(['monthly', 'quarterly'])
+export type ScrubCadence = z.infer<typeof ScrubCadence>
+
+/**
+ * The two phases of an AHR scrub, in the order they run — ONE scrub, never
+ * severable, neither alone sufficient (selfheal.4): parity first, then the
+ * checksum pass that can name files.
+ */
+export const AhrScrubPhase = z.enum(['md-parity', 'btrfs-checksums'])
+export type AhrScrubPhase = z.infer<typeof AhrScrubPhase>
 
 /**
  * The LAST COMPLETED verify pass on a pool, as the filesystem itself recorded
@@ -367,16 +387,29 @@ export type ScrubRunning = z.infer<typeof ScrubRunning>
 
 /**
  * A pool's periodic-scrub state, uniform across ZFS and AHR. `cadence` is
- * `monthly` for both (ZFS: PVE's 2nd-Sunday cron; AHR: mdcheck's 1st-Sunday
- * timer) — custom cadences are a later refinement (SCHEDULES-DESIGN §Scrub).
- * `note` carries the mechanism caveat (e.g. mdcheck's node-global scope).
+ * `monthly` for ZFS (PVE's 2nd-Sunday cron) and monthly|quarterly for AHR (the
+ * ANAS scrub timer's cadence). `note` carries the mechanism caveat (e.g. an
+ * mdcheck timer still enabled outside ANAS, or a foreign md array).
  */
 export const PeriodicScrubState = z.object({
   target: ScrubTarget,
   enabled: z.boolean(),
-  cadence: z.literal('monthly'),
+  cadence: ScrubCadence,
   mechanism: ScrubMechanism,
   note: z.string().optional(),
+  /**
+   * The next scheduled fire of the pool's periodic scrub (ISO), or null when
+   * the mechanism reports none (AHR: `systemctl show anas-scrub.timer -p
+   * NextElapseUSecRealtime`; ZFS's cron exposes none). Optional + additive.
+   */
+  nextRun: z.string().nullable().optional(),
+  /**
+   * The phases one scrub consists of, in the order they run (AHR only, since
+   * selfheal.4 — the md parity pass and the btrfs checksum pass). Optional:
+   * absent from an older daemon (version-skew rule) and absent for ZFS, whose
+   * scrub is one filesystem-native pass.
+   */
+  phases: z.array(AhrScrubPhase).optional(),
   /**
    * The last completed verify pass, or null when the filesystem records none —
    * a ZFS pool never scrubbed, and EVERY AHR pool (see {@link LastScrub}).
@@ -392,6 +425,31 @@ export const PeriodicScrubState = z.object({
 })
 export type PeriodicScrubState = z.infer<typeof PeriodicScrubState>
 
-/** Toggle a pool's periodic scrub on/off. */
+/** Toggle a pool's periodic scrub on/off (ZFS — the property flip). */
 export const ScrubToggleRequest = z.object({ enabled: z.boolean() })
 export type ScrubToggleRequest = z.infer<typeof ScrubToggleRequest>
+
+/**
+ * Toggle an AHR pool's periodic scrub (selfheal.4). `cadence` is optional and
+ * NODE-LEVEL: the one `anas-scrub.timer` carries it, so setting it from any
+ * pool rewrites the timer; absent means keep the current cadence (default
+ * `monthly` when there is none).
+ */
+export const AhrScrubToggleRequest = ScrubToggleRequest.extend({
+  cadence: ScrubCadence.optional(),
+})
+export type AhrScrubToggleRequest = z.infer<typeof AhrScrubToggleRequest>
+
+/**
+ * The canonical AHR periodic-scrub schedule embedded as the `X-ANAS-Schedule=`
+ * comment in the `anas-scrub.service` unit — the unit files ARE the store (the
+ * snapshot-schedule pattern, selfheal.4), and this JSON is the single source of
+ * truth parsed back. `pools` is the list of AHR pools the node-level timer
+ * scrubs, IN the order the runner fires them.
+ */
+export const AhrScrubSchedule = z.object({
+  kind: z.literal('ahr-scrub'),
+  cadence: ScrubCadence,
+  pools: z.array(PoolName),
+})
+export type AhrScrubSchedule = z.infer<typeof AhrScrubSchedule>

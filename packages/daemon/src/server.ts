@@ -539,8 +539,9 @@ export function createServer(opts?: ServerOptions) {
   const subvolRuntimeDir = process.env.ANAS_AHR_SUBVOL_RUNTIME_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-subvol-${process.pid}`) : undefined)
   server.register(scheduleRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, subvolRuntimeDir })
-  // Periodic scrub (Epic 17.5) — uniform on/off surface; ZFS property + mdcheck.
-  server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue })
+  // Periodic scrub (Epic 17.5 + selfheal.4) — uniform on/off surface; ZFS
+  // property + the node-level anas-scrub timer (same unit dir as schedules).
+  server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue, systemdDir })
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
   server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath, iscsiPaths })

@@ -6992,9 +6992,11 @@ async function taskDoorOnDoneCheck() {
 
 const SCRUB_STATES = {
   data: [
-    { target: { kind: 'zfs', pool: 'tank' }, enabled: true, cadence: 'monthly', mechanism: 'org.debian:periodic-scrub', lastScrub: null, running: null },
-    { target: { kind: 'ahr', pool: 'ahr0' }, enabled: false, cadence: 'monthly', mechanism: 'mdcheck timers', note: 'node-global', lastScrub: null, running: null },
-    { target: { kind: 'ahr', pool: 'ahr1' }, enabled: false, cadence: 'monthly', mechanism: 'mdcheck timers', note: 'node-global', lastScrub: null, running: null },
+    { target: { kind: 'zfs', pool: 'tank' }, enabled: true, cadence: 'monthly', mechanism: 'zfs-property', lastScrub: null, running: null },
+    // selfheal.4 — the AHR periodic scrub is the node-level ANAS timer running
+    // the WHOLE two-phase scrub: phases in the state, nextRun when on.
+    { target: { kind: 'ahr', pool: 'ahr0' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'one node-level timer scrubs the enabled AHR pools sequentially (phase 1 md parity, then phase 2 btrfs checksums)', lastScrub: null, running: null },
+    { target: { kind: 'ahr', pool: 'ahr1' }, enabled: false, cadence: 'quarterly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'double parity check — mdcheck is on', lastScrub: null, running: null },
   ],
 }
 
@@ -7337,6 +7339,84 @@ async function repairFromParityChecks() {
   ok('repair: …and says where the answer will arrive', /notification/.test(panel.html), panel.html)
 }
 
+// ============================================================================
+//  Scrubs: the two-phase AHR scrub surface (story selfheal.4)
+// ============================================================================
+//
+// The periodic AHR scrub is the WHOLE scrub now — phase 1 md parity, then
+// phase 2 btrfs checksums — on one node-level ANAS timer with a monthly or
+// quarterly cadence. The contract here: the AHR row names both phases (and the
+// next fire when the timer reports one), the cadence selector lives exactly
+// where the toggle lives (the toolbar, AHR-only, no new menu/window), the
+// toggle body carries the cadence, and the confirm dialog states the node-level
+// scope and the mdcheck takeover.
+
+async function scrubTwoPhaseChecks() {
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], SCRUB_ROUTES)
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  const ahr0 = rowFor(grid, 'ahr0')
+  const ahr1 = rowFor(grid, 'ahr1')
+  const tank = rowFor(grid, 'tank')
+  if (!ahr0 || !ahr1 || !tank) { ok('scrubs2: every pool is a row', false); return }
+
+  // --- The phases on the row -------------------------------------------------
+  // ahr1 is OFF with no findings: the idle AHR cell names both phases and says
+  // there is no next fire.
+  const offCell = scrubCell(grid, ahr1)
+  ok('scrubs2: the AHR row names both phases in order',
+    /phase 1 parity \(md\) → phase 2 checksums \(btrfs\)/.test(offCell), offCell)
+  ok('scrubs2: an OFF pool claims no next run', !/>?next/.test(offCell), offCell)
+  ok('scrubs2: the md-keeps-no-record honesty stays on the row',
+    /md keeps no completion record/.test(offCell), offCell)
+
+  // An ON pool shows the timer's next fire — but the findings cell outranks it,
+  // so the findings are set aside for the check and put back after.
+  const savedFindings = ahr0.get('findings')
+  ahr0.set('findings', null)
+  ahr0.set('nextRun', '2026-10-04T03:00:00.000Z')
+  const onCell = scrubCell(grid, ahr0)
+  ok('scrubs2: an ON pool shows the timer\'s next fire',
+    /; next /.test(onCell), onCell)
+  ahr0.set('nextRun', null)
+  ahr0.set('findings', savedFindings)
+
+  // A ZFS row never grew phase wording.
+  ok('scrubs2: a ZFS row says neither phase', !/phase 1 parity/.test(scrubCell(grid, tank)))
+
+  // --- The cadence selector + the toggle body --------------------------------
+  const cad = grid.down('#scrubCadence')
+  ok('scrubs2: the cadence selector exists beside the toggle (no new menu/window)', !!cad)
+  ok('scrubs2: it starts disabled with nothing selected', !!cad && cad.disabled === true)
+
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr1'))
+  ok('scrubs2: the selector enables for an AHR row', !!cad && cad.disabled === false)
+  ok('scrubs2: it shows the row\'s cadence', !!cad && cad.value === 'quarterly')
+
+  cad.value = 'quarterly'
+  jobs.length = 0
+  confirms.length = 0
+  grid.down('#scrubToggle').handler(grid.down('#scrubToggle'))
+  ok('scrubs2: the AHR toggle confirms the node-level scope',
+    confirms.some(c => /node-level timer/.test(c.title)), JSON.stringify(confirms))
+  ok('scrubs2: the enable confirm says mdcheck is turned off',
+    confirms.some(c => /mdcheck timers will be turned off/.test(c.msg)))
+  ok('scrubs2: the AHR toggle body carries the cadence',
+    jobs.some(j => j.method === 'put' && j.path === '/scrub/ahr/ahr1'
+      && j.body.enabled === true && j.body.cadence === 'quarterly'), JSON.stringify(jobs))
+
+  grid.selectRow(grid.getStore().findExact('pool', 'tank'))
+  ok('scrubs2: the selector is ZFS-disabled (PVE\'s cron owns ZFS cadence)', !!cad && cad.disabled === true)
+  jobs.length = 0
+  grid.down('#scrubToggle').handler(grid.down('#scrubToggle'))
+  ok('scrubs2: the ZFS toggle body carries no cadence',
+    jobs.some(j => j.method === 'put' && j.path === '/scrub/zfs/tank'
+      && j.body.enabled === false && !('cadence' in j.body)), JSON.stringify(jobs))
+}
+
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
@@ -7436,6 +7516,11 @@ created.windows.length = 0
 // Story selfheal.3 — the AHR scrub's findings on the Scrubs row, and the one
 // window they open.
 await scrubFindingsChecks()
+// Story selfheal.4 — the two-phase surface: phases + next run on the row, the
+// cadence selector beside the toggle, the toggle body and its confirm.
+warnings.length = 0
+created.windows.length = 0
+await scrubTwoPhaseChecks()
 warnings.length = 0
 created.windows.length = 0
 // Story selfheal.6 — Repair from parity, in that same window.

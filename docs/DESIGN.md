@@ -859,6 +859,8 @@ EnvironmentFile=-/etc/default/anas
 WantedBy=multi-user.target
 ```
 
+**Generated schedule units** (written at run time, not installed by `anas setup`): the snapshot schedules ship `anas-snap-<id>.service`/`.timer` per policy, and story selfheal.4 adds ONE node-level pair, `anas-scrub.service`/`anas-scrub.timer` — a `Persistent=true` timer (monthly/quarterly OnCalendar) whose oneshot service runs `node dist/scrub-task.js <pools…>`, the runner that POSTs `/v1/ahr/<pool>/scrub` per enabled AHR pool in sequence. Both pairs follow the same unit-store pattern: the canonical config rides an `X-ANAS-Schedule=` JSON marker inside the `.service` file, and ANAS never edits a unit that lacks the marker.
+
 ---
 
 ## Security Considerations

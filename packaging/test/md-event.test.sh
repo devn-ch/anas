@@ -69,7 +69,7 @@ check "journald line has BADBLOCKS=3"   grep -q 'EVENT=RebuildFinished DEVICE=/d
 check "notify severity escalated"       grep -q ' warning md RebuildFinished' "${TMP}/perl.log"
 check "note counts the ranges"          grep -q '3 unreadable sector range' "${TMP}/perl.log"
 check "note says data was lost"         grep -q 'could not be reconstructed' "${TMP}/perl.log"
-check "note recommends a Scrub"         grep -q 'Run a Scrub on this pool to identify any affected files' "${TMP}/perl.log"
+check "note recommends a Scrub"         grep -q "The periodic scrub's phase 2 will name the files" "${TMP}/perl.log"
 
 echo "== 2. RebuildFinished with a clean BBL =="
 for m in dev-sda1 dev-sdb1 dev-sdc1; do : > "${SYS}/md127/md/${m}/bad_blocks"; done
@@ -120,7 +120,7 @@ run_hook RebuildFinished /dev/md127
 check "journald has MISMATCHES=384"     grep -q 'MISMATCHES=384' "${TMP}/logger.log"
 check "severity escalated to warning"   grep -q ' warning md check finished' "${TMP}/perl.log"
 check "counts the mismatches"           grep -q '384 parity mismatch' "${TMP}/perl.log"
-check "recommends an ANAS Scrub"        grep -q 'run a Scrub on this pool so btrfs checksums can identify' "${TMP}/perl.log"
+check "recommends an ANAS Scrub"        grep -q "the periodic scrub's phase 2 will name the files" "${TMP}/perl.log"
 
 echo "== 8. Rebuild progress event carries ACTION in journald =="
 run_hook Rebuild20 /dev/md127

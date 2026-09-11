@@ -12,11 +12,13 @@ import {
   findingPath,
   journalSince,
   kernelJournalMessages,
+  mismatchCount,
   parseBtrfsScrubStatus,
   parseScrubWarning,
   parseUnattributedScrubError,
   scrubAhrPool,
 } from '../ahr-scrub.js'
+import { mismatchCntArgs } from '../scrub-schedules.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -28,9 +30,10 @@ const GT3_LINES = GT3_DMESG.split('\n').filter(l => l.trim() !== '')
 const GT6_LINES = GT6_DMESG.split('\n').filter(l => l.trim() !== '')
 
 /**
- * AHR scrub — the two-phase, strictly SEQUENTIAL pass (§4): btrfs scrub
- * completes before the first md check starts; md checks run one band at a
- * time. Findings notify at warning; a clean scrub is silent (§7.3).
+ * AHR scrub — ONE scrub, TWO phases, strictly SEQUENTIAL (selfheal.4, §4):
+ * each band's md parity check first (one band at a time), then the btrfs
+ * checksum scrub and its attribution. Findings notify at warning; a clean
+ * scrub is silent (§7.3).
  */
 
 const GIB = 1024 ** 3
@@ -94,6 +97,12 @@ function baseExecutor(): MockExecutor {
   executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r1'], result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r2'], result: { stdout: '/dev/md126\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+  // Catch-all cat: an idle mdstat (so a test that never scripts /proc/mdstat
+  // still terminates) — and, falling through, the phase-1 mismatch_cnt reads,
+  // whose non-numeric text reads as "no counter" (no parity-mismatch warning).
+  // Tests that script mdstat transitions or rot register exact-arg fixtures,
+  // which beat the catch-all.
+  executor.addFixture({ command: '/usr/bin/cat', result: { stdout: mdstat([]), stderr: '', exitCode: 0 } })
   return executor
 }
 
@@ -114,7 +123,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     ] })
 
     const progress: string[] = []
-    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.deepEqual(result, { scrubbed: 't2', btrfsErrors: null, checkedArrays: 2 })
 
     const calls = executor.calls
@@ -128,17 +137,86 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     const checkR1 = idx(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' && c.args[1] === '/dev/md/t2-r1')
     const checkR2 = idx(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' && c.args[1] === '/dev/md/t2-r2')
     assert.ok(scrubStart >= 0 && lastStatus >= 0 && checkR1 >= 0 && checkR2 >= 0)
-    // Never concurrent: btrfs finished before md; r1's check awaited before r2 starts.
-    assert.ok(lastStatus < checkR1, 'btrfs scrub completes before any md check starts')
+    // Never concurrent (selfheal.4): BOTH md checks finish before the btrfs
+    // scrub starts, and r1's check is awaited before r2's begins.
+    assert.ok(checkR2 < scrubStart, 'phase 1 (md) completes before phase 2 (btrfs) starts')
     assert.ok(checkR1 < checkR2, 'md checks run band by band')
     const waitBetween = calls.slice(checkR1 + 1, checkR2).some(c => c.command === '/usr/bin/cat')
     assert.ok(waitBetween, 'r1 check is awaited via /proc/mdstat before r2 starts')
 
-    // Clean scrub → NO notification (dashboard policy §7.3).
+    // Clean scrub → NO notification (dashboard policy §7.3) — parity was agreed
+    // (both mismatch counters read 0) and checksums found nothing.
     assert.ok(!calls.some(c => c.command === '/usr/bin/perl'))
-    // Progress reported on every poll.
+    // Progress NAMES the phase (selfheal.4) and reports on every poll.
+    assert.ok(progress.some(m => m.startsWith('phase 1/2: md parity check on t2-r1')), progress.join(' | '))
+    assert.ok(progress.some(m => m.startsWith('phase 2/2: btrfs checksum scrub')), progress.join(' | '))
     assert.ok(progress.some(m => m.includes('42.5')))
     assert.ok(progress.some(m => m.includes('t2-r1')) && progress.some(m => m.includes('t2-r2')))
+  })
+
+  // Story selfheal.4 (e): a phase-1 mismatch warns IMMEDIATELY — rot exists,
+  // and phase 2 (running right then) is what names the files. One warning per
+  // mismatching band; phase 2 proceeds either way.
+  it('phase 1 rot: a mismatch_cnt > 0 warns before phase 2 starts — and phase 2 still runs', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], results: [
+      { stdout: mdstat([{ kernel: 'md127', checkPercent: 10 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126', checkPercent: 55 }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+    ] })
+    // md counted 8 parity mismatches on r1; r2 came back clean.
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/mismatch_cnt'], result: { stdout: '8\n', stderr: '', exitCode: 0 } })
+
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    assert.equal(result.btrfsErrors, null, 'checksums can be clean while parity rots — both stories are told')
+
+    const calls = executor.calls
+    const warns = calls.filter(c => c.command === '/usr/bin/perl')
+    assert.equal(warns.length, 1, 'one warning for the one mismatching band')
+    assert.equal(warns[0].args[2], 'warning')
+    assert.equal(warns[0].args[3], 'AHR scrub: parity mismatch on t2-r1')
+    assert.equal(warns[0].args[4], 'rot exists in t2-r1 — phase 2 (running now) will name the files')
+    // The warning lands BETWEEN the md check and the btrfs scrub: phase 2 is
+    // literally running when the operator reads it.
+    const warnAt = calls.indexOf(warns[0])
+    const checkR1 = calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[1] === '/dev/md/t2-r1')
+    const scrubStart = calls.findIndex(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start')
+    assert.ok(checkR1 < warnAt && warnAt < scrubStart, 'the warning rides the phase boundary')
+    // The mismatch counter is read AFTER the check goes idle (md finalises it)
+    // — md127's counter is read after the poll that shows md127 idle, and
+    // still before phase 2 starts. (A later mdstat poll exists — r2's check —
+    // and rightly does not gate md127's read.)
+    const mdstatPolls = calls.map((c, i) => c.command === '/usr/bin/cat' && c.args[0] === '/proc/mdstat' ? i : -1).filter(i => i >= 0)
+    const cntRead = calls.findIndex(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt')
+    assert.ok(mdstatPolls[1] < cntRead && cntRead < scrubStart, 'the counter is read once the band is idle, before phase 2')
+  })
+
+  it('every mismatching band warns; an unreadable counter warns about nothing', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/mismatch_cnt'], result: { stdout: '3\n', stderr: '', exitCode: 0 } })
+    // md126's counter unreadable — fail-open to silence, never a false "rot".
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md126/md/mismatch_cnt'], result: { stdout: '', stderr: 'No such file', exitCode: 1 } })
+
+    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const warns = executor.calls.filter(c => c.command === '/usr/bin/perl')
+    assert.equal(warns.length, 1)
+    assert.ok(warns[0].args[4].includes('t2-r1'))
+    assert.ok(!warns.some(w => w.args[4].includes('t2-r2')), 'an unreadable counter never becomes a warning')
+  })
+
+  it('the mismatch counter is read from the sysfs file the 11.17 hook reads', async () => {
+    assert.deepEqual(mismatchCntArgs('md127'), ['/sys/block/md127/md/mismatch_cnt'])
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '  8 \n', stderr: '', exitCode: 0 } })
+    assert.equal(await mismatchCount(executor, 'md127'), 8)
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md0'), result: { stdout: 'nonsense\n', stderr: '', exitCode: 0 } })
+    assert.equal(await mismatchCount(executor, 'md0'), null, 'a non-numeric counter is no counter')
   })
 
   // Regression: array.kernelName in the pool object is captured at ROUTE time
@@ -169,7 +247,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     stale.arrays[0].kernelName = 'md0'
     stale.arrays[1].kernelName = 'md1'
 
-    const result = await scrubAhrPool(executor, stale, () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(executor, stale, () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.equal(result.checkedArrays, 2)
 
     const calls = executor.calls
@@ -193,7 +271,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     // body says so rather than printing an empty file list (selfheal.3).
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.equal(result.btrfsErrors, 'csum=2')
     assert.equal(result.errorsReported, 2)
     assert.deepEqual(result.findings, [])
@@ -237,7 +315,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 }, // r2 done
     ] })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.equal(result.checkedArrays, 2)
 
     const calls = executor.calls
@@ -254,7 +332,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   it('aborted btrfs scrub fails the job', async () => {
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: scrubStatus('aborted'), stderr: '', exitCode: 0 } })
-    await assert.rejects(scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 }), /aborted/)
+    await assert.rejects(scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }), /aborted/)
   })
 
   it('refuses an unmounted pool', async () => {
@@ -517,7 +595,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     bothPresent(executor)
     badBlock300(executor)
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
 
     assert.equal(result.errorsReported, 2)
     assert.equal(result.errorsAttributed, 2)
@@ -538,6 +616,12 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     assert.ok(journalCall)
     assert.deepEqual(journalCall!.args.slice(0, 4), ['-k', '-o', 'json', '-S'])
     assert.match(journalCall!.args[4], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+    // §4, restated by selfheal.4: the attribution's probe reads run AFTER both
+    // md checks — nothing else reads the array while a check runs.
+    const journalAt = executor.calls.indexOf(journalCall!)
+    const lastCheck = executor.calls.reduce((at, c, i) =>
+      (c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' ? i : at), -1)
+    assert.ok(lastCheck >= 0 && lastCheck < journalAt, 'attribution follows phase 1')
 
     // 16 O_DIRECT reads per named stripe — the whole stripe, nothing else.
     const ddF1 = executor.calls.filter(c => c.command === '/usr/bin/dd' && c.args[0] === `if=${F1}`)
@@ -558,7 +642,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     bothPresent(executor)
     badBlock300(executor)
 
-    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 })
+    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
 
     const notifies = executor.calls.filter(c => c.command === '/usr/bin/perl')
     assert.equal(notifies.length, 1, 'one event, one notification')
@@ -574,7 +658,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F1], result: { stdout: '4194304\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F2], result: { stdout: '', stderr: 'No such file or directory', exitCode: 1 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.equal(result.findings?.[1].missing, true)
     assert.deepEqual(result.findings?.[1].badBlocks, [])
     // Nothing was probed for it — a missing path is never dd'd sixteen times.
@@ -591,7 +675,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: '', stderr: 'Failed to open journal', exitCode: 1 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.equal(result.btrfsErrors, 'csum=2')
     assert.equal(result.errorsReported, 2)
     assert.equal(result.findings, undefined, 'no attribution rather than an invented one')
@@ -604,7 +688,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     clean.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     clean.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(clean, pool(), () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(clean, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.deepEqual(result, { scrubbed: 't2', btrfsErrors: null, checkedArrays: 2 })
     assert.ok(!clean.calls.some(c => c.command === '/usr/bin/journalctl'))
     assert.ok(!clean.calls.some(c => c.command === '/usr/bin/dd'))
@@ -635,7 +719,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     e.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/dd', args: [`if=${NESTED}`, 'iflag=direct', 'bs=4096', 'skip=290', 'count=1', 'of=/dev/null'], result: { stdout: '', stderr: '', exitCode: 1 } })
 
-    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
 
     // `@data/photos` under a mounted `@data` is <mountpoint>/photos — probed.
     assert.equal(result.findings?.[0].path, NESTED)
@@ -670,7 +754,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
     const flat = pool()
     flat.subvolLayout = false
-    const result = await scrubAhrPool(e, flat, () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(e, flat, () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.equal(result.findings?.[0].path, FLAT)
     assert.equal(result.findings?.[0].outsideMount, undefined)
     assert.equal(e.calls.filter(c => c.command === '/usr/bin/dd').length, 16)
@@ -690,7 +774,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     e.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F1], result: { stdout: '4194304\n', stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1 })
+    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.equal(result.findings?.[0].path, F1)
   })
 })
