@@ -1,0 +1,3 @@
+overrides:
+  '@anas/daemon': link:daemon
+  '@anas/shared': link:shared

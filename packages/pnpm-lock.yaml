@@ -1,0 +1,20 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  '@anas/shared': link:shared
+  '@anas/daemon': link:daemon
+
+importers:
+
+  .:
+    dependencies:
+      '@anas/daemon':
+        specifier: link:daemon
+        version: link:daemon
+      '@anas/shared':
+        specifier: link:shared
+        version: link:shared
