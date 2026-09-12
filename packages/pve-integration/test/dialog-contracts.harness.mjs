@@ -390,10 +390,15 @@ function makeComponent(cfg, parent) {
     // FIRES selectionchange, which is exactly how a widget that writes a field
     // from its own selection can loop. The harness reproduces that.
     select(what, _keepExisting, suppressEvent) {
-      const rec = (what && typeof what === 'object') ? what : (c.store ? c.store.getAt(what) : null)
-      c._selection = rec ? [rec] : []
+      // Real ExtJS takes ONE record, an index, or an ARRAY of records
+      // (CheckboxModel preselect — selfheal.9); the stub models all three.
+      const recs = (Array.isArray(what)
+        ? what
+        : [(typeof what === 'object' && what) ? what : (c.store ? c.store.getAt(what) : null)])
+        .filter(r => r)
+      c._selection = recs
       if (!suppressEvent) { c.fireEvent('selectionchange', {}, c._selection) }
-      return rec
+      return recs[0] || null
     },
     getSelection: () => c._selection.slice(),
     deselectAll() { c._selection = [] },
@@ -7389,6 +7394,80 @@ async function repairFromParityChecks() {
 }
 
 // ============================================================================
+//  Scrubs: Repair on the TOOLBAR (story selfheal.9)
+// ============================================================================
+//
+// The verb's standing home: a Repair action beside Run now / Stop, lit by the
+// ONE enablement rule the window's button is lit by (repairableFindings over
+// the selected AHR pool's last completed scrub), greyed with the reason on the
+// button otherwise. Clicking it opens the SAME findings window, the repairable
+// rows already ticked — the toolbar establishes what is repairable, the
+// operator only confirms.
+
+async function scrubToolbarRepairChecks() {
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], REPAIR_ROUTES)
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  const btn = grid.down('#scrubRepair')
+  ok('scrubrepair: the toolbar carries the Repair verb', !!btn && btn.cls === 'anas-btn-scrub-repair')
+  if (!btn) { return }
+
+  // --- Enablement, with the reason ON the button -----------------------------
+  ok('scrubrepair: nothing selected keeps it off', btn.disabled === true)
+  ok('scrubrepair: …and says an AHR pool is wanted', /select an AHR pool/.test(btn.tooltip || ''), btn.tooltip)
+
+  grid.selectRow(grid.getStore().findExact('pool', 'tank'))
+  ok('scrubrepair: a ZFS row keeps it off', btn.disabled === true)
+  ok('scrubrepair: …still saying an AHR pool is wanted', /select an AHR pool/.test(btn.tooltip || ''), btn.tooltip)
+
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr1'))
+  ok('scrubrepair: an AHR row with no findings keeps it off', btn.disabled === true)
+  ok('scrubrepair: …saying the daemon holds nothing for this pool',
+    /no scrub findings for this pool since the daemon started/.test(btn.tooltip || ''), btn.tooltip)
+
+  // ahr0's recovered findings include repairable rows (A, D, E) — the verb lights.
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr0'))
+  ok('scrubrepair: an AHR row with a repairable finding lights it', btn.disabled === false)
+  ok('scrubrepair: …with no tooltip standing in the way', !btn.tooltip, btn.tooltip)
+
+  // Findings that are ALL blocked: off, and the tooltip counts each kind in the
+  // window's own per-row words — one rule, said twice at different zooms.
+  const ahr0 = rowFor(grid, 'ahr0')
+  const saved = ahr0.get('findings')
+  ahr0.set('findings', { at: saved.at, result: { findings: [FINDING_B, FINDING_C, FINDING_F] } })
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr0'))
+  const tip = btn.tooltip || ''
+  ok('scrubrepair: findings that are all deleted/snapshot/unnamed keep it off', btn.disabled === true)
+  ok('scrubrepair: …and the tooltip says the findings cannot be repaired from here',
+    /findings cannot be repaired from here/.test(tip), tip)
+  ok('scrubrepair: …counting each blocked kind the window states per row',
+    /1 file deleted since the scrub/.test(tip)
+    && /1 finding in a snapshot, outside the mounted tree/.test(tip)
+    && /1 corruption whose bad block could not be named/.test(tip), tip)
+  ahr0.set('findings', saved)
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr0'))
+
+  // --- The click: the SAME window, repairable rows preselected ---------------
+  created.windows.length = 0
+  btn.handler(btn)
+  await settle()
+  const win = openWindow()
+  ok('scrubrepair: the click opens the findings window', !!win && win.cls === 'anas-win-scrub-findings')
+  if (!win) { return }
+  const fGrid = win.down('#findingsGrid')
+  const wBtn = win.down('#repairFromParity')
+  ok('scrubrepair: the ONE findings window, its Repair button included',
+    !!fGrid && !!wBtn && wBtn.cls === 'anas-btn-repair-parity')
+  if (!fGrid || !wBtn) { return }
+  eq('scrubrepair: exactly the repairable rows arrive ticked, none of the blocked ones',
+    fGrid.getSelection().map(r => r.get('path')), [FINDING_A.path, FINDING_D.path, FINDING_E.path])
+  eq('scrubrepair: the window verb is lit without the operator ticking anything', wBtn.disabled, false)
+}
+
+// ============================================================================
 //  Scrubs: the two-phase AHR scrub surface (story selfheal.4)
 // ============================================================================
 //
@@ -7574,6 +7653,11 @@ warnings.length = 0
 created.windows.length = 0
 // Story selfheal.6 — Repair from parity, in that same window.
 await repairFromParityChecks()
+warnings.length = 0
+created.windows.length = 0
+// Story selfheal.9 — Repair from parity on the Scrubs toolbar too, need-gated,
+// one enablement rule for both doors.
+await scrubToolbarRepairChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

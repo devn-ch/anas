@@ -79,9 +79,20 @@
  * come back into the same window. Never automatic, never a read-path heal: an
  * operator asks for it, on named files, with named blocks.
  *
+ * …and on the TOOLBAR too (selfheal.9, RULED: both, gated by need). A Repair
+ * action beside Run now / Stop is the verb's standing home — the window is a
+ * detail surface an operator has to be told about, the toolbar is where the
+ * eye already goes for pool verbs. One enablement rule drives both doors
+ * (`repairableFinding`): lit only when the selected AHR pool's last completed
+ * scrub holds at least one repairable finding, greyed with the reason on the
+ * button otherwise. Clicking it opens the SAME window, the repairable rows
+ * already ticked — the toolbar establishes what is repairable, the operator
+ * only confirms.
+ *
  * Test hooks: view cls 'anas-view anas-view-scrubs', grid cls 'anas-grid-scrub',
  * scrub toggle 'anas-btn-scrub-toggle', run 'anas-btn-scrub-run', stop
- * 'anas-btn-scrub-stop', findings window 'anas-win-scrub-findings' with grid
+ * 'anas-btn-scrub-stop', toolbar repair 'anas-btn-scrub-repair' (selfheal.9),
+ * findings window 'anas-win-scrub-findings' with grid
  * 'anas-grid-scrub-findings' (itemId '#findingsGrid'), repair button
  * 'anas-btn-repair-parity' and result panel '#repairResult'.
  *
@@ -580,6 +591,28 @@
             stopBtn.setDisabled(!rec || !!reason);
             btnSetTip(stopBtn, reason);
         }
+
+        // Repair from parity on the toolbar TOO (selfheal.9) — the verb's
+        // standing home. Lit only for an AHR pool whose last completed scrub
+        // holds at least one repairable finding, by the SAME rule the window's
+        // button is lit by (repairableFindings); greyed with the reason ON the
+        // button otherwise, each kind of silence said in its own words.
+        var repairBtn = scrubGrid.down('#scrubRepair');
+        if (repairBtn) {
+            var entry = isAhr ? rec.get('findings') : null;
+            var repairable = entry ? repairableFindings((entry.result || {}).findings) : [];
+            var why = '';
+            if (!rec || !isAhr) {
+                why = t('select an AHR pool');
+            } else if (!entry) {
+                why = t('no scrub findings for this pool since the daemon started');
+            } else if (!repairable.length) {
+                why = t('findings cannot be repaired from here') + ': '
+                    + blockedFindingReasons((entry.result || {}).findings).join(', ');
+            }
+            repairBtn.setDisabled(!rec || !!why);
+            btnSetTip(repairBtn, why);
+        }
     }
 
     function toggleScrub(node, scrubGrid, rec) {
@@ -730,8 +763,12 @@
     // engine repairs the whole blob when handed any block of the extent, so
     // the request carries the extent's FIRST block (selfheal.8).
     function repairableRow(rec) {
-        return !rec.get('missing') && !rec.get('outsideMount') && !rec.get('unidentified')
-            && Number(rec.get('blocks')) > 0;
+        return repairableFinding(rec ? {
+            missing: rec.get('missing'),
+            outsideMount: rec.get('outsideMount'),
+            unidentified: rec.get('unidentified'),
+            blocks: rec.get('blocks')
+        } : null);
     }
 
     function repairBlockedReason(rec) {
@@ -751,6 +788,64 @@
             return t('no block inside the reported stripe failed to read — there is nothing to repair');
         }
         return '';
+    }
+
+    // THE enablement rule (selfheal.9) — ONE copy, said in two shapes. A finding
+    // can be repaired only when there is a live file under the pool's mountpoint
+    // to repair (not deleted, not inside a snapshot) and a bad block the probe
+    // actually named (not unidentified, not a stripe that no longer fails). The
+    // findings window's Repair column states it per row; the Scrubs toolbar
+    // counts it across the pool's whole last-completed scrub — and both the
+    // window's button and the toolbar's are lit by it, never by a second rule.
+    function repairableFinding(f) {
+        f = f || {};
+        return !f.missing && !f.outsideMount && !f.unidentified && Number(f.blocks) > 0;
+    }
+
+    // The wire finding carries the probe's block array, the window row its count
+    // — the two shapes meet here, the only place the rule is stated.
+    function repairableFindings(findings) {
+        var out = [];
+        var list = findings || [];
+        for (var i = 0; i < list.length; i++) {
+            var f = list[i] || {};
+            if (repairableFinding({
+                missing: !!f.missing,
+                outsideMount: !!f.outsideMount,
+                unidentified: !!f.unidentified,
+                blocks: (f.badBlocks || []).length
+            })) {
+                out.push(f);
+            }
+        }
+        return out;
+    }
+
+    // Why a pool's findings leave the toolbar verb greyed out: the window's
+    // per-row Repair-column reasons, counted by kind, so the tooltip says WHY
+    // without the rule (or its words) being stated twice.
+    function blockedFindingReasons(findings) {
+        var counts = { deleted: 0, snapshot: 0, unnamed: 0, healed: 0 };
+        var list = findings || [];
+        for (var i = 0; i < list.length; i++) {
+            var f = list[i] || {};
+            if (f.missing) { counts.deleted++; }
+            else if (f.outsideMount) { counts.snapshot++; }
+            else if (f.unidentified) { counts.unnamed++; }
+            else if (!Number((f.badBlocks || []).length)) { counts.healed++; }
+        }
+        var parts = [];
+        var add = function (n, one, many) {
+            if (n > 0) { parts.push(n + ' ' + (n === 1 ? one : many)); }
+        };
+        add(counts.deleted, t('file deleted since the scrub'), t('files deleted since the scrub'));
+        add(counts.snapshot, t('finding in a snapshot, outside the mounted tree'),
+            t('findings in snapshots, outside the mounted tree'));
+        add(counts.unnamed, t('corruption whose bad block could not be named'),
+            t('corruptions whose bad block could not be named'));
+        add(counts.healed, t('file whose reported stripe no longer fails'),
+            t('files whose reported stripes no longer fail'));
+        return parts;
     }
 
     // The Repair column: what will happen, then what did. Before a run it is a
@@ -944,7 +1039,11 @@
         }
     }
 
-    function showScrubFindings(node, pool, result) {
+    // `preselect` (selfheal.9) — the toolbar Repair opens this same window with
+    // the repairable rows already ticked: the toolbar established what can be
+    // repaired, the operator only confirms. The row indicator and the post-Run
+    // auto-open leave the rows unticked, as ever.
+    function showScrubFindings(node, pool, result, preselect) {
         var findings = (result && result.findings) || [];
         if (!findings.length) {
             return false;
@@ -1048,6 +1147,26 @@
             ]
         });
         win.show();
+        if (preselect) {
+            try {
+                var fg = win.down('#findingsGrid');
+                var sm = fg && typeof fg.getSelectionModel === 'function' ? fg.getSelectionModel() : null;
+                if (sm && typeof sm.select === 'function') {
+                    var recs = [];
+                    var st = fg.getStore();
+                    for (var k = 0; k < st.getCount(); k++) {
+                        if (repairableRow(st.getAt(k))) {
+                            recs.push(st.getAt(k));
+                        }
+                    }
+                    if (recs.length) {
+                        sm.select(recs, true, true);
+                    }
+                }
+            } catch (eP) {
+                // non-fatal — the rows stay unticked and the operator ticks them
+            }
+        }
         updateRepairButton(win);
         return true;
     }
@@ -1219,6 +1338,30 @@
                             handler: function (btn) {
                                 var g = btn.up('grid');
                                 runScrub(node, g, selectedScrub(g), true);
+                            }
+                        },
+                        {
+                            // Repair from parity, from the grid (selfheal.9). The
+                            // same window the row indicator opens — the repairable
+                            // rows arrive preselected, so the operator only
+                            // confirms what the toolbar already established.
+                            text: t('Repair'),
+                            itemId: 'scrubRepair',
+                            cls: 'anas-btn-scrub-repair',
+                            iconCls: 'fa fa-wrench',
+                            disabled: true,
+                            handler: function (btn) {
+                                var g = btn.up('grid');
+                                var rec = selectedScrub(g);
+                                var entry = rec && rec.get('kind') === 'ahr' ? rec.get('findings') : null;
+                                if (!entry) {
+                                    return;
+                                }
+                                try {
+                                    showScrubFindings(node, rec.get('pool'), entry.result, true);
+                                } catch (e) {
+                                    ANAS.warn('scrub findings failed: ' + ANAS.errText(e));
+                                }
                             }
                         },
                         '-',
