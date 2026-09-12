@@ -24,7 +24,16 @@ def scan_device(dev: str, sig: bytes, size: int | None = None) -> list[int]:
     """Raw windowed scan of `dev` for `sig`; returns byte offsets. Overlapping
     windows so boundary hits are never lost. Shares no code with the mapper."""
     if size is None:
-        size = os.lseek(os.open(dev, os.O_RDONLY), 0, os.SEEK_END)
+        # close the probe fd: leaked, it keeps the scanned device open for the
+        # suite's whole lifetime — a case-5 scan of the md node made every
+        # later `mdadm --stop` of that array fail EBUSY ("running process"),
+        # and the surviving array's NAME then blocked the next same-named rig
+        # ("Array name /dev/md/gtsh5 is in use already." — hardening round)
+        fd = os.open(dev, os.O_RDONLY)
+        try:
+            size = os.lseek(fd, 0, os.SEEK_END)
+        finally:
+            os.close(fd)
     hits = []
     off = 0
     prev_tail = b""

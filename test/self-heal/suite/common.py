@@ -72,18 +72,76 @@ def md_attr(mddev: str, key: str) -> str:
     return open(f"{mdsys(mddev)}/{key}").read().strip()
 
 
+def md_attr_or_none(mddev: str, key: str) -> str | None:
+    """Read an md sysfs attribute, or None when the array has no such knob
+    (GT-16: a RAID1 array has no rmw_level / stripe_cache_size at all — absent
+    means absent, never an error)."""
+    p = f"{mdsys(mddev)}/{key}"
+    if not os.path.exists(p):
+        return None
+    return open(p).read().strip()
+
+
+def _md_read(mddev: str, rel: str) -> str:
+    """Read an md sysfs attribute, naming what actually exists when it is
+    gone: a mid-case FileNotFoundError used to be a bare mystery, so the
+    error now carries the array's own sysfs listing and mdstat line."""
+    p = f"{mdsys(mddev)}/{rel}"
+    try:
+        return open(p).read().strip()
+    except FileNotFoundError:
+        import glob
+        m = mdsys(mddev)
+        have = sorted(os.path.basename(x) for x in glob.glob(f"{m}/*"))
+        mdstat = [l for l in open("/proc/mdstat").read().splitlines()
+                  if os.path.basename(mddev) in l or "blocks" in l]
+        raise FileNotFoundError(f"{p} is gone: /sys/block md attrs={have} "
+                                f"mdstat={mdstat}") from None
+
+
+def _first_rd(mddev: str) -> str:
+    """The first EXISTING rdN dir name. The kernel REMOVES a member's rdN
+    from sysfs the moment it is marked faulty — proven live: after
+    `mdadm --fail` of member 0, /proc/mdstat still shows `loop0[0](F)` while
+    /sys/block/mdX/md/rd0 is already gone ([6/5] [_UUUUU]). Member geometry
+    must therefore never be read from rd0 by name alone; on the suite's rigs
+    every member has the same size and data offset, so any surviving rdN
+    answers for all."""
+    base = mdsys(mddev)
+    for d in sorted(os.listdir(base)):
+        if re.fullmatch(r"rd\d+", d):
+            return d
+    raise RuntimeError(f"{mddev}: no rdN left in sysfs")
+
+
 def md_geometry(mddev: str) -> dict:
     m = mdsys(mddev)
-    level = open(f"{m}/level").read().strip()
+    level = _md_read(mddev, "level")
     return {
         "level": level,
-        "chunk": int(open(f"{m}/chunk_size").read().strip()),
-        "n": int(open(f"{m}/raid_disks").read().strip()),
-        "layout": MDSYS_LAYOUT.get(int(open(f"{m}/layout").read().strip()),
-                                   f"raw{open(f'{m}/layout').read().strip()}"),
-        "data_offset": int(open(f"{m}/rd0/offset").read().strip()) * 512,
+        # F4: the chunk is read live per array — 128 sectors was the loop rig's
+        # 64 KiB chunk and EINVALs on an AHR band's 512 KiB default. GT-16: on
+        # RAID1 chunk_size reads 0 and means "no stripe geometry".
+        "chunk": int(_md_read(mddev, "chunk_size")),
+        "n": int(_md_read(mddev, "raid_disks")),
+        "layout": MDSYS_LAYOUT.get(int(_md_read(mddev, "layout")),
+                                   f"raw{_md_read(mddev, 'layout')}"),
+        "data_offset": int(_md_read(mddev, f"{_first_rd(mddev)}/offset")) * 512,
         "raid6": level == "raid6",
+        "raid1": level == "raid1",
     }
+
+
+def chunk_sectors(geo: dict) -> int:
+    """Per-member sectors one stripe occupies. RAID1 has no stripe (GT-16):
+    md accepts any sync window there, and the engine's convention — mirrored
+    here — is a plain 128-sector (64 KiB) window."""
+    if geo["raid1"]:
+        return 128
+    cs = geo["chunk"] // 512
+    if cs < 1:
+        raise RuntimeError(f"chunk_size {geo['chunk']} gives no stripe window")
+    return cs
 
 
 def find_btrfs_dev(mountpoint: str) -> str:
@@ -142,8 +200,15 @@ def write_direct(path: str, off: int, data: bytes) -> None:
 
 def predict(md_byte: int, geo: dict) -> dict:
     """md LBA -> (disk, member offset) for left-symmetric RAID5/6 (the md
-    default; layout recorded per GT-2). Ported from the drill's 02-locate.py."""
+    default; layout recorded per GT-2) or RAID1, where every leg stores the
+    same bytes at data_offset + the LBA and no stripe geometry exists (GT-16).
+    Ported from the drill's 02-locate.py."""
     chunk, n, doff = geo["chunk"], geo["n"], geo["data_offset"]
+    if geo["raid1"]:
+        return {"disk": 0, "moff": doff + md_byte, "stripe": None,
+                "parity_disk": None, "q_disk": None,
+                "chunk_index": md_byte // BS, "in_chunk": md_byte % BS,
+                "mirrors": list(range(n))}
     dc = n - (2 if geo["raid6"] else 1)          # data chunks per stripe
     chunk_index = md_byte // chunk
     d = chunk_index % dc
@@ -165,6 +230,9 @@ def predict(md_byte: int, geo: dict) -> dict:
 def reverse_predict(disk: int, moff: int, geo: dict) -> int:
     """(disk, member offset) -> md LBA (inverse of predict for left-symmetric)."""
     chunk, n, doff = geo["chunk"], geo["n"], geo["data_offset"]
+    if geo["raid1"]:
+        raise RuntimeError("reverse_predict is RAID5/6-only (RAID1 has no "
+                           "stripe geometry to invert, GT-16)")
     dc = n - (2 if geo["raid6"] else 1)
     stripe = (moff - doff) // chunk
     in_chunk = (moff - doff) % chunk
@@ -337,6 +405,8 @@ def locate_block(mddev: str, mountpoint: str, path: str, block: int) -> dict:
             "start_sector": ss, "md_byte": md_byte,
             "disk": p["disk"], "moff": p["moff"], "stripe": p["stripe"],
             "parity_disk": p["parity_disk"], "q_disk": p["q_disk"],
+            "raid1": geo["raid1"],
+            "mirrors": p.get("mirrors"),
             "exts": exts, "dump3": dump3}
 
 
@@ -388,16 +458,21 @@ def evict_stripe_cache(mddev: str, stripe: int, span: int = 200) -> None:
       the shrink.
     Shrink first, then sweep ±span stripes (excluding the target) while the
     cache is small: with 17 slots the sweep is forced through every slot and
-    the target's entry is recycled. Restore the size afterwards."""
+    the target's entry is recycled. Restore the size afterwards.
+    RAID1 (GT-16) has no stripe_cache_size knob and no stripe cache at all —
+    an absent attribute is skipped, never an error."""
     m = mdsys(mddev)
     sz_path = f"{m}/stripe_cache_size"
+    if not os.path.exists(sz_path):
+        return                       # RAID1: no stripe cache to evict (GT-16)
     orig = open(sz_path).read().strip()
     with open(sz_path, "w") as fh:
         fh.write("17")
     geo = md_geometry(mddev)
+    cs = chunk_sectors(geo)
     dc = geo["n"] - (2 if geo["raid6"] else 1)
     chunk = geo["chunk"]
-    last = array_end_sectors(mddev) // 128
+    last = array_end_sectors(mddev) // cs
     for s in list(range(max(0, stripe - span), stripe)) + \
              list(range(stripe + 1, min(stripe + 1 + span, last))):
         read_direct(mddev, s * dc * chunk, chunk)
@@ -406,15 +481,28 @@ def evict_stripe_cache(mddev: str, stripe: int, span: int = 200) -> None:
 
 
 def bounded_window_check(mddev: str, stripe: int, cap: int = 180) -> int:
-    """md check bounded to `stripe` (sync_min/sync_max in per-member chunk
-    sectors, GT-5 convention). GT-5/GT-13 rule: a check reaching sync_max < end
-    SUSPENDS with sync_action stuck on 'check'; once suspended (completed >=
-    sync_max) `echo idle` is accepted and ends the op scoped to the window.
-    The stripe cache is evicted first (see evict_stripe_cache) so the check
-    reads the members, not cached pre-corruption content."""
+    """md check bounded to `stripe` (sync_min/sync_max in per-member sectors,
+    GT-5 convention). The stripe width comes from the array's own chunk_size
+    (F4: it was hardcoded to the loop rig's 64 KiB / 128 sectors, which md
+    refuses with EINVAL on a 512 KiB-chunk array). The stripe cache is evicted
+    first (see evict_stripe_cache) so the check reads the members, not cached
+    pre-corruption content."""
+    geo = md_geometry(mddev)
+    cs = chunk_sectors(geo)
     evict_stripe_cache(mddev, stripe)
+    return bounded_range_check(mddev, stripe * cs, (stripe + 1) * cs, cap=cap)
+
+
+def bounded_range_check(mddev: str, lo: int, hi: int, cap: int = 180) -> int:
+    """md check bounded to [lo, hi) per-member sectors — the primitive
+    bounded_window_check derives its stripe window from. On RAID1 there is no
+    stripe geometry (GT-16: chunk_size 0) and the window is a plain sector
+    range; md accepts sync_min/sync_max there without the chunk-multiple rule,
+    which only applies when chunk_sectors is non-zero. GT-5/GT-13 rule: a check
+    reaching sync_max < end SUSPENDS with sync_action stuck on 'check'; once
+    suspended (completed >= sync_max) `echo idle` is accepted and ends the op
+    scoped to the window."""
     m = mdsys(mddev)
-    lo, hi = stripe * 128, (stripe + 1) * 128
     with open(f"{m}/sync_min", "w") as fh:
         fh.write(str(lo))
     with open(f"{m}/sync_max", "w") as fh:
@@ -450,21 +538,22 @@ def bounded_window_check(mddev: str, stripe: int, cap: int = 180) -> int:
 
 
 def array_end_sectors(mddev: str) -> int:
-    m = mdsys(mddev)
-    size = int(open(f"{m}/rd0/size").read().strip())      # sectors per member
-    doff = int(open(f"{m}/rd0/offset").read().strip())
+    rd = _first_rd(mddev)
+    size = int(_md_read(mddev, f"{rd}/size"))             # sectors per member
+    doff = int(_md_read(mddev, f"{rd}/offset"))
     return size - doff
 
 
 def bounded_end_check(mddev: str, cap: int = 300) -> dict:
     """Deterministic coverage proof (GT-5 rule): a check bounded to one stripe
     short of the array end SUSPENDS there with sync_completed == sync_max —
-    it can only get there by having covered 0..end-128. Ends the suspended op
+    it can only get there by having covered 0..end-1 stripe. Ends the suspended op
     with `idle` and restores the knobs."""
     import time
     m = mdsys(mddev)
     end = array_end_sectors(mddev)
-    hi = end - 128
+    cs = chunk_sectors(md_geometry(mddev))
+    hi = end - cs
     with open(f"{m}/sync_min", "w") as fh:
         fh.write("0")
     with open(f"{m}/sync_max", "w") as fh:
@@ -489,7 +578,7 @@ def bounded_end_check(mddev: str, cap: int = 300) -> dict:
     mm = int(open(f"{m}/mismatch_cnt").read().strip())
     restore_sync_knobs(mddev)
     return {"suspended": suspended, "completed": completed, "end": end,
-            "mismatch_cnt": mm}
+            "cs": cs, "mismatch_cnt": mm}
 
 
 def full_check(mddev: str, cap: int = 600) -> dict:
@@ -649,8 +738,8 @@ def teardown_all() -> None:
     sh("teardown_all")
 
 
-def rig_up(level: int) -> str:
-    sh(f"bash {GT}/00-rig.sh {level}")
+def rig_up(level: int, chunk: str = "64K") -> str:
+    sh(f"bash {GT}/00-rig.sh {level} {chunk}")
     return open(f"{GT}/state/mddev.txt").read().strip()
 
 

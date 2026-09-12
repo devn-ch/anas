@@ -11,11 +11,13 @@ never the ANAS install, never `/dev/sda*` or `/dev/zd*`.
 | id | case | negative control |
 |----|------|------------------|
 | 1a / 1r6-a | parity trap, RAID5 (6 × 200 MiB) / RAID6 (7 members): corrupt a data block below md, repair, fail a DIFFERENT member, every sibling block reads back correctly | 1-neg: the same repair with `rmw_level` at its default MUST poison parity (`mismatch_cnt > 0`) and sibling blocks MUST read back wrong |
+| 1r5x-a | the RAID5 parity case again on a rig built with `--chunk=512K` — md's default and the AHR band shape (F4): every stripe/sector window is derived from the array's own `chunk_size`, so nothing is hardcoded to the rig's 64 KiB | 1-neg (same controls, tagged `r5x`) |
 | 1r6-b | RAID6 with the P member failed after repair (Q reconstruction path) | (same controls) |
 | 2 | zero-block mapping: corrupt the data slot of a zeros file (scan hits data AND parity; flip-test disambiguates), repair invoked with a deliberately wrong block index onto a healthy zero block must exit 4 | 2-neg: the correct block still repairs (exit 0) and reads back cold |
 | 3 | compressed extent (`compress=zstd`), file page-cached BEFORE the rot: repair's end-to-end read must go cold via the fresh snapshot | 3-neg: first the warm-cache pair — live read succeeds, snapshot read EIOs |
 | 4 | `REPAIR_FAIL_AT=<step>` injected at every step boundary of the reference repair (11 steps): exit 70, `rmw_level`/`sync_min`/`sync_max`/`sync_action` restored, no transient snapshot left, then a full md check covers the whole array again | 4-neg: a clean run repairs and restores everything |
 | 5 | above-md rot (junk written THROUGH md, parity agrees): pre-check diagnoses it, exit 3, `precheck_mismatch == 0` | 5-neg: below-md rot in the same file repairs normally, not exit 3 |
+| 6 | RAID1 (2 legs, GT-16: no `rmw_level`, no `stripe_cache_size`, `chunk_size` reads 0): corrupt the marker block on ONE leg behind md — the signature is on BOTH legs, the injector picks one hit and records which — repair must exit 0 and the block must read back correct on BOTH legs afterwards (md writes every leg); post-repair cold snapshot read matches | 6-neg: BEFORE the repair, a cold read through md may be served either leg — the control records which leg md served and whether the btrfs read EIOs accordingly; both outcomes are legitimate, so it asserts only coherence (EIO iff md served the corrupt bytes) and that the rot is real on the member |
 
 Each case records its verdict and a detail line; the final line of the report
 is `SUITE: PASS|FAIL (n/m cases, k/l negative controls)` and the suite exits 0
@@ -76,15 +78,18 @@ reference implementation and checked when present.
 
 | REPAIR_CMD | report | result |
 |---|---|---|
-| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 28/28 cases, 9/9 controls |
-| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 28/28 cases, 9/9 controls |
+| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 34/34 cases, 12/12 controls |
+| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 34/34 cases, 12/12 controls |
 
 The engine covers everything the reference does and adds the RAID6 Q-syndrome
 reconstruction as a fallback when the P-based XOR fails arbitration (a stripe
-whose P member is damaged too), plus RAID1 bands, which this suite has no case
-for. It has one step the reference does not — `gates`, ahead of `pin` — so
+whose P member is damaged too), and the `gates` step ahead of `pin` — so
 `REPAIR_FAIL_AT=gates` is accepted by it and meaningless to the reference;
-case 4 injects into the eleven steps both share.
+case 4 injects into the eleven steps both share. Since the hardening round the
+suite has a RAID1 case (case 6), which both implementations pass; the engine
+also repairs a RAID1 block whose mirror legs DISAGREE from the second leg (the
+reference exits 2 — its RAID1 candidates are the surviving legs, and it
+refuses when they disagree), a shape the suite does not build.
 
 Two differences the suite cannot see, both about scale and layout rather than
 correctness on a rig:
@@ -114,6 +119,18 @@ correctness on a rig:
 
 ## Notes (observed on the node, kernel 7.0.14-12-pve, verbatim where it bit)
 
+- **Geometry is read live, never assumed (F4).** Every stripe/sector window
+  (`bounded_window_check`, the ±span eviction sweep, `bounded_end_check`) is
+  derived from the array's own `/sys/block/mdN/md/chunk_size` — the 128-sector
+  window was the loop rig's 64 KiB chunk, and md refuses a non-chunk-multiple
+  `sync_max` with EINVAL on a 512 KiB-chunk array (the AHR band shape; the
+  suite proves it by re-running the parity case on a `--chunk=512K` rig).
+  RAID1 has no stripe geometry at all (GT-16): `chunk_size` reads 0,
+  `rmw_level` and `stripe_cache_size` are ABSENT from sysfs (absent means
+  absent — the eviction helper returns without touching anything), and
+  `sync_min`/`sync_max` are accepted without the chunk-multiple rule, so
+  bounded checks there are a plain sector window around the block (64 KiB,
+  the engine's convention).
 - **mdadm over ssh**: `mdadm --create` asks an interactive write-intent
   bitmap `[y/N]` prompt which blocks forever on an ssh exec channel. Every
   spawned process in the suite (and the reference repair) uses
@@ -151,6 +168,15 @@ correctness on a rig:
   a later write. The suite's negative control runs cache-cold on purpose —
   that is the only state in which it proves anything — and the reference
   repair never relies on cache residency: `rmw_level=0` for the write.
+- **A FAILED member's rdN disappears from sysfs immediately.** The kernel
+  removes a member's `/sys/block/mdX/md/rdN` the moment it is marked faulty —
+  `/proc/mdstat` still shows `loop0[0](F)` and `[6/5] [_UUUUU]`, but `rd0/`
+  is already gone. Caught live in the hardening round: the engine repaired
+  member m3 of the 512K rig, so the sibling-block check failed member m0, and
+  the suite's member-geometry reads — hardcoded to `rd0` — crashed with
+  FileNotFoundError while the array was perfectly fine. Member geometry is
+  now read from the first SURVIVING rdN (members on these rigs share size and
+  data offset; the engine itself reads each member's own `rd<n>/offset`).
 - **mismatch_cnt settles after sync_action**: on a small window the check op
   flips to `idle` slightly before `mismatch_cnt` is finalized for that op —
   reading immediately returns the PREVIOUS check's count. `bounded_window_check`
@@ -175,16 +201,46 @@ correctness on a rig:
   busy otherwise); `readd_member` does remove-then-add and waits for idle.
 - **Remounting `compress=zstd` must target the mount root** (`/mnt/gtsh`),
   not the subvolume path — a remount target must be a mountpoint.
-- **teardown race**: the drill's `teardown_all` swallows a busy
-  `mdadm --stop` (`|| true`); after one green run `/proc/mdstat` still listed
-  md127 until a second teardown. `suite.py` retries teardown once for this.
+- **teardown blocked two ways, and the name-in-use trap**: the drill's
+  `teardown_all` swallowed a busy `mdadm --stop` (`|| true`) — with the
+  multi-rig run this stopped being only an end-of-run hazard, and the first
+  failure was doubly silent: `00-rig.sh 5 512K` exited 1 with no output
+  because `mdadm --create`'s output went to /dev/null (the create now keeps
+  its output and reports it), and the error it finally named was
+  `mdadm: Array name /dev/md/gtsh5 is in use already.` — a surviving array
+  keeps its metadata name, so only the rig that REUSES a name is refused
+  (the RAID6 and RAID1 rigs, uniquely named, never hit it). Two independent
+  blockers were found, both live-proven:
+  - **the oracle leaked an fd on every scanned device.** `scan_device` sized
+    the scan with `os.lseek(os.open(dev, ...), ...)` and never closed it, so
+    each scan kept the member — and case 5's md-node scan, the md device
+    ITSELF — open in the suite process for the rest of the run. Every later
+    `mdadm --stop` of the first RAID5 rig failed EBUSY ("running process"),
+    and its loops could not be detached either. That is why only the first
+    RAID5 rig was un-stoppable and only while the suite lived: the process
+    holding it was the suite.
+  - **udev spawns `mdadm --monitor --scan` when a gtsh array is assembled**,
+    and that monitor holds every array open: with it alive, `mdadm --stop`
+    failed 3× in a row with `Cannot get exclusive access`. It is
+    udev-transient — nothing respawns it while no array exists — so
+    `teardown_all` TERMs it before stopping arrays.
+  `teardown_all` also retries a busy stop 3× with the errors kept in
+  `$GT/state/stop-errors.log`; `suite.py` runs the whole retrying teardown
+  (`teardown_retry`) between rigs as well as at the ends and stops any
+  surviving array still holding one of its own loops BY NODE
+  (`stop_stale_gtsh_arrays`, matched against `/proc/mdstat` so a foreign
+  array is never touched); and a rig that still will not build is recorded
+  as a FAIL rather than crashing the run and hiding the rigs after it.
 
 ## Files
 
 - `run-suite.sh` — dev-box entry (rsync + ssh + pull report).
-- `suite.py` — orchestrator: builds the RAID5 rig, runs cases, tears down,
-  builds the RAID6 rig, tears down, writes `report.md`/`report.json` under
-  `/root/gtsh/suite-out/`, prints the `SUITE:` line.
+- `suite.py` — orchestrator: builds the RAID5 rig, runs the cases, tears
+  down, builds the RAID6 rig (parity cases), tears down; the hardening round
+  adds a 512 KiB-chunk RAID5 rig (parity case only — the F4 proof) and a
+  2-member RAID1 rig (case 6), each torn down in turn; then writes
+  `report.md`/`report.json` under `/root/gtsh/suite-out/` and prints the
+  `SUITE:` line.
 - `cases.py` — the six case functions and their negative controls.
 - `common.py` — node-side helpers: md geometry from sysfs, btrfs-tree
   mapping (logical → chunk hop → dm → md LBA → member offset), bounded

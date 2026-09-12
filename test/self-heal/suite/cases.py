@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""cases.py — the five selfheal.2 cases, each with its negative control,
+"""cases.py — the selfheal.2 cases, each with its negative control,
 against a freshly built rig. The suite (suite.py) builds the rig, writes the
-marker files, and calls the case functions with a recorder.
+marker files, and calls the case functions with a recorder. Cases 1–5 run on
+RAID5/6 loop rigs; case 6 is the RAID1 case (hardening round, F4/GT-16), and
+the parity case also runs once on a 512 KiB-chunk rig — the AHR band shape —
+to prove no chunk is hardcoded.
 
 Injected-fault placement is ALWAYS via oracle.py (raw signature scan). The
 mapping helpers are used only for verification and by the negative-control
@@ -12,10 +15,12 @@ import json
 import os
 
 from common import (BS, LOGS, SUITE_OUT, array_end_sectors, bounded_end_check,
-                    bounded_window_check, call_repair, components, drop_caches,
-                    fail_member, full_check, locate_block, make_snap, md_attr,
-                    md_geometry, readd_member, read_direct, regen, remove_snap,
-                    restore_sync_knobs, sig_for, snapshot_read, write_direct)
+                    bounded_range_check, bounded_window_check, call_repair,
+                    chunk_sectors, components, drop_caches, fail_member,
+                    full_check, locate_block, make_snap, md_attr,
+                    md_attr_or_none, md_geometry, readd_member, read_direct,
+                    regen, remove_snap, restore_sync_knobs, sig_for,
+                    snapshot_read, write_direct)
 from oracle import (ORACLE_SNAP, corrupt_block, disambiguate_data_slot,
                     scan_device, scan_members)
 
@@ -101,8 +106,9 @@ class CaseCtx:
         raid6 = self.geo["raid6"]
         n, chunk = self.geo["n"], self.geo["chunk"]
         dc = n - (2 if raid6 else 1)
+        cs = chunk_sectors(self.geo)
         t = loc["stripe"]
-        last = array_end_sectors(self.mddev) // 128
+        last = array_end_sectors(self.mddev) // cs
         for s in list(range(max(0, t - 200), t)) + \
                  list(range(t + 1, min(t + 201, last))):
             read_direct(self.mddev, s * dc * chunk, chunk)
@@ -152,13 +158,15 @@ def assert_snap_absent(ctx: CaseCtx, rec: Recorder, what: str) -> None:
 
 
 def knobs(ctx: CaseCtx) -> dict:
-    return {k: md_attr(ctx.mddev, k) for k in
+    # md_attr_or_none: a RAID1 array has no rmw_level at all (GT-16) — absent
+    # knobs are recorded as absent, not fabricated.
+    return {k: md_attr_or_none(ctx.mddev, k) for k in
             ("rmw_level", "sync_min", "sync_max", "sync_action")}
 
 
 def assert_knobs_default(ctx: CaseCtx, what: str) -> None:
     k = knobs(ctx)
-    if not (k["rmw_level"] == "1" and k["sync_min"] == "0"
+    if not (k.get("rmw_level", "1") == "1" and k["sync_min"] == "0"
             and k["sync_max"] == "max" and k["sync_action"] == "idle"):
         raise AssertionError(f"{what}: knobs not restored: {k}")
 
@@ -429,11 +437,11 @@ def case4_knob_restore(ctx: CaseCtx, rec: Recorder) -> None:
     # reaches idle (md cannot stop early with sync_max=max)
     ctx.corrupt_below_md(path, 300)             # leave the rot in place
     b = bounded_end_check(ctx.mddev)
-    ok1 = b["suspended"] and b["completed"] == b["end"] - 128
+    ok1 = b["suspended"] and b["completed"] == b["end"] - b["cs"]
     rec.add("case", "4-endcheck", "bounded check suspends one stripe short of the "
-            "array end (coverage 0..end-128 proven)", ok1,
+            "array end (coverage 0..end-1 stripe proven)", ok1,
             f"suspended={b['suspended']} completed={b['completed']}/{b['end']} "
-            f"mismatch_cnt={b['mismatch_cnt']}")
+            f"(stripe={b['cs']} sectors) mismatch_cnt={b['mismatch_cnt']}")
     f = full_check(ctx.mddev)
     ok2 = f["final_action"] == "idle"
     rec.add("case", "4-fullcheck", "full md check (sync_max=max) reaches idle — "
@@ -497,3 +505,96 @@ def case5_above_md(ctx: CaseCtx, rec: Recorder) -> None:
     rec.add("control", "5-neg", "below-md rot proceeds to repair (exit 0, not exit 3)",
             ok2, f"rc={rc2} postcheck={rep2.get('postcheck_mismatch')} "
                  f"reason={rep2.get('reason', out2)[:140]}")
+
+
+# ---------------------------------------------------------------- case 6
+
+def case6_raid1(ctx: CaseCtx, rec: Recorder) -> None:
+    """RAID1 (GT-16: no rmw_level, no stripe_cache_size, chunk_size reads 0):
+    corrupt the marker block on ONE leg behind md — the signature is on BOTH
+    legs, the injector picks one hit and records which — repair, and the block
+    must read back correct on BOTH legs afterwards (md writes every leg); the
+    post-repair cold snapshot read matches.
+
+    Negative control BEFORE the repair: with one leg rotten, a cold read
+    through md may be served either leg — record which leg md served and
+    whether the btrfs read EIOs accordingly. Both outcomes are legitimate;
+    what is asserted is only that the recorded pair is coherent (EIO iff md
+    served the corrupt bytes) and that the rot is real on the member."""
+    path = ctx.files["l1"]
+    name = "l1"
+
+    # --- injector: the scan hits every leg; corrupt one and record which
+    sig = sig_for(name, 300)
+    hits = scan_members(ctx.members, sig)
+    if len(hits) != len(ctx.members):
+        rec.add("case", "6-scan", "oracle scan of the RAID1 marker block", False,
+                f"{len(hits)} scan hits across {len(ctx.members)} legs, "
+                f"expected one per leg: {hits}")
+        return
+    leg_dev, off = hits[0]
+    leg = ctx.members.index(leg_dev)
+    boff = off - off % BS
+    same_off = all(h[1] - h[1] % BS == boff for h in hits)
+    rec.add("case", "6-scan", "marker block found on every RAID1 leg at the same "
+            "member offset; one leg corrupted behind md", same_off,
+            f"rot injected on leg m{leg} ({leg_dev}@{boff}); hits: "
+            + " ".join(f"{os.path.basename(d)}@{o - o % BS}" for d, o in hits))
+    if not same_off:
+        return
+    corrupt_block(leg_dev, off)
+
+    # --- negative control (before the repair): record what md serves, assert
+    # only coherence — never a specific leg
+    want = regen(name)[300 * BS:(300 + 1) * BS]
+    rot_real = read_direct(leg_dev, boff, BS) != want
+    drop_caches()
+    snap = make_snap(ctx.mp, ORACLE_SNAP)
+    try:
+        r = snapshot_read(os.path.join(snap, f"{name}.bin"), [300])
+    finally:
+        remove_snap(ctx.mp, ORACLE_SNAP)
+    if 300 in r["eio"]:
+        served = "the corrupt leg (btrfs read EIOs)"
+        coherent = rot_real
+    else:
+        served = "the good leg (btrfs read succeeds)"
+        coherent = rot_real and r["data"].get(300) == want
+    rec.add("control", "6-neg", f"cold read through md with leg m{leg} rotten: md "
+            "served " + served, coherent,
+            f"rot_on_m{leg}={rot_real} eio={r['eio']} (either leg is a "
+            "legitimate serving; recorded, not asserted)")
+
+    # --- repair
+    rc, rep, out = run_repair(ctx, path, 300, tag="c6r")
+    ok = rc == 0 and rep.get("postcheck_mismatch") == 0
+    rec.add("case", "6-repair", "repair of a one-leg corruption (RAID1, block 300)",
+            ok, f"rc={rc} postcheck={rep.get('postcheck_mismatch')} "
+                f"disk=m{rep.get('disk')} good_legs={rep.get('good_legs')} "
+                f"reason={rep.get('reason', '')[:120]}")
+    if not ok:
+        return
+
+    # --- BOTH legs must read back correct now (md writes all legs)
+    legs = []
+    for i, d in enumerate(ctx.members):
+        got = read_direct(d, boff, BS)
+        legs.append(f"m{i}={'ok' if got == want else 'BAD'}")
+    ok2 = all(not s.endswith("BAD") for s in legs)
+    rec.add("case", "6-legs", "block reads back correct on BOTH legs after repair "
+            "(md wrote every leg)", ok2,
+            f"rot was on m{leg}; now: " + " ".join(legs))
+    if not ok2:
+        return
+
+    # --- cold read matches
+    snap = make_snap(ctx.mp, REPAIR_SNAP)
+    try:
+        drop_caches()
+        r = snapshot_read(os.path.join(snap, f"{name}.bin"), [300])
+        okc = 300 in r["ok"] and r["data"].get(300) == want
+        rec.add("case", "6-cold", "post-repair cold snapshot read of the block "
+                "matches the original", okc,
+                f"eio={r['eio']} content_match={okc}")
+    finally:
+        remove_snap(ctx.mp, REPAIR_SNAP)

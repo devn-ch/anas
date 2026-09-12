@@ -72,9 +72,28 @@ teardown_all() { # teardown everything the drill may have created; tolerates abs
     for pv in $(pvs --noheadings -o pv_name 2>/dev/null | grep -E '^/dev/md' || true); do
         case "$(readlink -f "$pv")" in /dev/md*) pvremove -f "$pv" 2>/dev/null || true;; esac
     done
-    for md in /dev/md/gtsh5 /dev/md/gtsh6; do
+    # udev spawns `mdadm --monitor --scan` when a gtsh array is assembled, and
+    # that monitor holds every array open: every `mdadm --stop` then fails
+    # with "Cannot get exclusive access" (proven live in the suite hardening
+    # round, 2026-09-11 — build a rig, watch the monitor appear, three stops
+    # in a row fail EBUSY until it is gone). It is udev-transient — nothing
+    # respawns it while no array exists — so TERM it before stopping. The ^
+    # anchor keeps the pattern from matching the command line of whoever runs
+    # this by hand (a plain -f match kills their own shell). This teardown
+    # only ever runs against /root/gtsh loop rigs.
+    pkill -TERM -f "^/usr/sbin/mdadm --monitor" 2>/dev/null || true
+    for md in /dev/md/gtsh1 /dev/md/gtsh5 /dev/md/gtsh6; do
         [ -e "$md" ] || continue
-        mdadm --stop "$md" 2>/dev/null || true
+        # still retried, and its errors are kept in $GT/state/stop-errors.log
+        # rather than swallowed silently (a busy stop left an array standing
+        # whose NAME then blocked the next same-named rig's create outright —
+        # "Array name /dev/md/gtsh5 is in use already.")
+        for try in 1 2 3; do
+            if mdadm --stop "$md" 2>>"$GT/state/stop-errors.log"; then
+                break
+            fi
+            [ "$try" = 3 ] || sleep 2
+        done
     done
     # detach only loops backed by /root/gtsh files (every m?, not just m0)
     for f in "$GT"/m?; do

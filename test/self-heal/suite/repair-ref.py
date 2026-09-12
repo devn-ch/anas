@@ -12,18 +12,22 @@ Implements the converged sequence exactly as the story lists it:
                      (uncompressed: the 4K block; compressed: every on-disk
                      sector of the extent's blob); content that still passes
                      the stored csum => "not corrupt here" => exit 4
-    precheck         bounded md check over the stripe (GT-5 convention
-                     sync_min=stripe*128, sync_max=(stripe+1)*128); GT-5 rule:
+    precheck         bounded md check over the stripe (GT-5 convention,
+                     sync_min/sync_max in per-member sectors from the array's
+                     own chunk; RAID1: a plain 64 KiB window); GT-5 rule:
                      the check SUSPENDS at sync_max, end it with `idle`.
                      mismatch_cnt == 0 while the block is corrupt =>
                      parity agrees with the bad data => diagnosed-above-md
                      => exit 3
-    rmw              save rmw_level, set 0 (reconstruct-write semantics)
+    rmw              save rmw_level, set 0 (reconstruct-write semantics);
+                     RAID1 has no rmw_level at all (GT-16) — the step is a
+                     no-op there
     reconstruct      candidate = XOR of the same 4 KiB member offset on every
                      OTHER member. RAID5: all n-1 others. RAID6: P-only
                      reconstruction (XOR of every member except the bad data
                      member and except Q) — ONLY valid when the bad member is
                      a data member and P is intact; otherwise exit 2.
+                     RAID1: the surviving legs themselves (they must agree).
     arbitrate        crc32c(candidate) vs the STORED csum (csum tree read as
                      the drill did — this kernel's scrub dmesg omits csums);
                      mismatch => exit 2
@@ -55,10 +59,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common import (BS, bounded_window_check, chunk_data_map, dm_start_sector,
-                    drop_caches, dump_tree, extent_for_offset, file_extents,
-                    find_btrfs_dev, md_geometry, predict, read_direct,
-                    restore_sync_knobs, snapshot_read, write_direct)
+from common import (BS, bounded_range_check, bounded_window_check,
+                    chunk_data_map, chunk_sectors, dm_start_sector, drop_caches,
+                    dump_tree, extent_for_offset, file_extents, find_btrfs_dev,
+                    md_geometry, predict, read_direct, restore_sync_knobs,
+                    snapshot_read, write_direct)
 from crc32c import crc32c
 
 REPAIR_SNAP = ".anas-repair-snap"
@@ -150,9 +155,12 @@ class Repair:
         self.stripe = p["stripe"]
         self.parity_disk = p["parity_disk"]
         self.q_disk = p["q_disk"]
+        self.raid1 = self.geo["raid1"]
+        self.mirrors = p.get("mirrors")
         if self.moff % BS:
             self.die(EXIT_INTERNAL, f"computed member offset {self.moff} not 4K aligned")
         self.report.update({"level": self.geo["level"], "n": self.geo["n"],
+                            "raid1": self.raid1,
                             "compressed": self.compressed,
                             "blob_logical": self.blob_logical,
                             "blob_sectors": self.blob_sectors,
@@ -177,6 +185,41 @@ class Repair:
 
     def do_reverify(self) -> None:
         self.step("reverify")
+        if self.raid1:
+            # every leg holds the same bytes (GT-16: no stripe geometry); the
+            # corrupt leg is whichever fails the stored csum. One leg rotten
+            # is repairable from the surviving legs; all legs rotten is not.
+            if self.compressed:
+                self.die(EXIT_UNREPAIRABLE,
+                         "compressed extents on RAID1 are not covered by the "
+                         "reference repair")
+            try:
+                stored = self.stored_csum(self.blob_logical)
+            except LookupError:
+                self.die(EXIT_UNREPAIRABLE,
+                         f"no stored csum for logical {self.blob_logical} "
+                         f"(NOCOW/prealloc?)")
+            bad, good, content = [], [], {}
+            for leg in self.mirrors:
+                b = self.member_block(leg, 0)
+                content[leg] = b
+                (bad if crc32c(b) != stored else good).append(leg)
+            self.report["bad_sectors"] = [0] if bad else []
+            if not bad:
+                self.die(EXIT_MAPPING_ABORT,
+                         f"not corrupt here: every mirror leg at member offset "
+                         f"{self.moff} passes the stored csum for {self.path} "
+                         f"block {self.block}")
+            self.bad_sector = 0
+            self.bad_legs = bad
+            self.good_legs = good
+            self.disk = bad[0]
+            self.corrupt_member_bytes = content[bad[0]]
+            self.report.update({"disk": self.disk, "moff": self.moff,
+                                "stripe": None, "parity_disk": None,
+                                "q_disk": None, "bad_legs": bad,
+                                "good_legs": good})
+            return
         if self.compressed:
             bad = []
             for k in range(self.blob_sectors):
@@ -217,9 +260,20 @@ class Repair:
         self.bad_sector = bad[0]
         self.corrupt_member_bytes = self.member_block(self.disk, self.bad_sector)
 
+    def bounded_check(self) -> int:
+        """The bounded md check for this repair: one stripe for RAID5/6 (stripe
+        width from the array's own chunk_size, F4; the stripe cache evicted
+        first), a plain 64 KiB sector window around the block for RAID1
+        (GT-16: no stripe geometry, no stripe cache; the engine's convention)."""
+        if self.raid1:
+            cs = chunk_sectors(self.geo)
+            s = self.md_byte // (cs * 512)
+            return bounded_range_check(self.mddev, s * cs, (s + 1) * cs)
+        return bounded_window_check(self.mddev, self.stripe)
+
     def do_precheck(self) -> None:
         self.step("precheck")
-        mm = bounded_window_check(self.mddev, self.stripe)
+        mm = self.bounded_check()
         self.report["precheck_mismatch"] = mm
         if mm == 0:
             self.die(EXIT_ABOVE_MD,
@@ -232,6 +286,11 @@ class Repair:
         self.step("rmw")
         m = f"/sys/block/{os.path.basename(os.path.realpath(self.mddev))}/md"
         self.rmw_path = f"{m}/rmw_level"
+        if not os.path.exists(self.rmw_path):
+            # RAID1 has no rmw_level at all (GT-16) — nothing to save or set
+            self.rmw_path = self.rmw_saved = None
+            self.report["rmw_saved"] = None
+            return
         self.rmw_saved = open(self.rmw_path).read().strip()
         self.report["rmw_saved"] = self.rmw_saved
         with open(self.rmw_path, "w") as fh:
@@ -254,6 +313,21 @@ class Repair:
 
     def do_reconstruct(self) -> None:
         self.step("reconstruct")
+        if self.raid1:
+            # candidates are the surviving legs themselves; they must agree
+            # (an in-sync RAID1 has one truth) or there is nothing to trust
+            cand = None
+            for leg in self.good_legs:
+                data = self.member_block(leg, self.bad_sector)
+                if cand is None:
+                    cand = data
+                elif data != cand:
+                    self.die(EXIT_UNREPAIRABLE,
+                             f"surviving mirror legs disagree on the block "
+                             f"(m{leg} differs from the first surviving leg); "
+                             f"no trustworthy copy")
+            self.candidate = cand
+            return
         cand = None
         for i in self.contributing_members():
             data = self.member_block(i, self.bad_sector)
@@ -276,6 +350,14 @@ class Repair:
         md_node = self.mddev
         boff = self.md_byte - self.md_byte % BS + self.bad_sector * BS
         md_bytes = read_direct(md_node, boff, BS)
+        if self.raid1:
+            # md serves whichever leg its read balance picks — the block at
+            # the computed offset must match ONE of the legs seen at reverify
+            if md_bytes not in (self.corrupt_member_bytes, self.candidate):
+                self.die(EXIT_UNREPAIRABLE,
+                         "read-back guard failed: md block at the computed "
+                         "offset matches neither mirror leg seen at reverify")
+            return
         if md_bytes != self.corrupt_member_bytes:
             self.die(EXIT_UNREPAIRABLE,
                      "read-back guard failed: md block at the computed offset "
@@ -288,7 +370,7 @@ class Repair:
 
     def do_postcheck(self) -> None:
         self.step("postcheck")
-        mm = bounded_window_check(self.mddev, self.stripe)
+        mm = self.bounded_check()
         self.report["postcheck_mismatch"] = mm
         if mm != 0:
             self.die(EXIT_UNREPAIRABLE,

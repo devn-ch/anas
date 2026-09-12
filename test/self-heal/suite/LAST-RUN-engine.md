@@ -1,9 +1,9 @@
 # AHR self-heal loop-device suite — report
 
-- date: 2026-09-11 20:33:27  node: anas-pve  kernel: 7.0.14-12-pve
+- date: 2026-09-12 01:12:51  node: anas-pve  kernel: 7.0.14-12-pve
 - mdadm: 4.4  btrfs-progs: 6.14
 - REPAIR_CMD: `node /opt/anas/packages/daemon/dist/bin/selfheal-repair.js`
-- rigs: RAID5 (6 × 200 MiB loops) and RAID6 (7 × 200 MiB loops), built fresh per run, torn down after (see test/self-heal/gt/00-rig.sh)
+- rigs: RAID5 (6 × 200 MiB loops), RAID6 (7 × 200 MiB loops), RAID5 at md's 512 KiB chunk (6 × 200 MiB loops, parity case only), and RAID1 (2 × 200 MiB loops) — built fresh per run, torn down after (see test/self-heal/gt/00-rig.sh)
 
 ## Cases
 
@@ -27,7 +27,7 @@
 | 4-write | REPAIR_FAIL_AT=write: exit 70, knobs restored, no transient snapshot | PASS | rc=70 (expected 70) knobs={'rmw_level': '1', 'sync_min': '0', 'sync_max': 'max', 'sync_action': 'idle'} snapshots=absent |
 | 4-postcheck | REPAIR_FAIL_AT=postcheck: exit 70, knobs restored, no transient snapshot | PASS | rc=70 (expected 70) knobs={'rmw_level': '1', 'sync_min': '0', 'sync_max': 'max', 'sync_action': 'idle'} snapshots=absent |
 | 4-coldread | REPAIR_FAIL_AT=coldread: exit 70, knobs restored, no transient snapshot | PASS | rc=70 (expected 70) knobs={'rmw_level': '1', 'sync_min': '0', 'sync_max': 'max', 'sync_action': 'idle'} snapshots=absent |
-| 4-endcheck | bounded check suspends one stripe short of the array end (coverage 0..end-128 proven) | PASS | suspended=True completed=201600/201728 mismatch_cnt=8 |
+| 4-endcheck | bounded check suspends one stripe short of the array end (coverage 0..end-1 stripe proven) | PASS | suspended=True completed=201600/201728 (stripe=128 sectors) mismatch_cnt=8 |
 | 4-fullcheck | full md check (sync_max=max) reaches idle — the whole array is covered again | PASS | final=idle sampled_completed=382200/407552 mismatch_cnt=8 |
 | 5-scan | md-device scan located the through-md rot | PASS | scan md@153665536 vs mapped 153665536 (cross-check only) |
 | 5-sanity | bounded check over the stripe sees mismatch_cnt==0 (rot arrived through md) | PASS | mismatch_cnt=0 (expected 0) |
@@ -37,6 +37,12 @@
 | 1r6-a2 | sibling blocks correct with m1 failed (RAID6) | PASS | stripe 49: 0 wrong of 80 4K blocks |
 | 1r6-b | parity trap repair (RAID6, block 1000) | PASS | rc=0 postcheck=0 P=m4 Q=m5 reason=/mnt/gtsh/@data/r1.bin block 1000 reconstructed from the P parity of stripe 58 and its other data members and verified a |
 | 1r6-b2 | sibling blocks correct with P member m4 failed (Q reconstruction) | PASS | stripe 58: 0 wrong of 80 4K blocks |
+| 1r5x-a | parity trap repair (RAID5, block 300) | PASS | rc=0 precheck_mismatch=8 postcheck=0 disk=m3 stripe=6 reason=/mnt/gtsh/@data/c1.bin block 300 reconstructed from the XOR of the other 5 members of stripe 6 and verified against the  |
+| 1r5x-a2 | sibling blocks correct with m0 failed (RAID5) | PASS | stripe 6: 0 wrong of 512 4K blocks |
+| 6-scan | marker block found on every RAID1 leg at the same member offset; one leg corrupted behind md | PASS | rot injected on leg m0 (/dev/loop0@16957440); hits: loop0@16957440 loop1@16957440 |
+| 6-repair | repair of a one-leg corruption (RAID1, block 300) | PASS | rc=0 postcheck=0 disk=m0 good_legs=None reason=/mnt/gtsh/@data/l1.bin block 300 reconstructed from the copy on /dev/loop1 and verified against the stored csum 0x2835f5 |
+| 6-legs | block reads back correct on BOTH legs after repair (md wrote every leg) | PASS | rot was on m0; now: m0=ok m1=ok |
+| 6-cold | post-repair cold snapshot read of the block matches the original | PASS | eio=[] content_match=True |
 
 ## Negative controls
 
@@ -51,9 +57,12 @@
 | 5-neg | below-md rot proceeds to repair (exit 0, not exit 3) | PASS | rc=0 postcheck=0 reason=/mnt/gtsh/@data/c5.bin block 700 reconstructed from the XOR of the other 5 members of stripe 473 and verified against the stored csum 0xa8ae |
 | 1r6-n1 | naive repair at default rmw_level poisons parity (RAID6) | PASS | bounded check stripe 63: mismatch_cnt=8 (expected >0) |
 | 1r6-n2 | sibling blocks BROKEN with m2 failed (RAID6, default rmw) | PASS | stripe 63: 1 wrong of 80 4K blocks (expected >0) |
+| 1r5x-n1 | naive repair at default rmw_level poisons parity (RAID5) | PASS | bounded check stripe 6: mismatch_cnt=8 (expected >0) |
+| 1r5x-n2 | sibling blocks BROKEN with m1 failed (RAID5, default rmw) | PASS | stripe 6: 1 wrong of 512 4K blocks (expected >0) |
+| 6-neg | cold read through md with leg m0 rotten: md served the corrupt leg (btrfs read EIOs) | PASS | rot_on_m0=True eio=[300] (either leg is a legitimate serving; recorded, not asserted) |
 
 ## Notes
 
 - none — every stage behaved as expected
 
-**SUITE: PASS (28/28 cases, 9/9 negative controls)**
+**SUITE: PASS (34/34 cases, 12/12 negative controls)**
