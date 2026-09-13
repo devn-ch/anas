@@ -11,8 +11,9 @@ import { repairBlock } from './selfheal-repair.js'
  *
  * The engine (`selfheal-repair.ts`) repairs ONE 4 KiB block. This is the job
  * around it: the files and blocks an operator picked out of a scrub's findings,
- * run strictly one at a time, with every verdict landing in one of three honest
- * buckets and one PVE notification at the end.
+ * run strictly one at a time, with every verdict landing in one of four honest
+ * counts (repaired / unrepairable / above md / not corrupt at the mapped
+ * location — review R9) and one PVE notification at the end.
  *
  * Two boundaries from the epic hold here and are not negotiable:
  *   - repair is NEVER automatic — this service only ever runs from the
@@ -54,15 +55,14 @@ const ABOVE_MD_SENTENCE = 'parity already agreed with the bad data — this impl
 const UNREPAIRABLE_SENTENCE = 'restore this file from backup'
 
 /**
- * Mapping-abort wording (selfheal.7 live proof, F2).
+ * Mapping-abort wording (selfheal.7 live proof, F2; its own count since
+ * review R9 — no longer folded into `unrepairable`).
  *
- * A `mapping-abort` counts in the `unrepairable` bucket — that is the
- * selfheal.6 contract, and it is right: the block was not repaired. But it
- * means the OPPOSITE of the other members of that bucket. The bytes at the
+ * A `mapping-abort` means the OPPOSITE of `unrepairable`. The bytes at the
  * computed member location still pass the checksum btrfs stored for them, so
  * there is nothing wrong with the block and nothing was written. Telling the
  * operator to restore that file from backup is advice to overwrite good data,
- * so the tail says what actually happened instead.
+ * so it gets its own count and its own sentence.
  */
 const MAPPING_ABORT_SENTENCE = 'Blocks reported "not corrupt here" were left alone: the bytes on '
   + 'the member still pass their stored checksum, so there was nothing to reconstruct — either '
@@ -91,22 +91,18 @@ function fileLine(file: AhrRepairFileOutcome): string {
 function repairBody(pool: string, result: AhrRepairResult): string {
   const head = `Repair from parity on AHR pool '${pool}': `
     + `${result.repaired} repaired, ${result.unrepairable} unrepairable, `
-    + `${result.aboveMd} above md, of ${result.blocks} block(s) in ${result.files.length} file(s).`
+    + `${result.aboveMd} above md, ${result.mappingAbort} not corrupt at the mapped location, `
+    + `of ${result.blocks} block(s) in ${result.files.length} file(s).`
   const lines = result.files.slice(0, NOTIFY_FILE_LIMIT).map(fileLine)
   if (result.files.length > NOTIFY_FILE_LIMIT)
     lines.push(`  …and ${result.files.length - NOTIFY_FILE_LIMIT} more`)
   const tail: string[] = []
-  // The `unrepairable` bucket holds two different answers. Count the
-  // mapping-aborts so each gets its own sentence and neither is given the
-  // other's advice (F2): "restore from backup" is only for blocks that really
-  // have no source of truth left.
-  const aborted = result.files.reduce(
-    (n, f) => n + f.blocks.filter(b => b.outcome === 'mapping-abort').length,
-    0,
-  )
-  if (result.unrepairable - aborted > 0)
+  // Each bucket reads ITS OWN count (review R9) — "restore from backup" rides
+  // only the true `unrepairable`, never the mapping-aborts that mean the block
+  // was fine all along.
+  if (result.unrepairable > 0)
     tail.push(`Unrepairable blocks have no source of truth left below the checksum tree — ${UNREPAIRABLE_SENTENCE}.`)
-  if (aborted > 0)
+  if (result.mappingAbort > 0)
     tail.push(MAPPING_ABORT_SENTENCE)
   if (result.aboveMd > 0)
     tail.push(`Blocks diagnosed above md were not written: ${ABOVE_MD_SENTENCE}.`)
@@ -134,6 +130,7 @@ export async function repairAhrFiles(
   let repaired = 0
   let unrepairable = 0
   let aboveMd = 0
+  let mappingAbort = 0
   let done = 0
 
   for (const file of files) {
@@ -156,13 +153,16 @@ export async function repairAhrFiles(
         // and the remaining blocks still get their attempt.
         entry = { block, outcome: 'unrepairable', reason: errorText(error) }
       }
-      // `mapping-abort` is unrepairable in the buckets and keeps its own reason
-      // in the entry — the operator sees "not corrupt here", the count stays
-      // honest about what was NOT repaired.
+      // `mapping-abort` counts AS ITSELF (review R9) — it is not a repair, but
+      // it is the opposite of `unrepairable`: the block was not corrupt at the
+      // mapped location, nothing was written, nothing to restore. The
+      // per-block entry keeps the outcome and its own reason either way.
       if (entry.outcome === 'repaired')
         repaired += 1
       else if (entry.outcome === 'above-md')
         aboveMd += 1
+      else if (entry.outcome === 'mapping-abort')
+        mappingAbort += 1
       else
         unrepairable += 1
       updateProgress(`${file.path} block ${block}: ${entry.outcome}`)
@@ -177,13 +177,16 @@ export async function repairAhrFiles(
     repaired,
     unrepairable,
     aboveMd,
+    mappingAbort,
     blocks: total,
   })
 
   // ONE notification, whatever the outcome — the operator asked for this and is
   // owed the answer even when the browser has moved on (a repair outruns the
-  // UI's job-poll budget exactly as a scrub does).
-  const clean = unrepairable === 0 && aboveMd === 0
+  // UI's job-poll budget exactly as a scrub does). A mapping-abort block was
+  // left exactly as it was — still not a repair, so the notification stays a
+  // warning when any block ended unrepaired.
+  const clean = unrepairable === 0 && aboveMd === 0 && mappingAbort === 0
   await pveNotify(
     executor,
     clean ? 'info' : 'warning',

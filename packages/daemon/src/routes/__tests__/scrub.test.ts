@@ -2,7 +2,7 @@ import type { Job, PeriodicScrubState } from '@anas/shared'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -300,6 +300,28 @@ describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)
   it('PUT /scrub/ahr/ahr0 with a bad cadence → 400', async () => {
     const res = await server.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true, cadence: 'weekly' }) })
     assert.equal(res.statusCode, 400)
+  })
+
+  it('PUT /scrub/ahr/:pool on a FOREIGN anas-scrub unit → 409 reason foreign-unit, no job (review R10)', async () => {
+    // Someone else's unit on ANAS's fixed name — neither rewritten on enable
+    // nor deleted on disable.
+    await writeFile(join(unitDir, 'anas-scrub.service'), '[Unit]\nDescription=not ours\n')
+    for (const enabled of [true, false]) {
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/scrub/ahr/ahr0',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ enabled }),
+      })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.json()))
+      const body = res.json() as { error: { code: string, reason: string, message: string } }
+      assert.equal(body.error.code, 'CONFLICT')
+      assert.equal(body.error.reason, 'foreign-unit')
+      assert.match(body.error.message, /X-ANAS-Schedule/)
+    }
+    // The foreign file is untouched and no job was created.
+    assert.equal(await readFile(join(unitDir, 'anas-scrub.service'), 'utf-8'), '[Unit]\nDescription=not ours\n')
+    assert.equal((await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })).json().data.length, 0)
   })
 
   it('GET /scrub reports a RUNNING md check on the AHR pool (stage 6)', async () => {

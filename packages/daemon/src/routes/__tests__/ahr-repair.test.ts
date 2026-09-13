@@ -237,11 +237,13 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
     // block that cannot be proven is never reported as repaired, and a failing
     // engine never fails the JOB.
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    const result = job.result as { pool: string, repaired: number, unrepairable: number, aboveMd: number, blocks: number, files: { path: string, blocks: { block: number }[] }[] }
+    const result = job.result as { pool: string, repaired: number, unrepairable: number, aboveMd: number, mappingAbort: number, blocks: number, files: { path: string, blocks: { block: number }[] }[] }
     assert.equal(result.pool, 'ahr0')
     assert.equal(result.blocks, 2)
     assert.equal(result.repaired, 0)
-    assert.equal(result.repaired + result.unrepairable + result.aboveMd, result.blocks)
+    // review R9 — the buckets sum WITH the mapping-abort count (blocks the
+    // mock read layer found not corrupt at the mapped location).
+    assert.equal(result.repaired + result.unrepairable + result.aboveMd + (result.mappingAbort ?? 0), result.blocks)
     assert.equal(result.files[0].path, FILE)
     assert.deepEqual(result.files[0].blocks.map(b => b.block), [12, 300])
     await server.close()

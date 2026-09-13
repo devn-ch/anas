@@ -1,9 +1,11 @@
 import type { AhrPool, LastScrub, PeriodicScrubState, ScrubCadence, ScrubRunning } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
-import { readScrubSchedule, readScrubTimerNext, removeScrubUnits, SCRUB_TIMER_NAME, writeScrubUnits } from './scrub-schedule-units.js'
+import { readAhrPools } from './ahr-topology.js'
+import { ForeignUnitError, readScrubSchedule, readScrubTimerNext, removeScrubUnits, SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME, scrubUnitsAreForeign, writeScrubUnits } from './scrub-schedule-units.js'
 // The ONE systemd unit dir constant (env-overridable for tests) — reused, not
 // duplicated: the snapshot store owns it.
 import { DEFAULT_SYSTEMD_DIR } from './snapshot-schedule-units.js'
+import { readUnitFile } from './systemd-unit-store.js'
 
 /**
  * Periodic SCRUB — uniform surface, filesystem-native backend (Epic 17.5 +
@@ -167,21 +169,30 @@ async function isTimerEnabled(executor: CommandExecutor): Promise<boolean> {
   }
 }
 
+/** Legacy wording (review R8): mdcheck is the ONLY periodic check running. */
+const MDCHECK_LEGACY_SENTENCE = 'mdcheck is the only periodic parity check running (the pre-0.4 '
+  + 'mdcheck timer) — it is adopted onto the anas-scrub timer at daemon start'
+
 /**
  * The honest `note` for an AHR state, from what the node actually shows:
- *   - mdcheck still enabled ⇒ a warning: ANAS's phase 1 AND mdcheck would both
- *     run parity checks — "double parity check — mdcheck is on".
+ *   - mdcheck AND the ANAS timer both on ⇒ "double parity check — mdcheck is
+ *     on": ANAS's phase 1 AND mdcheck would both run parity checks.
+ *   - mdcheck on with the ANAS timer OFF ⇒ the LEGACY state (review R8): that
+ *     is 0.3.1's mdcheck-based toggle, said as such — and named as what the
+ *     daemon-start adoption picks up — never as a "double" about a second
+ *     mechanism that is not actually running.
  *   - an md array that is no AHR band ⇒ "<mdN> is not an ANAS pool and is not
  *     scrubbed by ANAS" — never silently.
- * With neither, the node-level mechanism is described in one sentence.
+ * With none of those, the node-level mechanism is described in one sentence.
  */
 export function ahrScrubNote(
   mdcheckOn: boolean,
   foreignArrays: string[],
+  anasTimerOn = true,
 ): string {
   const parts: string[] = []
   if (mdcheckOn)
-    parts.push('double parity check — mdcheck is on')
+    parts.push(anasTimerOn ? 'double parity check — mdcheck is on' : MDCHECK_LEGACY_SENTENCE)
   for (const name of foreignArrays)
     parts.push(`${name} is not an ANAS pool and is not scrubbed by ANAS`)
   if (parts.length === 0)
@@ -240,7 +251,7 @@ export async function readAhrScrubState(
     mechanism: 'anas-scrub-timer',
     nextRun: enabled ? nextRun : null,
     phases: ['md-parity', 'btrfs-checksums'],
-    note: ahrScrubNote(mdcheckOn, foreign),
+    note: ahrScrubNote(mdcheckOn, foreign, timerEnabled),
     lastScrub: null,
     ...(running && { running }),
   }
@@ -269,6 +280,11 @@ export async function setAhrScrubEnabled(
   opts?: { dir: string, cadence?: ScrubCadence },
 ): Promise<void> {
   const dir = opts?.dir ?? DEFAULT_SYSTEMD_DIR
+  // A unit file without our marker is someone else's on ANAS's fixed name:
+  // never rewritten on enable, and never DELETED on disable either (review
+  // R10). The route surfaces this before the job even starts (409).
+  if (await scrubUnitsAreForeign(dir))
+    throw new ForeignUnitError(`an anas-scrub unit without an X-ANAS-Schedule marker exists in ${dir} — not an ANAS unit; nothing was changed`)
   const current = await readScrubSchedule(dir)
   const pools = current?.pools ?? []
   const cadence: ScrubCadence = opts?.cadence ?? current?.cadence ?? 'monthly'
@@ -324,4 +340,116 @@ export function ahrScrubRunning(pool: AhrPool): ScrubRunning | null {
     ...(speeds.length > 0 && { speedBytesSec: speeds.reduce((sum, v) => sum + v, 0) }),
     ...(etas.length > 0 && { etaSeconds: Math.round(Math.max(...etas)) }),
   }
+}
+
+// --- Upgrade migration: adopt 0.3.1's mdcheck-based toggle (review R8) -------
+
+/**
+ * Why the adoption did not run, when it did not. `mdcheck-not-enabled` and
+ * `no-ahr-pools` are the everyday answers on nodes that never used 0.3.1's
+ * toggle; `anas-scrub-units-present` is the already-migrated (or
+ * deliberately-off) node; `foreign-unit` means ANAS's fixed names are taken by
+ * a unit that is not ours — never touched.
+ */
+export type MdcheckAdoptionReason
+  = | 'adopted'
+    | 'anas-scrub-units-present'
+    | 'mdcheck-not-enabled'
+    | 'no-ahr-pools'
+    | 'foreign-unit'
+
+export interface MdcheckAdoptionReport {
+  adopted: boolean
+  reason: MdcheckAdoptionReason
+  /** The pools moved onto the timer (empty unless `reason: 'adopted'`). */
+  pools: string[]
+}
+
+export interface MdcheckAdoptionOptions {
+  /** The systemd unit dir the `anas-scrub` units live in (default the real one). */
+  dir?: string
+  /**
+   * AHR pool names. Default: read live from the topology (`readAhrPools`,
+   * fail-open to []). Tests inject.
+   */
+  pools?: string[]
+  /** Log sink (default console.error — journald via the daemon unit). */
+  log?: (line: string) => void
+}
+
+/**
+ * ONE-TIME upgrade migration from 0.3.1 (review R8). In 0.3.1 the periodic-scrub
+ * toggle flipped mdadm's mdcheck timers; selfheal.4 replaced that with the
+ * `anas-scrub` timer and only disabled mdcheck INSIDE the toggle. An upgraded
+ * node whose operator had the toggle ON therefore reads every pool as OFF while
+ * mdcheck keeps firing — no parity check at all after an uninstall of the old
+ * units, a "double" warning about nothing. This adoption closes that gap at
+ * daemon start, when — and only when — the legacy state is unambiguous:
+ *
+ *   no `anas-scrub` units exist  (the adoption's own output is the no-op's
+ *                                 absence check — one-time by construction)
+ *   AND the mdcheck timers ARE enabled   (the operator's 0.3.1 toggle was ON)
+ *   AND there is at least one AHR pool   (nothing to adopt otherwise)
+ *
+ * then: ALL AHR pools move onto the `anas-scrub` timer at the `monthly`
+ * default, mdcheck is disabled (ANAS owns md checks — exactly what enabling
+ * the toggle does today), and ONE journald audit line says so. Non-blocking,
+ * fail-soft: every branch is a logged reason, never a daemon failure.
+ *
+ * Known edge, accepted by the ruling: an operator who deliberately disabled
+ * the ANAS scrub AND re-armed mdcheck by hand has re-created the legacy state,
+ * and a daemon restart re-adopts. The audit line says what happened, and the
+ * Scrubs toggle undoes it in one click.
+ */
+export async function adoptMdcheckScrub(
+  executor: CommandExecutor,
+  opts: MdcheckAdoptionOptions = {},
+): Promise<MdcheckAdoptionReport> {
+  const dir = opts.dir ?? DEFAULT_SYSTEMD_DIR
+  const log = opts.log ?? ((line: string) => console.error(line))
+  const say = (reason: MdcheckAdoptionReason, pools: string[] = []): MdcheckAdoptionReport => {
+    log(`scrub-schedules: mdcheck adoption skipped (${reason})`)
+    return { adopted: false, reason, pools }
+  }
+
+  // 1. Units already there — migrated, or deliberately off. Never re-adopt.
+  //    A foreign file on ANAS's fixed name is its own answer (never touched,
+  //    the foreign case is a 409 at the toggle), checked before the plain
+  //    units-present so the two are told apart.
+  if (await scrubUnitsAreForeign(dir))
+    return say('foreign-unit')
+  const serviceContent = await readUnitFile(dir, SCRUB_SERVICE_NAME)
+  if (serviceContent !== null)
+    return say('anas-scrub-units-present')
+
+  // 2. The legacy toggle must actually have been ON (mdcheck timers enabled).
+  if (!await isMdcheckEnabled(executor))
+    return say('mdcheck-not-enabled')
+
+  // 3. At least one AHR pool to adopt.
+  const pools = opts.pools ?? await readAhrPools(executor)
+    .then(pools => pools.map(p => p.name))
+    .catch(() => [])
+  if (pools.length === 0)
+    return say('no-ahr-pools')
+
+  // 4. Adopt: the units with every AHR pool at the monthly default, mdcheck
+  //    off (best-effort, surfaced), one audit line.
+  try {
+    await writeScrubUnits(executor, dir, { kind: 'ahr-scrub', cadence: 'monthly', pools })
+  }
+  catch (err) {
+    log(`scrub-schedules: mdcheck adoption failed to write the anas-scrub units: ${err instanceof Error ? err.message : String(err)}`)
+    return { adopted: false, reason: 'foreign-unit', pools }
+  }
+  try {
+    const r = await executor.exec(SYSTEMCTL, mdcheckToggleArgs(false))
+    if (r.exitCode !== 0)
+      log(`scrub-schedules: mdcheck adoption could not disable the mdcheck timers: ${r.stderr.trim() || `exit ${r.exitCode}`}`)
+  }
+  catch (err) {
+    log(`scrub-schedules: mdcheck adoption could not disable the mdcheck timers: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  log(`scrub-schedules: ADOPTED the legacy mdcheck periodic scrub — AHR pool(s) ${pools.join(', ')} moved onto the anas-scrub timer (monthly), the mdcheck timers are now off (upgrade migration, review R8)`)
+  return { adopted: true, reason: 'adopted', pools }
 }

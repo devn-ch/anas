@@ -7002,6 +7002,10 @@ const SCRUB_STATES = {
     // the WHOLE two-phase scrub: phases in the state, nextRun when on.
     { target: { kind: 'ahr', pool: 'ahr0' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'one node-level timer scrubs the enabled AHR pools sequentially (phase 1 md parity, then phase 2 btrfs checksums)', lastScrub: null, running: null },
     { target: { kind: 'ahr', pool: 'ahr1' }, enabled: false, cadence: 'quarterly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'double parity check — mdcheck is on', lastScrub: null, running: null },
+    // review cut-but-verified — ahr2's newest scrub was CLEAN (a later clean
+    // pass displaces an older one's findings); its note is the LEGACY mdcheck
+    // wording (review R8).
+    { target: { kind: 'ahr', pool: 'ahr2' }, enabled: false, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'mdcheck is the only periodic parity check running (the pre-0.4 mdcheck timer) — it is adopted onto the anas-scrub timer at daemon start', lastScrub: null, running: null },
   ],
 }
 
@@ -7082,6 +7086,19 @@ const SCRUB_JOBS = {
       at: '2026-09-11T09:30:00.000Z',
       result: { scrubbed: 'ahr1', btrfsErrors: null, checkedArrays: 2, findings: [] },
     }),
+    // ahr2: a scrub that FOUND something, then a LATER CLEAN one — the newest
+    // job wins findings-or-not, so the clean pass clears the indicator
+    // (review, cut-but-verified).
+    scrubJob({
+      id: 'j6',
+      at: '2026-09-11T08:00:00.000Z',
+      result: { scrubbed: 'ahr2', btrfsErrors: 'csum=2', checkedArrays: 2, findings: [FINDING_A], errorsReported: 2, errorsAttributed: 1, unattributed: 0, truncated: false },
+    }),
+    scrubJob({
+      id: 'j7',
+      at: '2026-09-11T12:00:00.000Z',
+      result: { scrubbed: 'ahr2', btrfsErrors: null, checkedArrays: 2, findings: [] },
+    }),
   ],
 }
 
@@ -7121,9 +7138,10 @@ async function scrubFindingsChecks() {
   // --- The indicator ---------------------------------------------------------
   const ahr0 = rowFor(grid, 'ahr0')
   const ahr1 = rowFor(grid, 'ahr1')
+  const ahr2 = rowFor(grid, 'ahr2')
   const tank = rowFor(grid, 'tank')
-  ok('scrubs: every pool is a row', !!ahr0 && !!ahr1 && !!tank)
-  if (!ahr0 || !ahr1 || !tank) { return }
+  ok('scrubs: every pool is a row', !!ahr0 && !!ahr1 && !!ahr2 && !!tank)
+  if (!ahr0 || !ahr1 || !ahr2 || !tank) { return }
 
   const found = ahr0.get('findings')
   ok('scrubs: the AHR row carries its last scrub\'s findings', !!found)
@@ -7131,6 +7149,11 @@ async function scrubFindingsChecks() {
   eq('scrubs: …with all of its files', found && found.result.findings.length, 3)
   eq('scrubs: a CLEAN last scrub is not a finding', ahr1.get('findings'), null)
   eq('scrubs: a ZFS row never carries AHR findings', tank.get('findings'), null)
+  // review cut-but-verified — the NEWEST completed scrub wins, findings or
+  // not: a later clean pass displaces an older one's stale findings.
+  eq('scrubs: a LATER clean scrub clears an older one\'s findings', ahr2.get('findings'), null)
+  ok('scrubs: …and that row falls back to the honest md-keeps-no-record line',
+    /md keeps no completion record/.test(scrubCell(grid, ahr2)), scrubCell(grid, ahr2))
 
   const cell = scrubCell(grid, ahr0)
   ok('scrubs: the row says how many files, labelled', /3 files with checksum errors/.test(cell), cell)
@@ -7192,7 +7215,7 @@ async function scrubFindingsChecks() {
   const grid2 = view2.down('#scrubGrid')
   view2.fireEvent('afterrender', view2)
   await settle()
-  eq('scrubs: an unreadable job list still renders every row', grid2.getStore().getCount(), 3)
+  eq('scrubs: an unreadable job list still renders every row', grid2.getStore().getCount(), 4)
   eq('scrubs: …and simply has no findings to show', rowFor(grid2, 'ahr0').get('findings'), null)
 }
 
@@ -7386,6 +7409,26 @@ async function repairFromParityChecks() {
   ok('repair: a mixed file says BOTH of its outcomes',
     /1 unrepairable/.test(repairCell(3)) && /1 above-md/.test(repairCell(3)), repairCell(3))
 
+  // --- review R9 — the mapping-abort bucket reads its own number -------------
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'mapping-abort', reason: 'the bytes still pass their stored checksum' }] },
+    ],
+    repaired: 0,
+    unrepairable: 0,
+    aboveMd: 0,
+    mappingAbort: 1,
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: the mapping-abort count rides the headline, its OWN number',
+    /0 repaired · 0 unrepairable · 0 above md · 1 not corrupt at the mapped location/.test(panel.html), panel.html)
+  ok('repair: mapping-abort says nothing was written and nothing needs a restore',
+    /1 block\(s\) were not corrupt at the mapped location — nothing was written, nothing to restore/.test(panel.html), panel.html)
+  ok('repair: …and the restore advice stays reserved for the TRUE unrepairable',
+    !/restore this file from backup/.test(panel.html), panel.html)
+
   // --- The honest "not finished" --------------------------------------------
   sent.onComplete({ id: 'rj2', status: 'running' })
   await settle()
@@ -7532,6 +7575,22 @@ async function scrubTwoPhaseChecks() {
     confirms.some(c => /node-level timer/.test(c.title)), JSON.stringify(confirms))
   ok('scrubs2: the enable confirm says mdcheck is turned off',
     confirms.some(c => /mdcheck timers will be turned off/.test(c.msg)))
+  // review R10 — Persistent=true + a leftover stamp means the enable may start
+  // the whole scrub immediately when the month's occurrence was already missed.
+  ok('scrubs2: the enable confirm warns that a missed occurrence may start a scrub right away',
+    confirms.some(c => /missed/.test(c.msg) && /RIGHT AWAY/.test(c.msg)))
+
+  // review cut-but-verified — the 10 s poll must not yank the cadence value out
+  // from under the operator while they are choosing it.
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr1'))
+  ok('scrubs2: the selector shows the row cadence before the guard', cad.value === 'quarterly')
+  cad.value = 'monthly'
+  cad.hasFocus = true // the operator is mid-choice
+  grid.fireEvent('selectionchange', grid)
+  ok('scrubs2: a FOCUSED cadence selector is left alone by the poll', cad.value === 'monthly')
+  cad.hasFocus = false
+  grid.fireEvent('selectionchange', grid)
+  ok('scrubs2: …and picks the row\'s cadence back up once the operator is done', cad.value === 'quarterly')
   ok('scrubs2: the AHR toggle body carries the cadence',
     jobs.some(j => j.method === 'put' && j.path === '/scrub/ahr/ahr1'
       && j.body.enabled === true && j.body.cadence === 'quarterly'), JSON.stringify(jobs))

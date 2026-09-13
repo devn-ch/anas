@@ -13,6 +13,57 @@ log()  { printf '==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
 
+# Where systemd keeps a Persistent timer's last-fire stamp. The scrub timer's
+# stamp is removed with the units so a later ANAS reinstall does not catch up a
+# months-old missed occurrence (review R10).
+TIMERS_STAMP_DIR="${TIMERS_STAMP_DIR:-/var/lib/systemd/timers}"
+
+# Remove the ANAS SCHEDULE units and restore the node's distro-default parity
+# check (review R8):
+#
+#   * `anas-scrub.timer`/`.service` — selfheal.4's node-level two-phase scrub.
+#     Left behind, the timer keeps firing a runner that no longer exists every
+#     month. When one was removed, mdadm's `mdcheck_start`/`mdcheck_continue`
+#     timers are RE-ENABLED: selfheal.4 turned them off when ANAS took md checks
+#     over, so leaving them off would leave the node with NO periodic parity
+#     check at all. Re-enabling them is the distro default, not a new decision.
+#   * the `anas-snap-*.timer`/`.service` snapshot-schedule pairs — never removed
+#     by an uninstall before; the same runner-gone problem, same cure. Their
+#     Persistent stamps go with them.
+#
+# Idempotent: every step is guarded, a partially-uninstalled node is fine.
+remove_schedule_units() {
+  local removed_scrub=0
+  if [ -f "${SYSTEMD_DIR}/anas-scrub.timer" ]; then
+    systemctl disable --now anas-scrub.timer >/dev/null 2>&1 || true
+    rm -f "${SYSTEMD_DIR}/anas-scrub.timer" "${SYSTEMD_DIR}/anas-scrub.service"
+    rm -f "${TIMERS_STAMP_DIR}/stamp-anas-scrub.timer"
+    removed_scrub=1
+    info "removed the ANAS periodic scrub units (anas-scrub.timer/.service)"
+  fi
+
+  local f svc removed_snap=0
+  for f in "${SYSTEMD_DIR}"/anas-snap-*.service; do
+    [ -e "${f}" ] || continue
+    svc="${f##*/}"; svc="${svc%.service}"
+    systemctl disable --now "${svc}.timer" >/dev/null 2>&1 || true
+    rm -f "${SYSTEMD_DIR}/${svc}.service" "${SYSTEMD_DIR}/${svc}.timer"
+    rm -f "${TIMERS_STAMP_DIR}/stamp-${svc}.timer"
+    removed_snap=$((removed_snap + 1))
+  done
+  if [ "${removed_snap}" -gt 0 ]; then
+    info "removed ${removed_snap} ANAS snapshot schedule unit pair(s) (anas-snap-*)"
+  fi
+
+  if [ "${removed_scrub}" -eq 1 ]; then
+    # The distro default restored: mdcheck resumes the node's monthly parity
+    # check on its own 1st-Sunday calendar. Best-effort — the timers may not be
+    # installed (mdadm absent); nothing about that is an uninstall failure.
+    systemctl enable mdcheck_start.timer mdcheck_continue.timer >/dev/null 2>&1 || true
+    info "restored mdadm's mdcheck timers (the distro default) — the node keeps a periodic parity check"
+  fi
+}
+
 usage() {
   cat <<EOF
 ANAS uninstaller
@@ -34,6 +85,13 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# ANAS_UNINSTALL_LIB_ONLY lets the test harness source this file to exercise
+# remove_schedule_units against a throwaway SYSTEMD_DIR with a faked systemctl —
+# the install.sh lib-mode pattern, no root, no real node.
+if [ "${ANAS_UNINSTALL_LIB_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || true
+fi
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   err "must run as root (EUID 0) — try: sudo ./uninstall.sh"
@@ -66,7 +124,12 @@ if [ "${removed_unit}" -eq 1 ]; then
   info "removed systemd unit files"
 fi
 
-# 3a. Remove the iSCSI boot-ordering drop-in install.sh added beside
+# 3a. Remove the ANAS schedule units (periodic scrub + snapshot schedules) and,
+# when the scrub timer went away, restore mdadm's mdcheck timers — see the
+# function above (review R8).
+remove_schedule_units
+
+# 3b. Remove the iSCSI boot-ordering drop-in install.sh added beside
 # rtslib-fb-targetctl.service. This is the ONLY iSCSI thing an uninstall touches.
 #
 # Deliberately NOT removed, ever:
@@ -91,7 +154,7 @@ fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 
-# 3b. Remove the mdadm md-event hook installed by install.sh. (Any PROGRAM
+# 3c. Remove the mdadm md-event hook installed by install.sh. (Any PROGRAM
 # line in mdadm.conf is the daemon's surgical edit, reverted at pool teardown —
 # not touched here.)
 HOOK_DEST="${HOOK_DEST:-/usr/local/bin/anas-md-event}"
@@ -100,7 +163,7 @@ if [ -f "${HOOK_DEST}" ]; then
   info "removed md-event hook ${HOOK_DEST}"
 fi
 
-# 3c. Remove the ANAS notification templates install.sh drops into pve-manager's
+# 3d. Remove the ANAS notification templates install.sh drops into pve-manager's
 # template dir. Only our own anas-named files are touched — never any other
 # template in that shared directory (guest philosophy).
 PVE_TEMPLATE_DIR="${PVE_TEMPLATE_DIR:-/usr/share/pve-manager/templates/default}"
@@ -118,7 +181,7 @@ if [ "${removed_template}" -eq 1 ]; then
   info "removed ANAS notification templates from ${PVE_TEMPLATE_DIR}"
 fi
 
-# 3d. Remove the ANAS-owned gateway env file (issue #2). ANAS-owned, so it is
+# 3e. Remove the ANAS-owned gateway env file (issue #2). ANAS-owned, so it is
 # safe to delete outright (unlike the surgical edits above).
 if [ -f "${ANAS_ENV_FILE}" ]; then
   rm -f "${ANAS_ENV_FILE}"

@@ -6,6 +6,7 @@ import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
+import { adoptMdcheckScrub } from './services/scrub-schedules.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
 // no-env manual launch must NOT land the trust-boundary socket in world-writable
@@ -84,6 +85,20 @@ async function main() {
         if (outcomes.length > 0)
           server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI menu once the filesystem is mounted`)
       })
+
+      // Upgrade migration (review R8): a node upgraded from 0.3.1 whose operator
+      // had the periodic scrub toggle ON reads every AHR pool OFF while the old
+      // mdcheck timers keep firing — selfheal.4's replacement only disabled
+      // mdcheck inside the toggle. When no anas-scrub units exist, mdcheck IS
+      // enabled, and there is at least one AHR pool, ADOPT: the pools move onto
+      // the ANAS timer (monthly) and mdcheck goes off, with one journald audit
+      // line. One-time by construction (the units it writes are the no-op's own
+      // absence check). Non-blocking; failures are logged, never fatal. Skipped
+      // in mock mode with the rest of the boot scans.
+      void adoptMdcheckScrub(decorated.executor, { log: (line: string) => server.log.info(line) })
+        .catch((err) => {
+          server.log.warn(`mdcheck adoption failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
     }
   }
   catch (err) {

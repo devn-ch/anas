@@ -136,4 +136,115 @@ describe('scrub-task runner (selfheal.4 — timer entrypoint)', () => {
     assert.equal(calls[0], 'POST /v1/ahr/p1/scrub')
     assert.ok(calls.slice(1).every(c => c === 'GET /v1/jobs/j1'))
   })
+
+  // --- The poll has NO duration cap on a live job (review, cut-but-verified) --
+  //
+  // The shared runner backstop (≈24h at 10s) gave up on pool 1 and CONTINUED to
+  // pool 2 while pool 1 was still scrubbing — two pools concurrently on shared
+  // spindles, the one thing selfheal.4 forbids. The scrub runner's own loop
+  // waits as long as the job exists; only a vanished job / daemon outage is
+  // capped.
+  it('a job still running past the old 24h backstop keeps being polled — no cap on a live job', async () => {
+    // 8700 running polls — 60 past the 8640 backstop the shared loop would have
+    // thrown on — then completed.
+    const running: RunnerResponse = { statusCode: 200, body: { job: { id: 'j1', status: 'running' } } }
+    // fill() widens to unknown[] in TS — the cast names the element type back.
+    const polls = Array.from({ length: 8700 }).fill(running) as RunnerResponse[]
+    polls.push({ statusCode: 200, body: { job: { id: 'j1', status: 'completed', result: { scrubbed: 'p1' } } } })
+    let pollIdx = 0
+    const requester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+      return polls[Math.min(pollIdx++, polls.length - 1)]
+    }
+    const job = await scrubPool(requester, 'p1', { sleep: noSleep })
+    assert.equal(job.status, 'completed')
+    assert.ok(pollIdx >= 8700, `polled past the old cap (${pollIdx} polls)`)
+  })
+
+  it('a VANISHED job (404 polls) ends the wait at the sanity cap, with a journald line', async () => {
+    const lines: string[] = []
+    const origErr = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (s: string | Uint8Array) => {
+      lines.push(String(s))
+      return true
+    }
+    try {
+      let pollIdx = 0
+      const requester: Requester = async (req) => {
+        if (req.method === 'POST')
+          return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+        pollIdx++
+        return { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } }
+      }
+      await assert.rejects(
+        () => scrubPool(requester, 'p1', { sleep: noSleep, maxAttempts: 3 }),
+        /vanished/,
+      )
+      assert.equal(pollIdx, 3, 'the wait ends at the cap — never leaps to the next pool before it')
+      assert.ok(lines.some(l => l.includes('vanished')), 'the give-up is said on stderr (journald via the unit)')
+    }
+    finally {
+      process.stderr.write = origErr
+    }
+  })
+
+  it('a daemon OUTAGE ends the wait at the sanity cap, with a journald line', async () => {
+    const lines: string[] = []
+    const origErr = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (s: string | Uint8Array) => {
+      lines.push(String(s))
+      return true
+    }
+    try {
+      let polls = 0
+      const requester: Requester = async (req) => {
+        if (req.method === 'POST')
+          return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+        polls++
+        throw new Error('socket gone')
+      }
+      await assert.rejects(
+        () => scrubPool(requester, 'p1', { sleep: noSleep, maxAttempts: 2 }),
+        /unreachable/,
+      )
+      assert.equal(polls, 2)
+      assert.ok(lines.some(l => l.includes('unreachable')), 'the outage is said on stderr (journald via the unit)')
+    }
+    finally {
+      process.stderr.write = origErr
+    }
+  })
+
+  it('a brief outage recovers — the poll resumes and reaches the terminal state', async () => {
+    let polls = 0
+    const requester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+      polls++
+      if (polls <= 2)
+        throw new Error('daemon restarting')
+      return { statusCode: 200, body: { job: { id: 'j1', status: 'completed', result: { scrubbed: 'p1' } } } }
+    }
+    const job = await scrubPool(requester, 'p1', { sleep: noSleep, maxAttempts: 100 })
+    assert.equal(job.status, 'completed', 'an outage shorter than the cap never abandons the pool')
+  })
+
+  it('the sequence never submits pool 2 while pool 1 is still running (even far past 24h)', async () => {
+    let j1Polls = 0
+    const requester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: req.path.includes('p1') ? 'j1' : 'j2', status: 'queued' } } }
+      if (req.path === '/v1/jobs/j1') {
+        j1Polls++
+        // Completed only after far more polls than the old backstop.
+        return j1Polls >= 8650
+          ? { statusCode: 200, body: { job: { id: 'j1', status: 'completed', result: { scrubbed: 'p1' } } } }
+          : { statusCode: 200, body: { job: { id: 'j1', status: 'running' } } }
+      }
+      return { statusCode: 200, body: { job: { id: 'j2', status: 'completed', result: { scrubbed: 'p2' } } } }
+    }
+    const outcome = await runScrubSchedule(requester, ['p1', 'p2'], { sleep: noSleep })
+    assert.equal(outcome.results.length, 2, 'both pools scrubbed, strictly one at a time')
+  })
 })

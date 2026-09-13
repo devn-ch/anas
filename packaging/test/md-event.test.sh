@@ -212,6 +212,21 @@ run_hook Fail /dev/md127 /dev/sdb1
 check "Fail still notifies"             grep -q ' warning md Fail' "${TMP}/perl.log"
 check "Fail stays warning"              grep -q 'daemon.warning' "${TMP}/logger.log"
 
+echo "== 17. notification text is plain ASCII (review: no mojibake through the monitor's locale) =="
+# The hook runs from mdadm's monitor with no locale of its own; a multi-byte
+# dash in the notification body renders as mojibake in the PVE UI. Everything
+# the hook hands to logger and perl must be ASCII (review, cut-but-verified).
+printf 'check\n' > "${SYS}/md127/md/last_sync_action"
+printf '5\n'     > "${SYS}/md127/md/mismatch_cnt"
+run_hook RebuildFinished /dev/md127
+check "journald line is pure ASCII"      bash -c "! LC_ALL=C grep -q '[^[:print:]]' '${TMP}/logger.log'"
+check "notification title+body are pure ASCII" bash -c "! LC_ALL=C grep -q '[^[:print:]]' '${TMP}/perl.log'"
+check "…and the advice still names phase 2"    grep -q "the periodic scrub's phase 2 will name the files" "${TMP}/perl.log"
+printf 'recover\n' > "${SYS}/md127/md/last_sync_action"
+printf '12\n' > "${SYS}/md127/md/dev-sda1/bad_blocks"
+run_hook RebuildFinished /dev/md127
+check "rebuild advice is pure ASCII too" bash -c "! LC_ALL=C grep -q '[^[:print:]]' '${TMP}/perl.log'"
+
 echo
 echo "md-event tests: ${PASS} passed, ${FAIL} failed"
 [ "${FAIL}" -eq 0 ]

@@ -1,9 +1,17 @@
 import type { DashboardWarning, SnapshotCadence, SnapshotSchedule, SnapshotScheduleDetail, SnapshotScheduleStatus } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
-import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { SnapshotSchedule as SnapshotScheduleSchema } from '@anas/shared'
 import { deriveRunResult, DISABLED_HISTORY_NOTE, parseShow, parseSystemdTimestamp } from './systemd-status.js'
+// The unit-store plumbing (marker parse, dir listing, unlink/systemctl) is the
+// ONE shared copy in systemd-unit-store.ts — snapshot was its second hand-copy.
+import {
+  listServiceUnits,
+  parseMarkedJson,
+  runSystemctl,
+  unlinkQuiet,
+} from './systemd-unit-store.js'
 
 /**
  * Snapshot SCHEDULES (Epic 17.3/17.4/17.5) — the systemd units ARE the store,
@@ -37,8 +45,6 @@ const UNIT_PREFIX = 'anas-snap-'
 const JOURNAL_TAIL = 200
 /** The service-file line that carries the canonical schedule JSON (as a comment). */
 const SCHEDULE_MARKER = 'X-ANAS-Schedule='
-/** Matches the X-ANAS-Schedule line (with or without a leading `# `), capturing JSON. */
-const SCHEDULE_MARKER_RE = /^#?\s*X-ANAS-Schedule=(.*)$/
 
 /** Default systemd unit directory; overridable (env/dep) for tests. */
 export const DEFAULT_SYSTEMD_DIR = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
@@ -127,33 +133,14 @@ export function renderTimerUnit(schedule: SnapshotSchedule): string {
  * skips (and warns about) such files, fail-open.
  */
 export function parseServiceUnit(content: string): SnapshotSchedule | null {
-  for (const line of content.split('\n')) {
-    const m = line.match(SCHEDULE_MARKER_RE)
-    if (!m)
-      continue
-    try {
-      const parsed = SnapshotScheduleSchema.safeParse(JSON.parse(m[1]))
-      return parsed.success ? parsed.data : null
-    }
-    catch {
-      return null
-    }
-  }
-  return null
+  return parseMarkedJson(content, SCHEDULE_MARKER, SnapshotScheduleSchema)
 }
 
 // --- Store: read ------------------------------------------------------------
 
 /** All valid schedules parsed from `anas-snap-*.service` files (invalid → skipped). */
 export async function readAllSchedules(dir: string): Promise<SnapshotSchedule[]> {
-  let files: string[]
-  try {
-    files = await readdir(dir)
-  }
-  catch {
-    return []
-  }
-  const services = files.filter(f => f.startsWith(UNIT_PREFIX) && f.endsWith('.service'))
+  const services = await listServiceUnits(dir, UNIT_PREFIX)
   const schedules: SnapshotSchedule[] = []
   for (const file of services) {
     try {
@@ -233,21 +220,6 @@ export async function removeScheduleUnits(
     unlinkQuiet(join(dir, timerUnitName(id))),
   ])
   await runSystemctl(executor, ['daemon-reload'])
-}
-
-async function unlinkQuiet(path: string): Promise<void> {
-  try {
-    await unlink(path)
-  }
-  catch {
-    // Missing file is fine — the goal state (absent) already holds.
-  }
-}
-
-async function runSystemctl(executor: CommandExecutor, args: string[]): Promise<void> {
-  const r = await executor.exec(SYSTEMCTL, args)
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `systemctl ${args.join(' ')} exited with code ${r.exitCode}`)
 }
 
 // --- Status derivation ------------------------------------------------------

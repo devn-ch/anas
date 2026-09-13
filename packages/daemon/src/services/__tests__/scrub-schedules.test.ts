@@ -1,12 +1,13 @@
 import type { AhrArraySync, AhrPool } from '@anas/shared'
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
-import { readScrubSchedule, renderScrubTimerUnit, SCRUB_TIMER_NAME, writeScrubUnits } from '../scrub-schedule-units.js'
+import { readScrubSchedule, renderScrubTimerUnit, SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME, writeScrubUnits } from '../scrub-schedule-units.js'
 import {
+  adoptMdcheckScrub,
   ahrScrubNote,
   ahrScrubRunning,
   foreignMdArrays,
@@ -185,6 +186,30 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
     }
   })
 
+  it('the note distinguishes the LEGACY mdcheck state (timer off, mdcheck on) from a true double (review R8)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-scrub-legacy-'))
+    try {
+      // An upgraded 0.3.1 node before adoption: ANAS timer off, mdcheck on.
+      // That is the ONLY parity check running — a "double" warning would be
+      // about a second mechanism that does not exist.
+      const exec = await stateExecutor({ timer: 'off', mdcheck: 'on' })
+      const st = await readAhrScrubState(exec, 'ahr0', null, { dir })
+      assert.equal(st.enabled, false)
+      assert.match(st.note ?? '', /mdcheck is the only periodic parity check running/)
+      assert.match(st.note ?? '', /adopted onto the anas-scrub timer at daemon start/)
+      assert.doesNotMatch(st.note ?? '', /double parity check/)
+
+      // Both on is the true double — unchanged wording.
+      assert.equal(ahrScrubNote(true, [], true), 'double parity check — mdcheck is on')
+      // Timer off + mdcheck on names the legacy state; pure note function.
+      assert.match(ahrScrubNote(true, [], false), /only periodic parity check/)
+      assert.equal(ahrScrubNote(false, [], false), 'one node-level timer scrubs the enabled AHR pools sequentially (phase 1 md parity, then phase 2 btrfs checksums)')
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('foreignMdArrays diffs /proc/mdstat names against the AHR bands (fail-open to none)', () => {
     assert.deepEqual(foreignMdArrays(['md127', 'md9'], ['md127']), ['md9'])
     assert.deepEqual(foreignMdArrays(['md127'], ['md127']), [])
@@ -280,6 +305,108 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
         process.stderr.write = origErr
       }
     })
+
+    it('a foreign anas-scrub unit is refused on BOTH directions — never rewritten, never deleted (review R10)', async () => {
+      await writeFile(join(dir, SCRUB_SERVICE_NAME), '[Unit]\nDescription=someone else\'s unit\n')
+      await assert.rejects(
+        () => setAhrScrubEnabled(mock, 'ahr0', true, { dir }),
+        (err: NodeJS.ErrnoException) => (err as Error).name === 'ForeignUnitError',
+      )
+      await assert.rejects(
+        () => setAhrScrubEnabled(mock, 'ahr0', false, { dir }),
+        /not an ANAS unit/,
+      )
+      // The foreign file is untouched — nothing was written, nothing deleted.
+      assert.equal(await readFile(join(dir, SCRUB_SERVICE_NAME), 'utf-8'), '[Unit]\nDescription=someone else\'s unit\n')
+      assert.equal(await readScrubSchedule(dir), null)
+    })
+  })
+})
+
+// The ONE-TIME upgrade migration from 0.3.1 (review R8): 0.3.1's periodic-scrub
+// toggle flipped the mdcheck timers, and selfheal.4's replacement disabled
+// mdcheck only inside the toggle — so an upgraded node with the toggle ON read
+// every pool OFF while mdcheck kept firing. The adoption runs at daemon start
+// when (and only when) the legacy state is unambiguous.
+describe('adoptMdcheckScrub — the 0.3.1 mdcheck upgrade migration (review R8)', () => {
+  let dir: string
+  let mock: MockExecutor
+  const lines: string[] = []
+  let origErr: typeof process.stderr.write
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-scrub-adopt-'))
+    mock = new MockExecutor()
+    mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    // No mdcheck is-enabled fixture here: MockExecutor is first-fixture-wins on
+    // identical command+args, so each test registers its own mdcheck answer.
+    lines.length = 0
+    origErr = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (s: string | Uint8Array) => {
+      lines.push(String(s))
+      return true
+    }
+  })
+  afterEach(async () => {
+    process.stderr.write = origErr
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('ADOPTS: every AHR pool onto the timer (monthly), mdcheck disabled, one audit line', async () => {
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: isEnabledArgs('mdcheck_start.timer'),
+      result: { stdout: 'enabled\n', stderr: '', exitCode: 0 },
+    })
+    const report = await adoptMdcheckScrub(mock, { dir, pools: ['ahr0', 'ahr1'] })
+    assert.deepEqual(report, { adopted: true, reason: 'adopted', pools: ['ahr0', 'ahr1'] })
+    assert.deepEqual(await readScrubSchedule(dir), { kind: 'ahr-scrub', cadence: 'monthly', pools: ['ahr0', 'ahr1'] })
+    const cmds = mock.calls.map(c => c.args.join(' '))
+    assert.ok(cmds.includes(`enable --now ${SCRUB_TIMER_NAME}`))
+    assert.ok(cmds.includes('disable --now mdcheck_start.timer mdcheck_continue.timer'), 'ANAS owns md checks on this node from here on')
+    assert.ok(lines.some(l => l.includes('ADOPTED the legacy mdcheck periodic scrub') && l.includes('ahr0, ahr1')), lines.join(' | '))
+  })
+
+  it('is a NO-OP when mdcheck is not enabled (the operator never had the 0.3.1 toggle on)', async () => {
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: isEnabledArgs('mdcheck_start.timer'),
+      result: { stdout: 'disabled\n', stderr: '', exitCode: 1 },
+    })
+    const report = await adoptMdcheckScrub(mock, { dir, pools: ['ahr0'] })
+    assert.deepEqual(report, { adopted: false, reason: 'mdcheck-not-enabled', pools: [] })
+    assert.equal(await readScrubSchedule(dir), null, 'no units written')
+    assert.ok(!mock.calls.some(c => c.args[0] === 'disable' && c.args.includes('mdcheck_start.timer')), 'mdcheck untouched')
+  })
+
+  it('is a NO-OP when there is no AHR pool to adopt', async () => {
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: isEnabledArgs('mdcheck_start.timer'),
+      result: { stdout: 'enabled\n', stderr: '', exitCode: 0 },
+    })
+    const report = await adoptMdcheckScrub(mock, { dir, pools: [] })
+    assert.deepEqual(report, { adopted: false, reason: 'no-ahr-pools', pools: [] })
+    assert.equal(await readScrubSchedule(dir), null)
+  })
+
+  it('is a NO-OP when the anas-scrub units already exist (already migrated, or deliberately off)', async () => {
+    await writeScrubUnits(mock, dir, { kind: 'ahr-scrub', cadence: 'quarterly', pools: ['ahr0'] })
+    const callsBefore = mock.calls.length
+    const report = await adoptMdcheckScrub(mock, { dir, pools: ['ahr0'] })
+    assert.deepEqual(report, { adopted: false, reason: 'anas-scrub-units-present', pools: [] })
+    // The existing schedule is untouched, and mdcheck was never even asked
+    // about — the units' presence is the whole answer.
+    assert.deepEqual(await readScrubSchedule(dir), { kind: 'ahr-scrub', cadence: 'quarterly', pools: ['ahr0'] })
+    assert.equal(mock.calls.length, callsBefore, 'no new systemctl calls at all')
+  })
+
+  it('is a NO-OP when a FOREIGN unit squats on the anas-scrub name — never touched', async () => {
+    await writeFile(join(dir, SCRUB_SERVICE_NAME), '[Unit]\nDescription=not ours\n')
+    const report = await adoptMdcheckScrub(mock, { dir, pools: ['ahr0'] })
+    assert.deepEqual(report, { adopted: false, reason: 'foreign-unit', pools: [] })
+    assert.equal(await readFile(join(dir, SCRUB_SERVICE_NAME), 'utf-8'), '[Unit]\nDescription=not ours\n')
+    assert.equal(await readScrubSchedule(dir), null)
   })
 })
 

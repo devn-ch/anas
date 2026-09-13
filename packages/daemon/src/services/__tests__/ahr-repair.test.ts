@@ -53,8 +53,8 @@ function notification(exec: MockExecutor): { severity: string, title: string, bo
   return { severity: call.args[2], title: call.args[3], body: call.args[4] }
 }
 
-describe('AHR repair job — the three honest buckets', () => {
-  it('sorts every verdict into repaired / unrepairable / aboveMd, mapping-abort included', async () => {
+describe('AHR repair job — the four honest counts (review R9)', () => {
+  it('sorts every verdict into repaired / unrepairable / aboveMd / mappingAbort, each as itself', async () => {
     const exec = executor()
     const verdicts: Record<string, SelfhealOutcomeKind> = {
       '/a.bin:1': 'repaired',
@@ -71,11 +71,13 @@ describe('AHR repair job — the three honest buckets', () => {
     )
 
     assert.equal(result.repaired, 1)
-    // mapping-abort counts as unrepairable — it is NOT a repair.
-    assert.equal(result.unrepairable, 2)
+    // mapping-abort counts AS ITSELF now (review R9) — not a repair, but the
+    // opposite of unrepairable: the block was fine at the mapped location.
+    assert.equal(result.unrepairable, 1)
     assert.equal(result.aboveMd, 1)
+    assert.equal(result.mappingAbort, 1)
     assert.equal(result.blocks, 4)
-    assert.equal(result.repaired + result.unrepairable + result.aboveMd, result.blocks)
+    assert.equal(result.repaired + result.unrepairable + result.aboveMd + result.mappingAbort, result.blocks)
     // …and keeps its own name and reason in the per-block entry.
     const b8 = result.files[1].blocks.find(b => b.block === 8)!
     assert.equal(b8.outcome, 'mapping-abort')
@@ -209,7 +211,7 @@ describe('AHR repair job — the one notification', () => {
     assert.doesNotMatch(notify.body, /proves|definitely/)
   })
 
-  it('a mapping-abort is never told to restore from backup — it means the block is FINE (selfheal.7 F2)', async () => {
+  it('a mapping-abort is never told to restore from backup — it means the block is FINE (selfheal.7 F2, R9)', async () => {
     const exec = executor()
     await repairAhrFiles(
       exec,
@@ -219,17 +221,18 @@ describe('AHR repair job — the one notification', () => {
       { repair: async (_e, req) => outcome(req.file, req.block, 'mapping-abort', 'not corrupt here') },
     )
     const notify = notification(exec)!
-    // Still a warning and still counted as unrepairable — nothing was repaired.
+    // Still a warning and now counted AS ITSELF — nothing was repaired.
     assert.equal(notify.severity, 'warning')
-    assert.match(notify.body, /0 repaired, 2 unrepairable, 0 above md/)
+    assert.match(notify.body, /0 repaired, 0 unrepairable, 0 above md, 2 not corrupt at the mapped location/)
     assert.match(notify.body, /\/a\.bin — 2 mapping-abort/)
-    // But the advice is the opposite of "restore from backup".
+    // But the advice is the opposite of "restore from backup", and it reads the
+    // ONE number (review R9).
     assert.doesNotMatch(notify.body, /restore this file from backup/)
     assert.match(notify.body, /still pass their stored checksum/)
     assert.match(notify.body, /they need no restore/)
   })
 
-  it('a mix keeps each sentence with the blocks it belongs to (selfheal.7 F2)', async () => {
+  it('a mix keeps each sentence with the blocks it belongs to (selfheal.7 F2, R9)', async () => {
     const exec = executor()
     await repairAhrFiles(
       exec,
@@ -246,9 +249,31 @@ describe('AHR repair job — the one notification', () => {
       },
     )
     const notify = notification(exec)!
-    assert.match(notify.body, /0 repaired, 2 unrepairable, 0 above md/)
+    assert.match(notify.body, /0 repaired, 1 unrepairable, 0 above md, 1 not corrupt at the mapped location/)
+    // "restore from backup" belongs to the TRUE unrepairable only.
     assert.match(notify.body, /restore this file from backup/)
     assert.match(notify.body, /they need no restore/)
+  })
+
+  it('the notification names all four counts, and they add up (review R9)', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1, 2, 3, 4] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(req.file, req.block, ({
+          1: 'repaired',
+          2: 'unrepairable',
+          3: 'above-md',
+          4: 'mapping-abort',
+        } as Record<number, SelfhealOutcomeKind>)[req.block], 'because'),
+      },
+    )
+    assert.equal(result.repaired + result.unrepairable + result.aboveMd + result.mappingAbort, result.blocks)
+    const notify = notification(exec)!
+    assert.match(notify.body, /1 repaired, 1 unrepairable, 1 above md, 1 not corrupt at the mapped location, of 4 block\(s\)/)
   })
 
   it('caps the file list at 20 and says how many more', async () => {
@@ -300,11 +325,25 @@ describe('AHR repair schemas — round trips', () => {
       pool: 'tank',
       files: [{ path: '/a.bin', blocks: [{ block: 1, outcome: 'mapping-abort', reason: 'not corrupt here' }] }],
       repaired: 0,
-      unrepairable: 1,
+      unrepairable: 0,
       aboveMd: 0,
+      mappingAbort: 1,
       blocks: 1,
     }
     assert.deepEqual(AhrRepairResult.parse(value), value)
     assert.throws(() => AhrRepairResult.parse({ ...value, files: [{ path: '/a.bin', blocks: [{ block: 1, outcome: 'fixed', reason: '' }] }] }))
+  })
+
+  it('a pre-R9 payload without mappingAbort parses (additive field, default 0)', () => {
+    const legacy = {
+      pool: 'tank',
+      files: [{ path: '/a.bin', blocks: [{ block: 1, outcome: 'unrepairable', reason: 'two bad blocks' }] }],
+      repaired: 0,
+      unrepairable: 1,
+      aboveMd: 0,
+      blocks: 1,
+    }
+    const parsed = AhrRepairResult.parse(legacy)
+    assert.equal(parsed.mappingAbort, 0, 'the new count defaults to 0, never undefined')
   })
 })

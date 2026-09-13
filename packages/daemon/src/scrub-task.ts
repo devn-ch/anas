@@ -1,6 +1,6 @@
 import type { Job, JobRef } from '@anas/shared'
 import type { Requester, RunLoopOptions } from './runner-poll.js'
-import { defaultSocket, errorMessage, identityHeaders, pollJobToTerminal, socketRequester } from './runner-poll.js'
+import { defaultSocket, errorMessage, identityHeaders, RUNNER_POLL_INTERVAL_MS, RUNNER_POLL_MAX_ATTEMPTS, socketRequester } from './runner-poll.js'
 
 /**
  * AHR periodic-scrub RUNNER (story selfheal.4) — the entrypoint the node-level
@@ -55,8 +55,9 @@ export function parseRunnerArgs(argv: string[]): ScrubRunnerOptions {
 
 /**
  * Submit ONE pool's scrub and poll it to a terminal state. Resolves with the
- * finished Job (completed OR failed); rejects on transport failures. A 404 —
- * the pool is gone — throws a distinct "gone" error the caller skips on.
+ * finished Job (completed OR failed); rejects only when the JOB is gone. A 404
+ * on the SUBMIT — the pool is gone — throws a distinct "gone" error the caller
+ * skips on.
  */
 export async function scrubPool(
   requester: Requester,
@@ -78,7 +79,78 @@ export async function scrubPool(
   const jobRef = (submit.body as { job?: JobRef }).job
   if (!jobRef?.id)
     throw new Error(`scrub submit returned no job id for '${pool}': ${JSON.stringify(submit.body)}`)
-  return pollJobToTerminal(requester, jobRef, 'ahr-scrub', loop)
+  return pollScrubJob(requester, jobRef, loop)
+}
+
+/**
+ * Poll ONE scrub job to its terminal state — WITHOUT the shared 24 h backstop
+ * (review, cut-but-verified). The generic runner cap exists so a healthy
+ * multi-hour backup is never declared failed; a scrub is LONGER still (days on
+ * real spindles), and worse: the runner would give up on pool 1 and `continue`
+ * to pool 2 while pool 1 was still scrubbing — two pools concurrently on
+ * shared spindles, the one thing selfheal.4 forbids. So THIS loop keeps its
+ * own rule:
+ *
+ *   - a job that exists and is not terminal is waited for. No cap. The daemon
+ *     is the source of truth and the job always terminates; the runner's job
+ *     is to mirror it, however long that takes.
+ *   - only a job that VANISHES ends the wait: a 404 (the daemon restarted and
+ *     its in-memory job list is gone) or a daemon outage, each polled up to
+ *     {@link RUNNER_POLL_MAX_ATTEMPTS} attempts (≈ 24 h at the 10 s interval)
+ *     before giving up with a journald line — a sanity cap on a missing job,
+ *     never a judgment about how long the work should take.
+ */
+export async function pollScrubJob(
+  requester: Requester,
+  jobRef: JobRef,
+  loop: RunLoopOptions = {},
+): Promise<Job> {
+  const intervalMs = loop.intervalMs ?? RUNNER_POLL_INTERVAL_MS
+  const vanishCap = loop.maxAttempts ?? RUNNER_POLL_MAX_ATTEMPTS
+  const sleep = loop.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms)))
+  const headers = identityHeaders()
+
+  let missing = 0
+  let outage = 0
+  for (;;) {
+    let poll
+    try {
+      poll = await requester({
+        method: 'GET',
+        path: `/v1/jobs/${jobRef.id}`,
+        headers,
+      })
+      outage = 0
+    }
+    catch (err) {
+      outage += 1
+      if (outage >= vanishCap) {
+        const message = `scrub job ${jobRef.id} unreachable — the daemon has been answering for `
+          + `${outage} consecutive polls (${Math.round(outage * intervalMs / 1000)}s); giving up on this pool's wait: ${
+            err instanceof Error ? err.message : String(err)}`
+        process.stderr.write(`scrub-task: ${message}\n`)
+        throw new Error(message)
+      }
+      await sleep(intervalMs)
+      continue
+    }
+    if (poll.statusCode === 200) {
+      missing = 0
+      const job = (poll.body as { job?: Job }).job
+      if (job && (job.status === 'completed' || job.status === 'failed'))
+        return job
+    }
+    else {
+      missing += 1
+      if (missing >= vanishCap) {
+        const message = `scrub job ${jobRef.id} vanished — HTTP ${poll.statusCode} for `
+          + `${missing} consecutive polls (the daemon restarted and its job list is gone?); giving up on this pool's wait`
+        process.stderr.write(`scrub-task: ${message}\n`)
+        throw new Error(message)
+      }
+    }
+    await sleep(intervalMs)
+  }
 }
 
 /** The outcome of one pool's pass through the sequence. */

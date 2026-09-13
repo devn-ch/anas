@@ -253,17 +253,25 @@ export type AhrRepairFileOutcome = z.infer<typeof AhrRepairFileOutcome>
 /**
  * The result of a repair job.
  *
- * THREE honest buckets, and no fourth place to hide a block in:
+ * FOUR honest counts, and no fifth place to hide a block in (review R9 —
+ * `mapping-abort` is counted AS ITSELF, never folded into `unrepairable`, so
+ * each bucket's advice follows its own blocks):
  *
  *  - `repaired` — the reconstruction matched the stored checksum, was written
  *    through md, re-checked clean and read back cold.
  *  - `unrepairable` — nothing below the csum tree can be proven right for this
- *    block. `mapping-abort` counts here too (the bytes still pass their stored
- *    csum, so the engine refused to write) and keeps its own reason in the
- *    per-block entry. Restore the file from backup.
+ *    block (two bad blocks in one stripe, an extent with no csum at all, a
+ *    post-check that did not come back clean). Restore the file from backup.
  *  - `aboveMd` — parity already agreed with the bad data. Nothing was written.
+ *  - `mappingAbort` — the block was NOT CORRUPT AT THE MAPPED LOCATION: the
+ *    bytes there still pass their stored csum, so the engine refused to write.
+ *    Nothing was written, nothing to restore — the finding no longer
+ *    describes the block. The per-block entry keeps the outcome and its own
+ *    reason either way.
  *
- * `blocks` is every block attempted, so the three buckets always add up to it.
+ * `blocks` is every block attempted, so the four counts always add up to it.
+ * `mappingAbort` defaults to 0 so a payload from a daemon that folded it into
+ * `unrepairable` (pre-R9) still parses.
  */
 export const AhrRepairResult = z.object({
   /** The AHR pool the repair ran on. */
@@ -272,7 +280,9 @@ export const AhrRepairResult = z.object({
   repaired: z.number().int().nonnegative(),
   unrepairable: z.number().int().nonnegative(),
   aboveMd: z.number().int().nonnegative(),
-  /** Total blocks attempted — repaired + unrepairable + aboveMd. */
+  /** Blocks whose mapped location was not corrupt — left alone, nothing to restore. */
+  mappingAbort: z.number().int().nonnegative().default(0),
+  /** Total blocks attempted — repaired + unrepairable + aboveMd + mappingAbort. */
   blocks: z.number().int().nonnegative(),
 })
 export type AhrRepairResult = z.infer<typeof AhrRepairResult>

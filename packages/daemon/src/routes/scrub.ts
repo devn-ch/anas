@@ -7,6 +7,7 @@ import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseScrubScans } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
+import { scrubUnitsAreForeign } from '../services/scrub-schedule-units.js'
 import {
   ahrScrubRunning,
   readAhrScrubState,
@@ -193,6 +194,20 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     if (!(await ahrPoolNames()).includes(pool)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${pool}' not found` } }
+    }
+
+    // A unit file on ANAS's fixed anas-scrub names WITHOUT our marker is not
+    // ours to rewrite (enable) or delete (disable) — refuse at the door, 409,
+    // before a job exists (review R10). The job service checks again.
+    if (await scrubUnitsAreForeign(systemdDir)) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'foreign-unit',
+          message: `an anas-scrub unit without an X-ANAS-Schedule marker exists in ${systemdDir} — not an ANAS unit; the periodic scrub toggle will not change it`,
+        },
+      }
     }
 
     const job = jobQueue.submit(

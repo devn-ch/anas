@@ -809,3 +809,13 @@ Nothing. Specifically:
 - The node-side workspace `/root/sh7` (the suite copies, the marker regen images, the step
   scripts) and the poll helpers were removed. `/root/aq.sh` — which predates this round — stays.
 - The node is running the build with the F1 and F2 fixes.
+
+## Review remediation 2026-09-13
+
+R8 — mdcheck adoption on upgrade: on daemon start, a node with no `anas-scrub` units, mdcheck enabled and ≥1 AHR pool is adopted onto the timer (all pools, monthly, mdcheck disabled, one audit line); the note distinguishes the legacy mdcheck-only state from a true double; uninstall removes the schedule units and re-enables mdcheck's timers.
+
+R9 — the mapping-abort outcome is its own count in `AhrRepairResult` (not folded into `unrepairable`): schema, engine verdict loop, notification and Scrubs UI all read the one number, and "restore from backup" is reserved for true unrepairable.
+
+R10 — `writeScrubUnits` reads before it writes: a marker-less `anas-scrub.service` is refused as a foreign unit (409 `reason: 'foreign-unit'`), never overwritten or deleted; `removeScrubUnits` also clears the timer's Persistent stamp; the enable-confirm dialog warns that enabling may start a scrub right away if this month's occurrence was missed.
+
+Cut-but-verified — the runner polls a still-running scrub job with no cap (only a vanished job or daemon outage ends the wait); the findings window shows the newest completed scrub per pool, so a later clean scrub clears an older row's findings; the cadence combo is not overwritten mid-choice by the 10 s poll; the md-event advice lines are pure ASCII; the fourth hand-copy of the systemd unit-store plumbing is extracted into one shared module (`systemd-unit-store.ts`).

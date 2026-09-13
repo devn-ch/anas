@@ -75,9 +75,10 @@
  * the findings are what a repair is selected FROM, so the verb belongs where
  * they are told. Tick the files to repair (a finding with no live file under
  * the mountpoint — deleted, or inside a snapshot — cannot be ticked and says
- * why), confirm what the daemon warns about, and the job's three honest buckets
- * come back into the same window. Never automatic, never a read-path heal: an
- * operator asks for it, on named files, with named blocks.
+ * why), confirm what the daemon warns about, and the job's four honest counts
+ * (repaired / unrepairable / above md / not corrupt at the mapped location —
+ * review R9) come back into the same window. Never automatic, never a
+ * read-path heal: an operator asks for it, on named files, with named blocks.
  *
  * …and on the TOOLBAR too (selfheal.9, RULED: both, gated by need). A Repair
  * action beside Run now / Stop is the verb's standing home — the window is a
@@ -229,10 +230,11 @@
             // The pass running RIGHT NOW, or null when the pool is idle (and
             // always null against a daemon too old to report it).
             running: state.running || null,
-            // The findings of this pool's last COMPLETED AHR scrub job, when the
-            // daemon still holds one (selfheal.3). Null for ZFS, and null for an
-            // AHR pool whose last scrub found nothing or has aged out.
-            findings: (kind === 'ahr' && findingsByPool) ? (findingsByPool[target.pool] || null) : null,
+            // The findings of this pool's NEWEST COMPLETED AHR scrub job, when
+            // that job found something (selfheal.3). Null for ZFS, and null for
+            // an AHR pool whose newest scrub was CLEAN — a clean pass displaces
+            // an older one's findings — or whose jobs have aged out.
+            findings: (kind === 'ahr' && findingsByPool) ? findingsFor(findingsByPool, target.pool) : null,
             // A stable per-row key (kind+pool) so selection survives a poll.
             rowKey: kind + ':' + (target.pool || '')
         };
@@ -244,8 +246,14 @@
     // that started it — so the findings have to be found again later. They are:
     // the AHR scrub job carries them in its RESULT, and the daemon already
     // exposes `GET /v1/jobs?status=completed`. The filtering (operation, pool,
-    // has-findings, newest-per-pool) is done here rather than asking the route
-    // for a filter it does not have.
+    // newest-per-pool) is done here rather than asking the route for a filter
+    // it does not have.
+    //
+    // The NEWEST completed `ahr.scrub` job per pool wins — findings OR NOT
+    // (review, cut-but-verified): a later CLEAN scrub must displace an older
+    // one's findings, or the row would advertise corruption a clean pass has
+    // already ruled out. The row shows the entry only when that newest job
+    // actually carries findings, so a clean scrub clears the indicator.
     //
     // The job queue is IN MEMORY: it holds what has run since anasd started and
     // nothing older, and ANAS keeps no scrub history of its own (stateless — no
@@ -256,7 +264,7 @@
         return isFinite(t) ? t : 0;
     }
 
-    function latestScrubFindings(res) {
+    function latestScrubByPool(res) {
         var byPool = {};
         var list = (res && res.data) || [];
         for (var i = 0; i < list.length; i++) {
@@ -265,9 +273,8 @@
                 continue;
             }
             var result = job.result;
-            var findings = result && result.findings;
             var pool = result && result.scrubbed;
-            if (!pool || !findings || !findings.length) {
+            if (!pool) {
                 continue;
             }
             var prior = byPool[pool];
@@ -276,6 +283,15 @@
             }
         }
         return byPool;
+    }
+
+    /** The findings entry for a row — null when the pool's newest scrub was clean. */
+    function findingsFor(byPool, pool) {
+        var entry = byPool[pool];
+        if (!entry || !entry.result || !entry.result.findings || !entry.result.findings.length) {
+            return null;
+        }
+        return entry;
     }
 
     // Pool: the shared fs-tag chip ("zfs"/"ahr") + the full pool name — reads
@@ -483,7 +499,7 @@
             }
             var findingsByPool = {};
             try {
-                findingsByPool = latestScrubFindings(both[1]);
+                findingsByPool = latestScrubByPool(both[1]);
             } catch (eJ) {
                 ANAS.warn('scrub findings read failed: ' + ANAS.errText(eJ));
             }
@@ -555,11 +571,21 @@
         // The cadence selector lives exactly where the toggle does — the toolbar,
         // enabled only for an AHR row (ZFS's cadence is PVE's monthly cron). It
         // rides the toggle body; there is no second control, no second dialog.
+        // The 10 s poll must not yank the value out from under the operator
+        // while they are choosing (review, cut-but-verified): a focused or
+        // expanded picker is left alone, and the value is only ever rewritten
+        // when it actually differs from the row's.
         var cad = scrubGrid.down('#scrubCadence');
         if (cad) {
             cmpSetDisabled(cad, !isAhr);
             if (isAhr) {
-                comboSetValue(cad, rec.get('cadence') || 'monthly');
+                var wanted = rec.get('cadence') || 'monthly';
+                var busy = false;
+                try { busy = cad.hasFocus === true; } catch (eF) { /* non-fatal */ }
+                try { busy = busy || (typeof cad.isExpanded === 'function' && cad.isExpanded()); } catch (eX) { /* non-fatal */ }
+                if (!busy && comboValue(cad) !== wanted) {
+                    comboSetValue(cad, wanted);
+                }
             }
         }
 
@@ -655,7 +681,10 @@
                         + t('the ANAS scrub timer for this pool — the timer runs the whole scrub '
                             + '(phase 1 md parity, then phase 2 btrfs checksums) for every enabled '
                             + 'AHR pool on this node, one at a time?')
-                        + (next ? '<br><br>' + enc(t('mdadm\'s mdcheck timers will be turned off.')) : ''),
+                        + (next
+                            ? '<br><br>' + enc(t('mdadm\'s mdcheck timers will be turned off.'))
+                                + '<br><br>' + enc(t('The timer is persistent: if this month\'s occurrence was already '
+                                    + 'missed, enabling may START A SCRUB RIGHT AWAY — it can run for many hours.')) : ''),
                     function (btn) {
                         if (btn === 'yes') { doToggle(); }
                     }
@@ -930,11 +959,21 @@
         var counts = Number(res.repaired || 0) + ' ' + t('repaired')
             + ' · ' + Number(res.unrepairable || 0) + ' ' + t('unrepairable')
             + ' · ' + Number(res.aboveMd || 0) + ' ' + t('above md')
+            + ' · ' + Number(res.mappingAbort || 0) + ' ' + t('not corrupt at the mapped location')
             + ' (' + t('of') + ' ' + Number(res.blocks || 0) + ' ' + t('4 KiB block(s)') + ')';
         var lines = [enc(counts)];
+        // Each bucket reads its own count (review R9): "restore from backup"
+        // rides only the TRUE unrepairable. A mapping-abort block was never
+        // corrupt at the mapped location — the engine wrote nothing, and the
+        // advice is the opposite of a restore.
         if (Number(res.unrepairable || 0) > 0) {
             lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
                 + 'those blocks — restore this file from backup.')));
+        }
+        if (Number(res.mappingAbort || 0) > 0) {
+            lines.push(enc(Number(res.mappingAbort || 0) + ' ' + t('block(s) were not corrupt at the mapped location '
+                + '— nothing was written, nothing to restore: the bytes there still pass their stored '
+                + 'checksum, so the finding no longer describes them.')));
         }
         if (Number(res.aboveMd || 0) > 0) {
             lines.push(enc(t('Above md: parity already agreed with the bad data — this implicates '

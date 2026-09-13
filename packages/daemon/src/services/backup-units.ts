@@ -1,11 +1,19 @@
 import type { BackupArchiveConsistency, BackupExpandedArchive, BackupPruneResult, BackupRunResult, BackupTask, BackupTransientSnapshot, DashboardWarning } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { BackupTrigger, CadenceGateDecision } from './backup-cadence.js'
-import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, BackupTask as BackupTaskSchema, cadenceToOnCalendar } from '@anas/shared'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
 import { deriveRunResult as deriveSystemdRunResult, DISABLED_HISTORY_NOTE, parseShow, parseSystemdTimestamp } from './systemd-status.js'
+// The unit-store plumbing (marker parse, dir listing, unlink/systemctl) is the
+// ONE shared copy in systemd-unit-store.ts — same shape as the snapshot store.
+import {
+  listServiceUnits,
+  parseMarkedJson,
+  runSystemctl,
+  unlinkQuiet,
+} from './systemd-unit-store.js'
 
 /**
  * Backup TASKS (Epic 16.3) — the systemd units ARE the store, exactly the
@@ -37,8 +45,6 @@ const RUNNER_SCRIPT = '/opt/anas/packages/daemon/dist/backup-task.js'
 const UNIT_PREFIX = 'anas-backup-'
 /** The service-file line that carries the canonical task JSON (as a comment). */
 const TASK_MARKER = 'X-ANAS-Task='
-/** Matches the X-ANAS-Task line (with or without a leading `# `), capturing JSON. */
-const TASK_MARKER_RE = /^#?\s*X-ANAS-Task=(.*)$/
 /** How many recent journald lines the detail view surfaces. */
 const JOURNAL_TAIL = 200
 /**
@@ -134,33 +140,14 @@ export function renderTimerUnit(task: BackupTask): string {
  * warns about) such files, fail-open.
  */
 export function parseServiceUnit(content: string): BackupTask | null {
-  for (const line of content.split('\n')) {
-    const m = line.match(TASK_MARKER_RE)
-    if (!m)
-      continue
-    try {
-      const parsed = BackupTaskSchema.safeParse(JSON.parse(m[1]))
-      return parsed.success ? parsed.data : null
-    }
-    catch {
-      return null
-    }
-  }
-  return null
+  return parseMarkedJson(content, TASK_MARKER, BackupTaskSchema)
 }
 
 // --- Store: read ------------------------------------------------------------
 
 /** All valid tasks parsed from `anas-backup-*.service` files (invalid → skipped). */
 export async function readAllTasks(dir: string): Promise<BackupTask[]> {
-  let files: string[]
-  try {
-    files = await readdir(dir)
-  }
-  catch {
-    return []
-  }
-  const services = files.filter(f => f.startsWith(UNIT_PREFIX) && f.endsWith('.service'))
+  const services = await listServiceUnits(dir, UNIT_PREFIX)
   const tasks: BackupTask[] = []
   for (const file of services) {
     try {
@@ -267,21 +254,6 @@ export async function removeTaskUnits(
     unlinkQuiet(join(dir, timerUnitName(name))),
   ])
   await runSystemctl(executor, ['daemon-reload'])
-}
-
-async function unlinkQuiet(path: string): Promise<void> {
-  try {
-    await unlink(path)
-  }
-  catch {
-    // Missing file is fine — the goal state (absent) already holds.
-  }
-}
-
-async function runSystemctl(executor: CommandExecutor, args: string[]): Promise<void> {
-  const r = await executor.exec(SYSTEMCTL, args)
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `systemctl ${args.join(' ')} exited with code ${r.exitCode}`)
 }
 
 // --- Status derivation ------------------------------------------------------
