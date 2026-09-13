@@ -7,7 +7,7 @@ import type {
 } from '../../executor/types.js'
 import type { SelfhealRepairOptions } from '../selfheal-repair.js'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { SelfhealOutcome } from '@anas/shared'
 import { crc32c } from '../selfheal-csum.js'
-import { geometryFromAttributes, parseMdDetailExport } from '../selfheal-map.js'
+import { chunkForLogical, geometryFromAttributes, locateLogicalIn, memberOffsetOn, parseChunkItems, parseDmTable, parseMdDetailExport, selfhealBand } from '../selfheal-map.js'
 import {
   boundedWindowCheck,
   gfInv,
@@ -651,12 +651,298 @@ describe('selfheal repair — a block in the second band of the pool', () => {
     assert.equal(node.knob('rmw_level'), '1')
   })
 
+  // The refusal now comes from the GATES, by name: a band's geometry failure is
+  // carried on the band rather than thrown out of `resolveContext` (F6 — one
+  // unreadable band must not void a whole scrub's attribution), and the repair
+  // gate is what turns it back into a refusal for the pool as a whole.
   it('REFUSES a pool whose segment is not on an md array at all', async () => {
     node.dmTableLv = '0 2031616 linear 9:200 2560\n'
     const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
-    assert.equal(outcome.outcome, 'mapping-abort')
-    assert.match(outcome.reason, /is not an md array/)
+    assert.equal(outcome.outcome, 'unrepairable')
+    assert.match(outcome.reason, /^refused: .*is not an md array/)
     assert.equal(node.wroteThroughMd, null)
+    assert.deepEqual(outcome.steps.map(s => s.name), ['gates'], 'nothing past the gates ran')
+  })
+})
+
+/**
+ * A compressed blob whose on-disk sectors sit on TWO bands (second-pass F5).
+ *
+ * R1 gave every sector its own band, but the repair kept using
+ * `sectors[0].geometry` for the knob save/restore and for the outcome's
+ * `array`, while the write, the bounded checks and `rmw_level=0` went to
+ * `target.geometry`. On a blob that straddles a band boundary those are
+ * DIFFERENT arrays: band 2 was left at `rmw_level=0` for good and band 1 got a
+ * restore it never needed. `reverify` had the same split — it read every
+ * sector's `raid1`/`members` out of the first sector's geometry.
+ *
+ * The filesystem is a live capture (PROVENANCE.md, "Multi-sector compressed
+ * blob"): `blob.bin`, one zstd extent of 128 KiB compressed to 45,056 on-disk
+ * bytes — ELEVEN 4 KiB sectors, contiguous from logical 13,631,488 in a DATA
+ * chunk whose device delta is 0. The dm table below puts the first eight of
+ * them on band 1 and the last three on band 2, and the corrupt one is sector 9.
+ */
+describe('selfheal repair — a compressed blob straddling two bands', () => {
+  const BLOB_LOGICAL = 13631488
+  const BLOB_SECTORS = 11
+  /** The blob's first sector on band 2 — the dm segment boundary, in LV bytes. */
+  const BAND_BOUNDARY = BLOB_LOGICAL + 8 * BS
+  /** The sector that is rotten: on band 2, and NOT the blob's first. */
+  const BAD_SECTOR = 9
+  const BAND2_MEMBERS = ['/dev/loop3', '/dev/loop4', '/dev/loop5']
+  /** Band 1 is a MIRROR band — AHR builds one whenever a band has two disks. */
+  const BAND1_MEMBERS = ['/dev/loop0', '/dev/loop1']
+
+  const DM_TABLE_TWO_BAND = `0 ${BAND_BOUNDARY / 512} linear 9:127 2048\n`
+    + `${BAND_BOUNDARY / 512} 1000000 linear 9:126 4096\n`
+
+  /** The blob's tree blocks, by bytenr, as `dump-tree -b` printed them. */
+  const BLOB_BLOCKS: Record<number, string> = {
+    22036480: 'blob-dump-tree-chunk.txt',
+    30425088: 'blob-dump-tree-csum.txt',
+    30556160: 'blob-dump-tree-subvol.txt',
+  }
+  /** The csum item the capture holds: 11 entries from the blob's first sector. */
+  const CSUM_LEAF_LOGICAL = 30425088
+  const CSUM_ITEM_OFFSET = 16239
+  /** The METADATA|DUP chunk the csum leaf lives in (stripe 0 is the copy read). */
+  const CSUM_CHUNK_LOGICAL = 30408704
+  const CSUM_CHUNK_DEVICE = 38797312
+  const LEAF_HEADER = 101
+
+  class FakeBlobNode implements CommandExecutor {
+    readonly root: string
+    readonly mountpoint: string
+    readonly file: string
+    readonly calls: { command: string, args: string[] }[] = []
+    /** The blob's true sector contents; index 9 is what the repair must restore. */
+    readonly sectors: Buffer[] = []
+    /** Where each sector physically is, from the engine's own pure placement. */
+    readonly locations: ReturnType<typeof locateLogicalIn>[] = []
+    /** `<device>@<offset>` → the 4 KiB it holds. */
+    readonly disk = new Map<string, Buffer>()
+    wroteTo: { device: string, offset: number } | null = null
+    wroteBytes: Buffer | null = null
+
+    constructor() {
+      this.root = mkdtempSync(join(tmpdir(), 'anas-selfheal-blob-'))
+      this.mountpoint = join(this.root, 'mnt')
+      this.file = join(this.mountpoint, 'blob.bin')
+      mkdirSync(this.mountpoint, { recursive: true })
+      mkdirSync(join(this.root, 'proc/sys/vm'), { recursive: true })
+      writeFileSync(join(this.root, 'proc/sys/vm/drop_caches'), '0')
+      this.writeSysfs('md127', 'md-sysfs-raid1.txt', '999999 / 129024\n')
+      this.writeSysfs('md126', 'twoband-md-sysfs-band2.txt', '999999 / 405504\n')
+      // The precheck must see rot on the band under repair.
+      writeFileSync(join(this.root, 'sys/block/md126/md/mismatch_cnt'), '8\n')
+
+      const bands = [
+        selfhealBand(parseDmTable(DM_TABLE_TWO_BAND)[0], this.geometry('md127', 'mdadm-detail-export-raid1.txt', 'md-sysfs-raid1.txt')),
+        selfhealBand(parseDmTable(DM_TABLE_TWO_BAND)[1], this.geometry('md126', 'twoband-mdadm-detail-export-band2.txt', 'twoband-md-sysfs-band2.txt')),
+      ]
+      const chunk = chunkForLogical(parseChunkItems(fixture('blob-dump-tree-chunk.txt')), BLOB_LOGICAL, true)
+      for (let k = 0; k < BLOB_SECTORS; k++) {
+        this.sectors.push(filler(100 + k))
+        this.locations.push(locateLogicalIn(BLOB_LOGICAL + k * BS, chunk, bands))
+      }
+      // Every sector where it lives — the bad one replaced by junk. A mirror
+      // band carries the same bytes on EVERY leg, each at its own data offset.
+      for (let k = 0; k < BLOB_SECTORS; k++) {
+        const where = this.locations[k]
+        const content = k === BAD_SECTOR ? Buffer.alloc(BS, 0xAB) : this.sectors[k]
+        for (const leg of where.mirrors)
+          this.disk.set(`${where.geometry.members[leg]}@${memberOffsetOn(where.geometry, where, leg)}`, content)
+        this.disk.set(`${where.geometry.device}@${where.mdByte}`, content)
+      }
+      // Band 2's other two members of the bad sector's stripe, seeded so their
+      // XOR IS the sector that has to come back.
+      const target = this.locations[BAD_SECTOR]
+      const others = BAND2_MEMBERS.map((_, role) => role).filter(role => role !== target.memberIndex)
+      const first = filler(7)
+      const rows = [first, xor(first, this.sectors[BAD_SECTOR])]
+      for (const [i, role] of others.entries())
+        this.disk.set(`${BAND2_MEMBERS[role]}@${memberOffsetOn(target.geometry, target, role)}`, rows[i])
+    }
+
+    private writeSysfs(kernel: string, capture: string, syncCompleted: string): void {
+      const sys = join(this.root, `sys/block/${kernel}/md`)
+      mkdirSync(sys, { recursive: true })
+      for (const line of fixture(capture).split('\n')) {
+        const eq = line.indexOf('=')
+        if (eq <= 0 || line.slice(eq + 1) === '<absent>')
+          continue
+        const path = join(sys, line.slice(0, eq))
+        mkdirSync(dirname(path), { recursive: true })
+        writeFileSync(path, `${line.slice(eq + 1)}\n`)
+      }
+      writeFileSync(join(sys, 'sync_completed'), syncCompleted)
+    }
+
+    /** The geometry the engine itself will read — built from the same captures. */
+    private geometry(kernel: string, exportFixture: string, sysfsFixture: string) {
+      const attributes: Record<string, string | null> = {}
+      for (const line of fixture(sysfsFixture).split('\n')) {
+        const eq = line.indexOf('=')
+        if (eq > 0)
+          attributes[line.slice(0, eq)] = line.slice(eq + 1) === '<absent>' ? null : line.slice(eq + 1)
+      }
+      const members = parseMdDetailExport(fixture(exportFixture), Number(attributes.raid_disks))
+      return geometryFromAttributes(`/dev/${kernel}`, kernel, `/sys/block/${kernel}/md`, attributes, members)
+    }
+
+    cleanup(): void {
+      rmSync(this.root, { recursive: true, force: true })
+    }
+
+    knob(kernel: string, key: string): string {
+      return readFileSync(join(this.root, `sys/block/${kernel}/md`, key), 'utf-8').trim()
+    }
+
+    async exec(command: string, args: string[]): Promise<ExecResult> {
+      this.calls.push({ command, args })
+      const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
+      if (command === '/usr/bin/readlink') {
+        const target = args[1]
+        if (target.includes('9:127'))
+          return ok('/sys/devices/virtual/block/md127\n')
+        if (target.includes('9:126'))
+          return ok('/sys/devices/virtual/block/md126\n')
+        return ok(`${target}\n`)
+      }
+      if (command === '/usr/bin/findmnt') {
+        return args[0] === '--mountpoint'
+          ? { stdout: '', stderr: '', exitCode: 1 }
+          : ok('/dev/mapper/gtsh-data\n')
+      }
+      if (command === '/usr/sbin/dmsetup')
+        return ok(args.length > 1 ? DM_TABLE_TWO_BAND : `gtsh-data: ${DM_TABLE_TWO_BAND.split('\n')[0]}\n`)
+      if (command === '/usr/sbin/mdadm') {
+        return ok(args.at(-1) === '/dev/md126'
+          ? fixture('twoband-mdadm-detail-export-band2.txt')
+          : fixture('mdadm-detail-export-raid1.txt'))
+      }
+      if (command === '/usr/bin/stat')
+        return ok('257\n')
+      if (command === '/usr/bin/sync')
+        return ok('')
+      if (command === '/usr/bin/btrfs') {
+        if (args[1] === 'dump-tree') {
+          if (args[2] === '-r')
+            return ok(fixture('blob-dump-tree-roots.txt'))
+          const block = BLOB_BLOCKS[Number(args[3])]
+          if (block)
+            return ok(fixture(block))
+          return { stdout: '', stderr: `no such block ${args[3]}`, exitCode: 1 }
+        }
+        if (args[1] === 'rootid')
+          return ok('256\n')
+        if (args[1] === 'subvolid-resolve')
+          return ok('@data\n')
+        if (args[0] === 'subvolume' && args[1] === 'list')
+          return ok('')
+        if (args[0] === 'subvolume')
+          return ok('')
+      }
+      if (command === '/usr/bin/dd') {
+        const source = args.find(a => a.startsWith('if='))?.slice(3) ?? ''
+        const target = args.find(a => a.startsWith('of='))?.slice(3) ?? ''
+        if (target !== '' && target !== '/dev/null') {
+          const offset = Number(args.find(a => a.startsWith('seek='))?.slice(5) ?? '0') * BS
+          this.wroteTo = { device: target, offset }
+          this.wroteBytes = readFileSync(source)
+          this.disk.set(`${target}@${offset}`, this.wroteBytes)
+          const where = this.locations[BAD_SECTOR]
+          this.disk.set(`${where.memberDevice}@${where.memberOffset}`, this.wroteBytes)
+          writeFileSync(join(this.root, 'sys/block/md126/md/mismatch_cnt'), '0\n')
+        }
+        return ok('')
+      }
+      return { stdout: '', stderr: `unexpected ${command}`, exitCode: 127 }
+    }
+
+    async pipeline(cmd1: string, args1: string[], _cmd2: string, _args2: string[]): Promise<PipelineResult> {
+      this.calls.push({ command: cmd1, args: args1 })
+      const device = args1.find(a => a.startsWith('if='))?.slice(3) ?? ''
+      const skip = Number(args1.find(a => a.startsWith('skip='))?.slice(5) ?? '0')
+      const count = Number(args1.find(a => a.startsWith('count='))?.slice(6) ?? '1')
+      let bytes: Buffer
+      if (device === '/dev/mapper/gtsh-data') {
+        // The csum leaf, off the LV: each of the item's 11 entries is the
+        // crc32c of the sector it belongs to, at the offset the REAL item
+        // header in the capture puts it.
+        bytes = Buffer.alloc(count * BS)
+        const leafLv = CSUM_LEAF_LOGICAL - CSUM_CHUNK_LOGICAL + CSUM_CHUNK_DEVICE
+        assert.equal(skip * BS, leafLv, 'the csum leaf was read somewhere the chunk hop did not point')
+        for (let k = 0; k < BLOB_SECTORS; k++)
+          bytes.writeUInt32LE(crc32c(this.sectors[k]), LEAF_HEADER + CSUM_ITEM_OFFSET + k * 4)
+      }
+      else {
+        bytes = this.disk.get(`${device}@${skip * BS}`) ?? Buffer.alloc(BS)
+      }
+      return { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: bytes.toString('base64') }
+    }
+
+    async execToStream(): Promise<ExecStreamResult> {
+      throw new Error('not used')
+    }
+  }
+
+  let blob: FakeBlobNode
+
+  beforeEach(() => {
+    blob = new FakeBlobNode()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = blob.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(blob.root, 'run')
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    blob.cleanup()
+  })
+
+  it('the capture really does straddle: sector 0 on band 1, the bad one on band 2', () => {
+    assert.equal(blob.locations[0].geometry.device, '/dev/md127')
+    assert.equal(blob.locations[BAD_SECTOR].geometry.device, '/dev/md126')
+  })
+
+  it('repairs it on the TARGET\'s band, and names that band in the outcome', async () => {
+    const outcome = await repairBlock(blob, { mountpoint: blob.mountpoint, file: blob.file, block: 0 }, OPTIONS)
+
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.equal(outcome.array, '/dev/md126', 'the outcome names the band that was worked on, not sector 0\'s')
+    assert.ok(BAND2_MEMBERS.includes(outcome.member ?? ''), `member ${outcome.member} is not a band-2 disk`)
+    assert.ok(blob.wroteBytes?.equals(blob.sectors[BAD_SECTOR]), 'the sector that came back is the one btrfs checksummed')
+    assert.equal(blob.wroteTo?.device, '/dev/md126')
+    assert.equal(blob.wroteTo?.offset, blob.locations[BAD_SECTOR].mdByte)
+  })
+
+  it('restores rmw_level on the band it turned it down on — and leaves the other band alone', async () => {
+    const outcome = await repairBlock(blob, { mountpoint: blob.mountpoint, file: blob.file, block: 0 }, OPTIONS)
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.deepEqual(outcome.diagnostics?.cleanupErrors, [])
+    // Band 2 is the one that was turned down to 0 for the write; it must be
+    // back at 1. Pre-fix the restore was written to band 1 and band 2 kept 0.
+    assert.equal(blob.knob('md126', 'rmw_level'), '1', 'band 2 rmw_level')
+    assert.equal(blob.knob('md126', 'sync_min'), '0')
+    assert.equal(blob.knob('md126', 'sync_max'), 'max')
+    assert.equal(blob.knob('md126', 'stripe_cache_size'), '256')
+    // Band 1 was never turned at all — a mirror band has no `rmw_level` for
+    // anything to write to, which is exactly what the pre-fix restore did.
+    assert.equal(existsSync(join(blob.root, 'sys/block/md127/md/rmw_level')), false, 'nothing was written to band 1\'s rmw_level')
+    assert.equal(blob.knob('md127', 'sync_min'), '0')
+    assert.equal(blob.knob('md127', 'sync_max'), 'max')
+  })
+
+  it('re-verifies every sector through ITS OWN band\'s members', async () => {
+    await repairBlock(blob, { mountpoint: blob.mountpoint, file: blob.file, block: 0 }, OPTIONS)
+    const reads = blob.calls
+      .filter(c => c.command === '/usr/bin/dd' && c.args.some(a => a.startsWith('if=/dev/loop')))
+      .map(c => c.args.find(a => a.startsWith('if='))!.slice(3))
+    // Sectors 0..7 live on band 1's disks and 8..10 on band 2's; both sets were
+    // read, each at its own array's offsets (a zero-filled miss would fail the
+    // csum and abort the run long before the repair above).
+    assert.ok(reads.some(d => BAND1_MEMBERS.includes(d)), 'band 1 members were read')
+    assert.ok(reads.some(d => BAND2_MEMBERS.includes(d)), 'band 2 members were read')
   })
 })
 

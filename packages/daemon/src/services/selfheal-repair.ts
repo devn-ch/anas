@@ -466,6 +466,17 @@ interface Candidate {
   detail: string
 }
 
+/** One band whose md knobs a run moved, and what they were before it did. */
+interface TouchedBand {
+  geo: MdGeometry
+  /** `rmw_level` as it was, or null when this array has none (RAID1). */
+  savedRmwLevel: string | null
+  /** `stripe_cache_size` as it was, or null when this array has none (RAID1). */
+  savedStripeCache: string | null
+  /** True once a bounded check moved `sync_min`/`sync_max` on this array. */
+  syncKnobs: boolean
+}
+
 /**
  * Repair one 4 KiB block. Never throws for a verdict — the four buckets are
  * all returned as an outcome; it throws only for an internal failure (and for
@@ -485,10 +496,40 @@ export async function repairBlock(
     throw new SelfhealRunError(`${file} is not under ${mountpoint}`, steps, diagnostics)
 
   let pin: Pin | null = null
-  /** The BAND under repair — set once the block is resolved, and the only array touched. */
-  let geometry: MdGeometry | null = null
-  let savedRmwLevel: string | null = null
-  let savedStripeCache: string | null = null
+  /**
+   * The band the OUTCOME names: the array the write went to (or would have).
+   *
+   * Set from the resolved block's first sector, then narrowed to the TARGET
+   * sector's band once the re-verify says which sector is the corrupt one. A
+   * compressed blob straddling a band boundary has its sectors on two arrays,
+   * and the outcome has to name the one that was worked on (F5).
+   */
+  let outcomeBand: MdGeometry | null = null
+  /**
+   * Every band whose md knobs this run moved, keyed by its md device.
+   *
+   * `rmw_level` was written on the TARGET's band while the restore read the
+   * FIRST sector's — so a blob crossing a boundary left band 2 at
+   * `rmw_level=0` forever and "restored" band 1 to the value it already had
+   * (F5). Saved and restored per band, so whatever was touched is what is put
+   * back, and nothing else is written to at all.
+   */
+  const touched = new Map<string, TouchedBand>()
+
+  /** Register a band as touched, snapshotting the knobs before they move. */
+  async function touchBand(geo: MdGeometry): Promise<TouchedBand> {
+    const existing = touched.get(geo.device)
+    if (existing)
+      return existing
+    const entry: TouchedBand = {
+      geo,
+      savedRmwLevel: null,
+      savedStripeCache: await readMdAttrOrNull(geo.sys, 'stripe_cache_size'),
+      syncKnobs: false,
+    }
+    touched.set(geo.device, entry)
+    return entry
+  }
 
   /** The step currently running — what `note` annotates and `fail` marks failed. */
   let current: SelfhealStep | null = null
@@ -539,11 +580,12 @@ export async function repairBlock(
     await step('resolve')
     const pinned = await resolveContext(executor, mountpoint)
     const resolved = await resolveBlock(executor, pinned, file, request.block)
-    // The band the block is on — its own array, its own geometry, its own
-    // sysfs. Everything below reads and writes through THIS and nothing else.
+    // The band the repair unit STARTS on — its own array, its own geometry,
+    // its own sysfs. It is what the outcome names until the re-verify says
+    // which sector is corrupt; a compressed blob can straddle a boundary and
+    // the sector that gets worked on may be on the next band along (F5).
     const band = resolved.sectors[0].geometry
-    geometry = band
-    savedStripeCache = await readMdAttrOrNull(band.sys, 'stripe_cache_size')
+    outcomeBand = band
     diagnostics.mapping = mappingOf(resolved)
     note(`${band.device} m${resolved.sectors[0].memberIndex}@${resolved.sectors[0].memberOffset} `
       + `md@${resolved.sectors[0].mdByte} stripe ${resolved.sectors[0].stripe ?? 'n/a'}`)
@@ -556,6 +598,10 @@ export async function repairBlock(
       fail(verdict.abort.kind, verdict.abort.reason)
     const target = resolved.sectors[verdict.badSectors[0]]
     const geo = target.geometry
+    // The band that is actually worked on — which is not necessarily the first
+    // sector's when a compressed blob straddles a band boundary (F5).
+    outcomeBand = geo
+    diagnostics.mapping = mappingOf(resolved, verdict.badSectors[0])
     const corruptBytes = verdict.corruptBytes
     const storedCsum = verdict.storedCsum
     diagnostics.storedCsum = csumHex(storedCsum)
@@ -568,6 +614,9 @@ export async function repairBlock(
     // ---- precheck -------------------------------------------------------
     await step('precheck')
     const stripe = target.stripe ?? Math.floor(target.mdByte / (windowSectors(geo) * 512))
+    // From here down the TARGET's band is written to: register it (and snapshot
+    // its stripe cache) before the first knob moves.
+    ;(await touchBand(geo)).syncKnobs = true
     const before = await boundedWindowCheck(executor, geo, stripe, options)
     diagnostics.precheckMismatch = before
     note(`mismatch_cnt=${before}`)
@@ -577,8 +626,9 @@ export async function repairBlock(
 
     // ---- rmw ------------------------------------------------------------
     await step('rmw')
-    savedRmwLevel = await readMdAttrOrNull(geo.sys, 'rmw_level')
-    if (savedRmwLevel !== null)
+    const rmwBand = await touchBand(geo)
+    rmwBand.savedRmwLevel = await readMdAttrOrNull(geo.sys, 'rmw_level')
+    if (rmwBand.savedRmwLevel !== null)
       await writeMdAttr(geo.sys, 'rmw_level', '0')
 
     // ---- reconstruct ----------------------------------------------------
@@ -660,7 +710,7 @@ export async function repairBlock(
       file,
       block: request.block,
       pool: request.pool?.name ?? null,
-      array: geometry?.device ?? null,
+      array: outcomeBand?.device ?? null,
       member: map?.memberDevice ?? null,
       stripe: map?.stripe ?? null,
       steps,
@@ -669,28 +719,31 @@ export async function repairBlock(
   }
 
   async function cleanup(): Promise<void> {
-    if (geometry && savedRmwLevel !== null) {
-      try {
-        await writeMdAttr(geometry.sys, 'rmw_level', savedRmwLevel)
-      }
-      catch (error) {
-        diagnostics.cleanupErrors.push(`rmw_level not restored to ${savedRmwLevel}: ${errorText(error)}`)
-      }
-    }
-    if (geometry) {
-      try {
-        await restoreSyncKnobs(geometry)
-      }
-      catch (error) {
-        diagnostics.cleanupErrors.push(`sync knobs not restored: ${errorText(error)}`)
-      }
-      if (savedStripeCache !== null) {
+    // Per band, and ONLY the bands this run touched (F5).
+    for (const band of touched.values()) {
+      if (band.savedRmwLevel !== null) {
         try {
-          if ((await readMdAttrOrNull(geometry.sys, 'stripe_cache_size')) !== savedStripeCache)
-            await writeMdAttr(geometry.sys, 'stripe_cache_size', savedStripeCache)
+          await writeMdAttr(band.geo.sys, 'rmw_level', band.savedRmwLevel)
         }
         catch (error) {
-          diagnostics.cleanupErrors.push(`stripe_cache_size not restored to ${savedStripeCache}: ${errorText(error)}`)
+          diagnostics.cleanupErrors.push(`${band.geo.device}: rmw_level not restored to ${band.savedRmwLevel}: ${errorText(error)}`)
+        }
+      }
+      if (band.syncKnobs) {
+        try {
+          await restoreSyncKnobs(band.geo)
+        }
+        catch (error) {
+          diagnostics.cleanupErrors.push(`${band.geo.device}: sync knobs not restored: ${errorText(error)}`)
+        }
+      }
+      if (band.savedStripeCache !== null) {
+        try {
+          if ((await readMdAttrOrNull(band.geo.sys, 'stripe_cache_size')) !== band.savedStripeCache)
+            await writeMdAttr(band.geo.sys, 'stripe_cache_size', band.savedStripeCache)
+        }
+        catch (error) {
+          diagnostics.cleanupErrors.push(`${band.geo.device}: stripe_cache_size not restored to ${band.savedStripeCache}: ${errorText(error)}`)
         }
       }
     }
@@ -724,6 +777,12 @@ async function gateRefusal(
   options?: SelfhealRepairOptions,
 ): Promise<string | null> {
   for (const band of ctx.bands) {
+    // A band whose geometry could not be read is carried, not thrown, since F6
+    // (the attribution pass must survive one unreadable band). A REPAIR still
+    // refuses the whole pool for it: which band the block is on is not known
+    // yet, and a band nothing can be read from is not one to write near.
+    if (band.geometry === null)
+      return `${band.device}: ${band.error ?? 'its geometry could not be read'}`
     const refusal = await arrayRefusal(band.geometry)
     if (refusal)
       return refusal
@@ -971,13 +1030,16 @@ interface Reverified {
  * happens to hold identical content (a zero-filled region of an image, say),
  * the engine finds a passing csum and aborts with "not corrupt here" instead of
  * writing a correct-looking block over a healthy one.
+ *
+ * Every sector is read through ITS OWN band's geometry (F5). A compressed blob
+ * can straddle a band boundary, and the first sector's `raid1`, `members` and
+ * data offsets say nothing about the array the later sectors are on.
  */
 async function reverify(
   executor: CommandExecutor,
   ctx: SelfhealContext,
   resolved: ResolvedBlock,
 ): Promise<Reverified> {
-  const geo = resolved.sectors[0].geometry
   const badSectors: number[] = []
   let corruptBytes: Buffer = Buffer.alloc(0)
   let storedCsum = 0
@@ -986,6 +1048,7 @@ async function reverify(
 
   for (let k = 0; k < resolved.sectors.length; k++) {
     const location = resolved.sectors[k]
+    const geo = location.geometry
     const stored = await readStoredCsum(executor, ctx, location.logical)
     if (stored === null) {
       return {
@@ -1060,7 +1123,7 @@ async function reverify(
       },
     }
   }
-  if (geo.raid1 && goodMirrors.length === 0) {
+  if (resolved.sectors[badSectors[0]].geometry.raid1 && goodMirrors.length === 0) {
     return {
       badSectors,
       corruptBytes,
@@ -1244,9 +1307,16 @@ async function coldRead(
   return pin.coldRead(blocks)
 }
 
-/** The resolved chain, flattened for the outcome's audit trail. */
-function mappingOf(resolved: ResolvedBlock): SelfhealMapping {
-  const first = resolved.sectors[0]
+/**
+ * The resolved chain, flattened for the outcome's audit trail.
+ *
+ * `sector` is which on-disk sector of the repair unit it describes: the first
+ * one until the re-verify says which is corrupt, and the TARGET's from then on.
+ * A compressed blob straddling a band boundary has its sectors on two arrays,
+ * and an audit trail that names the wrong one is worse than none (F5).
+ */
+function mappingOf(resolved: ResolvedBlock, sector = 0): SelfhealMapping {
+  const first = resolved.sectors[sector]
   const geo = first.geometry
   return {
     level: geo.level,

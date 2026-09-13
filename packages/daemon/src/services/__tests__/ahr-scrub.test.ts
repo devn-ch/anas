@@ -1,3 +1,4 @@
+import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -161,12 +162,19 @@ function mappingFixtures(
   executor: MockExecutor,
   device: string,
   trees: { roots: string, extentLeaf: string, subvolLeaf: string },
+  /** The LV's dm table and the arrays its segments resolve to (default: one band). */
+  dm: { table: string, bands: { majmin: string, kernel: string }[] } = {
+    table: 'dmsetup-table-lv.txt',
+    bands: [{ majmin: '9:127', kernel: 'md127' }],
+  },
 ): void {
   useKernelRoot()
   executor.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE', '-T', MOUNTPOINT], result: { stdout: `${device}\n`, stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/sbin/dmsetup', args: ['table', device], result: { stdout: selfhealFixture('dmsetup-table-lv.txt'), stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', '/sys/dev/block/9:127'], result: { stdout: '/sys/devices/virtual/block/md127\n', stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', '/dev/md127'], result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/sbin/dmsetup', args: ['table', device], result: { stdout: selfhealFixture(dm.table), stderr: '', exitCode: 0 } })
+  for (const band of dm.bands) {
+    executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', `/sys/dev/block/${band.majmin}`], result: { stdout: `/sys/devices/virtual/block/${band.kernel}\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', `/dev/${band.kernel}`], result: { stdout: `/dev/${band.kernel}\n`, stderr: '', exitCode: 0 } })
+  }
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: selfhealFixture('mdadm-detail-export-raid5.txt'), stderr: '', exitCode: 0 } })
   const rootsText = selfhealFixture(trees.roots)
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'dump-tree', '-r', device], result: { stdout: rootsText, stderr: '', exitCode: 0 } })
@@ -463,6 +471,130 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     // The scrub itself still runs — phase 2 is not cancelled by a band md
     // would not check.
     assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'))
+  })
+
+  /**
+   * F11 (second pass) — the start-wait had no "already finished" branch. On a
+   * small band a check can run AND complete between `mdadm --action=check`
+   * returning and the first poll, which every poll of the start window then
+   * reads as idle. That was reported as "never started" and the counter — this
+   * scrub's own verdict — was never read. md's record of what it last RAN is
+   * the evidence.
+   */
+  it('a check that finished before the first poll is not "never started" — its counter IS read', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    // The band is a tiny one: mdstat never names a check and sysfs reads idle
+    // from the very first poll — the check is over before anything looks.
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
+    // Before the check md had last run a resync; after it, a check — ours.
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/last_sync_action'], results: [
+      { stdout: 'resync\n', stderr: '', exitCode: 0 },
+      { stdout: 'check\n', stderr: '', exitCode: 0 },
+    ] })
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
+
+    const progress: string[] = []
+    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+    const calls = executor.calls
+    const priorRead = calls.findIndex(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/last_sync_action')
+    const issued = calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[1] === '/dev/md/t2-r1')
+    assert.ok(priorRead >= 0 && priorRead < issued, 'the prior sync action is snapshotted BEFORE the check is issued')
+    assert.ok(
+      calls.some(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt'),
+      'the completed check\'s counter is read',
+    )
+    assert.ok(!progress.some(m => m.includes('never started')), progress.join(' | '))
+    assert.ok(progress.some(m => m.includes('finished before the first poll')), progress.join(' | '))
+    // The counter is this check's, so its verdict is reported.
+    const warns = calls.filter(c => c.command === '/usr/bin/perl')
+    assert.equal(warns.length, 1)
+    assert.equal(warns[0].args[3], 'AHR scrub: parity mismatch on t2-r1')
+  })
+
+  /**
+   * F3 (second pass) — the finish-wait exited only when mdstat AND sync_action
+   * both read idle, so a band that went `frozen` (or was taken over by another
+   * sync op) spun the job forever. With the active-job exclusion (R7) that
+   * refused every later scrub and repair on the pool until anasd restarted.
+   */
+  for (const takeover of ['frozen', 'recover'] as const) {
+    it(`stops waiting on a band whose check became '${takeover}', and checks the next band`, async () => {
+      const executor = baseExecutor()
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+      // Our check starts, then md is doing something else entirely — for good.
+      executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], results: [
+        { stdout: 'check\n', stderr: '', exitCode: 0 },
+        { stdout: `${takeover}\n`, stderr: '', exitCode: 0 },
+      ] })
+      // A counter from some earlier check is sitting there — and must NOT be read.
+      executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
+
+      const progress: string[] = []
+      const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+      assert.equal(result.btrfsErrors, null)
+      assert.ok(
+        !executor.calls.some(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt'),
+        'no counter is read for a band md is not checking for us',
+      )
+      assert.ok(progress.includes(`t2-r1 was not checked (sync_action=${takeover}) — md is not running this scrub's check on that band`), progress.join(' | '))
+      assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'no rot is claimed from a stale number')
+      // The scrub goes ON: band 2 is checked and phase 2 runs.
+      assert.ok(executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[1] === '/dev/md/t2-r2'))
+      assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'))
+    })
+  }
+
+  it('a long check is waited out — polled for as long as md says `check`, then the counter', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], results: [
+      ...Array.from({ length: 13 }).fill({ stdout: mdstat([{ kernel: 'md127', checkPercent: 3 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 }) as ExecResult[],
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+    ] })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], results: [
+      ...Array.from({ length: 12 }).fill({ stdout: 'check\n', stderr: '', exitCode: 0 }) as ExecResult[],
+      { stdout: 'idle\n', stderr: '', exitCode: 0 },
+    ] })
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+
+    const progress: string[] = []
+    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+    const actionReads = executor.calls.filter(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/sync_action').length
+    assert.ok(actionReads >= 12, `the check was polled through, not cut short (saw ${actionReads} reads)`)
+    assert.ok(progress.some(m => m.startsWith('md check on t2-r1 (3.0%)')), progress.join(' | '))
+    assert.ok(!progress.some(m => m.includes('was not checked')), progress.join(' | '))
+    assert.ok(executor.calls.some(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt'))
+  })
+
+  it('the absolute ceiling is the last resort — a band that never goes idle stops being waited on', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127', checkPercent: 1 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    // md says `check` for ever — the one state the sync_action policy cannot
+    // end, because a real check legitimately looks exactly like this.
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'check\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
+
+    const progress: string[] = []
+    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20, checkFinishCeilingMs: 5 })
+
+    assert.equal(result.checkedArrays, 2)
+    assert.ok(progress.some(m => m.includes('t2-r1 was not checked (sync_action=check) — still not idle after the 5ms ceiling')), progress.join(' | '))
+    assert.ok(
+      !executor.calls.some(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt'),
+      'no counter is read for a band whose check never ended',
+    )
+    assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'), 'the job finishes rather than spinning')
   })
 
   it('aborted btrfs scrub fails the job', async () => {
@@ -968,9 +1100,12 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     assert.equal(result.findings?.[0].path, FLAT)
     assert.equal(result.findings?.[0].outsideMount, undefined)
     // The path is the subject here; with no mapping wired the blocks inside it
-    // are not identified, and nothing is probed at an unverified offset.
+    // are not identified.
     assert.equal(result.findings?.[0].unidentified, true)
-    assert.deepEqual(e.calls.filter(c => c.command === '/usr/bin/dd'), [])
+    // The window WAS probed (F6) — every block of it read back fine, so there
+    // is nothing to name and the finding says so.
+    assert.deepEqual(result.findings?.[0].badBlocks, [])
+    assert.equal(e.calls.filter(c => c.command === '/usr/bin/dd').length, 16)
   })
 
   it('an unreadable mount table falls back to the pool\'s own subvolLayout reading', async () => {
@@ -1142,7 +1277,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
    * rig's captured trees: phase 1, the btrfs scrub, the journal with the
    * verbatim scrub warning, and everything `resolveContext` reads.
    */
-  function compressedExecutor(): MockExecutor {
+  function compressedExecutor(dm?: { table: string, bands: { majmin: string, kernel: string }[] }): MockExecutor {
     useKernelRoot()
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -1161,7 +1296,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
       roots: 'dump-tree-roots-compressed.txt',
       extentLeaf: 'dump-tree-extent.txt',
       subvolLeaf: 'dump-tree-subvol-compressed.txt',
-    })
+    }, dm)
     return executor
   }
 
@@ -1219,13 +1354,16 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     assert.ok(body.includes('block not identified'), body)
   })
 
-  it('an unresolvable stripe names NO block and says why — the printed offset may not mean what it says', async () => {
-    // No mapping fixtures: resolveContext fails at its first findmnt. Without
-    // the extents there is no way to know whether the kernel's `offset` is
-    // file-relative (uncompressed) or extent-relative (compressed, selfheal.8),
-    // so the window is not probed at all: blocks named from the wrong 64 KiB
-    // are worse than blocks not named, because an operator can hand them to a
-    // repair. The finding says `unidentified`, with the reason.
+  /**
+   * F6 (second pass). With the mapping unavailable the stripe is STILL probed
+   * at the kernel's printed offset. A probe reads the FILE with O_DIRECT, so a
+   * block that comes back EIO is a block of this file that genuinely cannot be
+   * read — the wrong window costs a miss, never a false accusation, and for an
+   * uncompressed extent the kernel's offset is exact (GT-3). The earlier cut
+   * dropped the probe and voided the WHOLE pool's findings whenever the mapping
+   * was unavailable for any reason at all.
+   */
+  it('a stripe whose mapping is unavailable is still probed at the kernel offset — a block that EIOs there is real', async () => {
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
@@ -1243,16 +1381,19 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
 
     const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     const finding = result.findings?.[0]
-    assert.deepEqual(finding?.badBlocks, [])
-    assert.equal(finding?.compressed, undefined, 'an unresolved stripe claims no compression')
-    assert.equal(finding?.unidentified, true)
-    assert.match(finding?.reason ?? '', /^extent could not be resolved \(/)
-    // The file is still NAMED — only its blocks are not.
     assert.equal(finding?.path, F)
+    assert.deepEqual(finding?.badBlocks, [5], 'the failing block of the named stripe is reported')
+    assert.equal(finding?.compressed, undefined, 'an unresolved stripe claims no compression')
+    assert.equal(finding?.unidentified, undefined, 'a block was named, so the finding is not unidentified')
+    // The 16 blocks of the named 64 KiB stripe, and nothing else.
     const dd = executor.calls.filter(c => c.command === '/usr/bin/dd' && c.args[0] === `if=${F}`)
-    assert.deepEqual(dd, [], 'nothing is probed at an offset that may not mean what it says')
+    assert.deepEqual(dd.map(c => c.args[3]), Array.from({ length: 16 }, (_, i) => `skip=${i}`))
   })
 
+  // The compressed case with the mapping down: the kernel's offset is
+  // extent-relative, so the probed window is the wrong one and nothing in it
+  // fails — which is a MISS, and is reported as `unidentified` with the mapping
+  // error rather than an empty badBlocks that reads as "nothing wrong here".
   it('unresolvable AND nothing failing → unidentified, with the mapping error as the reason', async () => {
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -1271,6 +1412,33 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     assert.match(finding?.reason ?? '', /extent could not be resolved/)
     const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
     assert.ok(body.includes('block not identified'), body)
+  })
+
+  /**
+   * F6 (second pass), the other half. R1 made `resolveContext` throw for any
+   * band whose geometry is momentarily unreadable — and the attribution's
+   * mapping is built ONCE per pass, so one bad band left every file of the
+   * pool `unidentified` with no blocks and nothing to repair. Band geometry is
+   * resolved lazily now: the attribution walks the btrfs trees, which need no
+   * band at all, and only a byte actually placed ON the bad band fails.
+   */
+  it('one band with no readable geometry does not void the whole pool\'s findings', async () => {
+    // The LV is TWO linear segments (the live two-band capture) — and band 2
+    // on 9:126 has NO md sysfs in the kernel root, so its geometry cannot be
+    // read at all. Pre-fix that threw out of `resolveContext` and took the
+    // btrfs tree roots with it.
+    const executor = compressedExecutor({
+      table: 'twoband-dmsetup-table-lv.txt',
+      bands: [{ majmin: '9:127', kernel: 'md127' }, { majmin: '9:126', kernel: 'md126' }],
+    })
+    corruptExtent(executor)
+
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const finding = result.findings?.[0]
+    assert.equal(finding?.path, F)
+    assert.equal(finding?.unidentified, undefined, 'the mapping still answered for this stripe')
+    assert.equal(finding?.compressed, true)
+    assert.deepEqual(finding?.badBlocks, Array.from({ length: 32 }, (_, i) => 32 + i))
   })
 
   it('the verbatim scrub warning parses field for field — the F3 shape, captured again', () => {

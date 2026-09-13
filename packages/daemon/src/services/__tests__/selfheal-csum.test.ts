@@ -14,7 +14,7 @@ import {
   parseCsumItems,
   readStoredCsum,
 } from '../selfheal-csum.js'
-import { parseChunkItems, parseDmTable } from '../selfheal-map.js'
+import { parseChunkItems, parseDmTable, selfhealBand } from '../selfheal-map.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixtures = join(__dirname, '../../fixtures/selfheal')
@@ -113,21 +113,18 @@ describe('selfheal csum — reading it off the LV', () => {
   const context = {
     mountpoint: '/mnt/gtsh/@data',
     srcDevice: '/dev/mapper/gtsh-data',
-    bands: parseDmTable(fixture('dmsetup-table-lv.txt')).map(segment => ({
-      segment,
-      geometry: {
-        device: '/dev/md127',
-        kernel: 'md127',
-        sys: '/sys/block/md127/md',
-        level: 'raid5',
-        raid6: false,
-        raid1: false,
-        raidDisks: 6,
-        chunkBytes: 65536,
-        layout: 'left-symmetric',
-        members: ['/dev/loop0'],
-        dataOffsets: [1048576],
-      },
+    bands: parseDmTable(fixture('dmsetup-table-lv.txt')).map(segment => selfhealBand(segment, {
+      device: '/dev/md127',
+      kernel: 'md127',
+      sys: '/sys/block/md127/md',
+      level: 'raid5',
+      raid6: false,
+      raid1: false,
+      raidDisks: 6,
+      chunkBytes: 65536,
+      layout: 'left-symmetric',
+      members: ['/dev/loop0'],
+      dataOffsets: [1048576],
     })),
     roots: { chunk: 22052864, csum: 30834688, extent: 32505856, bySubvolume: new Map([[256, 30851072]]) },
     chunks: parseChunkItems(fixture('dump-tree-chunk.txt')),

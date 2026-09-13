@@ -1,0 +1,440 @@
+btrfs-progs v6.14
+leaf 30916608 items 141 free space 5721 generation 11 owner EXTENT_TREE
+leaf 30916608 flags 0x1(WRITTEN) backref revision 1
+fs uuid 1f281769-4bcb-4343-bafd-920c57dac1a7
+chunk uuid 2b1786f8-e529-4ce5-a771-634aa9fa6075
+	item 0 key (13631488 EXTENT_ITEM 4096) itemoff 16230 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de73813529) extent data backref root 256 objectid 257 offset 131072 count 1
+	item 1 key (13631488 BLOCK_GROUP_ITEM 8388608) itemoff 16206 itemsize 24
+		block group used 491520 chunk_objectid 256 flags DATA|single
+	item 2 key (13635584 EXTENT_ITEM 4096) itemoff 16153 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de1af8a29d) extent data backref root 256 objectid 257 offset 262144 count 1
+	item 3 key (13639680 EXTENT_ITEM 4096) itemoff 16100 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dec174025e) extent data backref root 256 objectid 257 offset 393216 count 1
+	item 4 key (13643776 EXTENT_ITEM 4096) itemoff 16047 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dec80b8df5) extent data backref root 256 objectid 257 offset 524288 count 1
+	item 5 key (13647872 EXTENT_ITEM 4096) itemoff 15994 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de13872d36) extent data backref root 256 objectid 257 offset 655360 count 1
+	item 6 key (13651968 EXTENT_ITEM 4096) itemoff 15941 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de7afeba82) extent data backref root 256 objectid 257 offset 786432 count 1
+	item 7 key (13656064 EXTENT_ITEM 4096) itemoff 15888 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dea1721a41) extent data backref root 256 objectid 257 offset 917504 count 1
+	item 8 key (13660160 EXTENT_ITEM 4096) itemoff 15835 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de6801a5d4) extent data backref root 256 objectid 257 offset 1048576 count 1
+	item 9 key (13664256 EXTENT_ITEM 4096) itemoff 15782 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deb38d0517) extent data backref root 256 objectid 257 offset 1179648 count 1
+	item 10 key (13668352 EXTENT_ITEM 4096) itemoff 15729 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dedaf492a3) extent data backref root 256 objectid 257 offset 1310720 count 1
+	item 11 key (13672448 EXTENT_ITEM 4096) itemoff 15676 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de01783260) extent data backref root 256 objectid 257 offset 1441792 count 1
+	item 12 key (13676544 EXTENT_ITEM 4096) itemoff 15623 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de0807bdcb) extent data backref root 256 objectid 257 offset 1572864 count 1
+	item 13 key (13680640 EXTENT_ITEM 4096) itemoff 15570 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30ded38b1d08) extent data backref root 256 objectid 257 offset 1703936 count 1
+	item 14 key (13684736 EXTENT_ITEM 4096) itemoff 15517 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30debaf28abc) extent data backref root 256 objectid 257 offset 1835008 count 1
+	item 15 key (13688832 EXTENT_ITEM 4096) itemoff 15464 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de617e2a7f) extent data backref root 256 objectid 257 offset 1966080 count 1
+	item 16 key (13692928 EXTENT_ITEM 4096) itemoff 15411 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de2df98367) extent data backref root 256 objectid 257 offset 2097152 count 1
+	item 17 key (13697024 EXTENT_ITEM 4096) itemoff 15358 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30def67523a4) extent data backref root 256 objectid 257 offset 2228224 count 1
+	item 18 key (13701120 EXTENT_ITEM 4096) itemoff 15305 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de9f0cb410) extent data backref root 256 objectid 257 offset 2359296 count 1
+	item 19 key (13705216 EXTENT_ITEM 4096) itemoff 15252 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de448014d3) extent data backref root 256 objectid 257 offset 2490368 count 1
+	item 20 key (13709312 EXTENT_ITEM 4096) itemoff 15199 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de4dff9b78) extent data backref root 256 objectid 257 offset 2621440 count 1
+	item 21 key (13713408 EXTENT_ITEM 4096) itemoff 15146 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de96733bbb) extent data backref root 256 objectid 257 offset 2752512 count 1
+	item 22 key (13717504 EXTENT_ITEM 4096) itemoff 15093 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deff0aac0f) extent data backref root 256 objectid 257 offset 2883584 count 1
+	item 23 key (13721600 EXTENT_ITEM 4096) itemoff 15040 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de24860ccc) extent data backref root 256 objectid 257 offset 3014656 count 1
+	item 24 key (13725696 EXTENT_ITEM 4096) itemoff 14987 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deedf5b359) extent data backref root 256 objectid 257 offset 3145728 count 1
+	item 25 key (13729792 EXTENT_ITEM 4096) itemoff 14934 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de3679139a) extent data backref root 256 objectid 257 offset 3276800 count 1
+	item 26 key (13733888 EXTENT_ITEM 4096) itemoff 14881 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de5f00842e) extent data backref root 256 objectid 257 offset 3407872 count 1
+	item 27 key (13737984 EXTENT_ITEM 4096) itemoff 14828 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de848c24ed) extent data backref root 256 objectid 257 offset 3538944 count 1
+	item 28 key (13742080 EXTENT_ITEM 4096) itemoff 14775 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de8df3ab46) extent data backref root 256 objectid 257 offset 3670016 count 1
+	item 29 key (13746176 EXTENT_ITEM 4096) itemoff 14722 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de567f0b85) extent data backref root 256 objectid 257 offset 3801088 count 1
+	item 30 key (13750272 EXTENT_ITEM 4096) itemoff 14669 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de3f069c31) extent data backref root 256 objectid 257 offset 3932160 count 1
+	item 31 key (13754368 EXTENT_ITEM 4096) itemoff 14616 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dee48a3cf2) extent data backref root 256 objectid 257 offset 4063232 count 1
+	item 32 key (13758464 EXTENT_ITEM 4096) itemoff 14563 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dea609ce01) extent data backref root 256 objectid 257 offset 4194304 count 1
+	item 33 key (13762560 EXTENT_ITEM 4096) itemoff 14510 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de7d856ec2) extent data backref root 256 objectid 257 offset 4325376 count 1
+	item 34 key (13766656 EXTENT_ITEM 4096) itemoff 14457 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de14fcf976) extent data backref root 256 objectid 257 offset 4456448 count 1
+	item 35 key (13770752 EXTENT_ITEM 4096) itemoff 14404 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30decf7059b5) extent data backref root 256 objectid 257 offset 4587520 count 1
+	item 36 key (13774848 EXTENT_ITEM 4096) itemoff 14351 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dec60fd61e) extent data backref root 256 objectid 257 offset 4718592 count 1
+	item 37 key (13778944 EXTENT_ITEM 4096) itemoff 14298 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de1d8376dd) extent data backref root 256 objectid 257 offset 4849664 count 1
+	item 38 key (13783040 EXTENT_ITEM 4096) itemoff 14245 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de74fae169) extent data backref root 256 objectid 257 offset 4980736 count 1
+	item 39 key (13787136 EXTENT_ITEM 4096) itemoff 14192 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deaf7641aa) extent data backref root 256 objectid 257 offset 5111808 count 1
+	item 40 key (13791232 EXTENT_ITEM 4096) itemoff 14139 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de6605fe3f) extent data backref root 256 objectid 257 offset 5242880 count 1
+	item 41 key (13795328 EXTENT_ITEM 4096) itemoff 14086 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30debd895efc) extent data backref root 256 objectid 257 offset 5373952 count 1
+	item 42 key (13799424 EXTENT_ITEM 4096) itemoff 14033 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30ded4f0c948) extent data backref root 256 objectid 257 offset 5505024 count 1
+	item 43 key (13803520 EXTENT_ITEM 4096) itemoff 13980 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de0f7c698b) extent data backref root 256 objectid 257 offset 5636096 count 1
+	item 44 key (13807616 EXTENT_ITEM 4096) itemoff 13927 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de0603e620) extent data backref root 256 objectid 257 offset 5767168 count 1
+	item 45 key (13811712 EXTENT_ITEM 4096) itemoff 13874 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dedd8f46e3) extent data backref root 256 objectid 257 offset 5898240 count 1
+	item 46 key (13815808 EXTENT_ITEM 4096) itemoff 13821 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deb4f6d157) extent data backref root 256 objectid 257 offset 6029312 count 1
+	item 47 key (13819904 EXTENT_ITEM 4096) itemoff 13768 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de6f7a7194) extent data backref root 256 objectid 257 offset 6160384 count 1
+	item 48 key (13824000 EXTENT_ITEM 4096) itemoff 13715 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de23fdd88c) extent data backref root 256 objectid 257 offset 6291456 count 1
+	item 49 key (13828096 EXTENT_ITEM 4096) itemoff 13662 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30def871784f) extent data backref root 256 objectid 257 offset 6422528 count 1
+	item 50 key (13832192 EXTENT_ITEM 4096) itemoff 13609 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de9108effb) extent data backref root 256 objectid 257 offset 6553600 count 1
+	item 51 key (13836288 EXTENT_ITEM 4096) itemoff 13556 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de4a844f38) extent data backref root 256 objectid 257 offset 6684672 count 1
+	item 52 key (13840384 EXTENT_ITEM 4096) itemoff 13503 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de43fbc093) extent data backref root 256 objectid 257 offset 6815744 count 1
+	item 53 key (13844480 EXTENT_ITEM 4096) itemoff 13450 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de98776050) extent data backref root 256 objectid 257 offset 6946816 count 1
+	item 54 key (13848576 EXTENT_ITEM 4096) itemoff 13397 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30def10ef7e4) extent data backref root 256 objectid 257 offset 7077888 count 1
+	item 55 key (13852672 EXTENT_ITEM 4096) itemoff 13344 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de2a825727) extent data backref root 256 objectid 257 offset 7208960 count 1
+	item 56 key (13856768 EXTENT_ITEM 4096) itemoff 13291 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dee3f1e8b2) extent data backref root 256 objectid 257 offset 7340032 count 1
+	item 57 key (13860864 EXTENT_ITEM 4096) itemoff 13238 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de387d4871) extent data backref root 256 objectid 257 offset 7471104 count 1
+	item 58 key (13864960 EXTENT_ITEM 4096) itemoff 13185 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de5104dfc5) extent data backref root 256 objectid 257 offset 7602176 count 1
+	item 59 key (13869056 EXTENT_ITEM 4096) itemoff 13132 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de8a887f06) extent data backref root 256 objectid 257 offset 7733248 count 1
+	item 60 key (13873152 EXTENT_ITEM 4096) itemoff 13079 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de83f7f0ad) extent data backref root 256 objectid 257 offset 7864320 count 1
+	item 61 key (13877248 EXTENT_ITEM 4096) itemoff 13026 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de587b506e) extent data backref root 256 objectid 257 offset 7995392 count 1
+	item 62 key (13881344 EXTENT_ITEM 4096) itemoff 12973 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de3102c7da) extent data backref root 256 objectid 257 offset 8126464 count 1
+	item 63 key (13885440 EXTENT_ITEM 4096) itemoff 12920 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deea8e6719) extent data backref root 256 objectid 257 offset 8257536 count 1
+	item 64 key (13889536 EXTENT_ITEM 4096) itemoff 12867 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deb405223c) extent data backref root 256 objectid 257 offset 8388608 count 1
+	item 65 key (13893632 EXTENT_ITEM 4096) itemoff 12814 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de6f8982ff) extent data backref root 256 objectid 257 offset 8519680 count 1
+	item 66 key (13897728 EXTENT_ITEM 4096) itemoff 12761 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de06f0154b) extent data backref root 256 objectid 257 offset 8650752 count 1
+	item 67 key (13901824 EXTENT_ITEM 4096) itemoff 12708 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dedd7cb588) extent data backref root 256 objectid 257 offset 8781824 count 1
+	item 68 key (13905920 EXTENT_ITEM 4096) itemoff 12655 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30ded4033a23) extent data backref root 256 objectid 257 offset 8912896 count 1
+	item 69 key (13910016 EXTENT_ITEM 4096) itemoff 12602 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de0f8f9ae0) extent data backref root 256 objectid 257 offset 9043968 count 1
+	item 70 key (13914112 EXTENT_ITEM 4096) itemoff 12549 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de66f60d54) extent data backref root 256 objectid 257 offset 9175040 count 1
+	item 71 key (13918208 EXTENT_ITEM 4096) itemoff 12496 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30debd7aad97) extent data backref root 256 objectid 257 offset 9306112 count 1
+	item 72 key (13922304 EXTENT_ITEM 4096) itemoff 12443 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de74091202) extent data backref root 256 objectid 257 offset 9437184 count 1
+	item 73 key (13926400 EXTENT_ITEM 4096) itemoff 12390 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deaf85b2c1) extent data backref root 256 objectid 257 offset 9568256 count 1
+	item 74 key (13930496 EXTENT_ITEM 4096) itemoff 12337 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dec6fc2575) extent data backref root 256 objectid 257 offset 9699328 count 1
+	item 75 key (13934592 EXTENT_ITEM 4096) itemoff 12284 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de1d7085b6) extent data backref root 256 objectid 257 offset 9830400 count 1
+	item 76 key (13938688 EXTENT_ITEM 4096) itemoff 12231 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de140f0a1d) extent data backref root 256 objectid 257 offset 9961472 count 1
+	item 77 key (13942784 EXTENT_ITEM 4096) itemoff 12178 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30decf83aade) extent data backref root 256 objectid 257 offset 10092544 count 1
+	item 78 key (13946880 EXTENT_ITEM 4096) itemoff 12125 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dea6fa3d6a) extent data backref root 256 objectid 257 offset 10223616 count 1
+	item 79 key (13950976 EXTENT_ITEM 4096) itemoff 12072 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de7d769da9) extent data backref root 256 objectid 257 offset 10354688 count 1
+	item 80 key (13955072 EXTENT_ITEM 4096) itemoff 12019 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de31f134b1) extent data backref root 256 objectid 257 offset 10485760 count 1
+	item 81 key (13959168 EXTENT_ITEM 4096) itemoff 11966 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deea7d9472) extent data backref root 256 objectid 257 offset 10616832 count 1
+	item 82 key (13963264 EXTENT_ITEM 4096) itemoff 11913 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de830403c6) extent data backref root 256 objectid 257 offset 10747904 count 1
+	item 83 key (13967360 EXTENT_ITEM 4096) itemoff 11860 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de5888a305) extent data backref root 256 objectid 257 offset 10878976 count 1
+	item 84 key (13971456 EXTENT_ITEM 4096) itemoff 11807 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de51f72cae) extent data backref root 256 objectid 257 offset 11010048 count 1
+	item 85 key (13975552 EXTENT_ITEM 4096) itemoff 11754 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de8a7b8c6d) extent data backref root 256 objectid 257 offset 11141120 count 1
+	item 86 key (13979648 EXTENT_ITEM 4096) itemoff 11701 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dee3021bd9) extent data backref root 256 objectid 257 offset 11272192 count 1
+	item 87 key (13983744 EXTENT_ITEM 4096) itemoff 11648 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de388ebb1a) extent data backref root 256 objectid 257 offset 11403264 count 1
+	item 88 key (13987840 EXTENT_ITEM 4096) itemoff 11595 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30def1fd048f) extent data backref root 256 objectid 257 offset 11534336 count 1
+	item 89 key (13991936 EXTENT_ITEM 4096) itemoff 11542 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de2a71a44c) extent data backref root 256 objectid 257 offset 11665408 count 1
+	item 90 key (13996032 EXTENT_ITEM 4096) itemoff 11489 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de430833f8) extent data backref root 256 objectid 257 offset 11796480 count 1
+	item 91 key (14000128 EXTENT_ITEM 4096) itemoff 11436 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de9884933b) extent data backref root 256 objectid 257 offset 11927552 count 1
+	item 92 key (14004224 EXTENT_ITEM 4096) itemoff 11383 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de91fb1c90) extent data backref root 256 objectid 257 offset 12058624 count 1
+	item 93 key (14008320 EXTENT_ITEM 4096) itemoff 11330 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de4a77bc53) extent data backref root 256 objectid 257 offset 12189696 count 1
+	item 94 key (14012416 EXTENT_ITEM 4096) itemoff 11277 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de230e2be7) extent data backref root 256 objectid 257 offset 12320768 count 1
+	item 95 key (14016512 EXTENT_ITEM 4096) itemoff 11224 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30def8828b24) extent data backref root 256 objectid 257 offset 12451840 count 1
+	item 96 key (14020608 EXTENT_ITEM 4096) itemoff 11171 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deba0179d7) extent data backref root 256 objectid 257 offset 12582912 count 1
+	item 97 key (14024704 EXTENT_ITEM 4096) itemoff 11118 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de618dd914) extent data backref root 256 objectid 257 offset 12713984 count 1
+	item 98 key (14028800 EXTENT_ITEM 4096) itemoff 11065 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de08f44ea0) extent data backref root 256 objectid 257 offset 12845056 count 1
+	item 99 key (14032896 EXTENT_ITEM 4096) itemoff 11012 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30ded378ee63) extent data backref root 256 objectid 257 offset 12976128 count 1
+	item 100 key (14036992 EXTENT_ITEM 4096) itemoff 10959 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deda0761c8) extent data backref root 256 objectid 257 offset 13107200 count 1
+	item 101 key (14041088 EXTENT_ITEM 4096) itemoff 10906 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de018bc10b) extent data backref root 256 objectid 257 offset 13238272 count 1
+	item 102 key (14045184 EXTENT_ITEM 4096) itemoff 10853 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de68f256bf) extent data backref root 256 objectid 257 offset 13369344 count 1
+	item 103 key (14049280 EXTENT_ITEM 4096) itemoff 10800 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deb37ef67c) extent data backref root 256 objectid 257 offset 13500416 count 1
+	item 104 key (14053376 EXTENT_ITEM 4096) itemoff 10747 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de7a0d49e9) extent data backref root 256 objectid 257 offset 13631488 count 1
+	item 105 key (14057472 EXTENT_ITEM 4096) itemoff 10694 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dea181e92a) extent data backref root 256 objectid 257 offset 13762560 count 1
+	item 106 key (14061568 EXTENT_ITEM 4096) itemoff 10641 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dec8f87e9e) extent data backref root 256 objectid 257 offset 13893632 count 1
+	item 107 key (14065664 EXTENT_ITEM 4096) itemoff 10588 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de1374de5d) extent data backref root 256 objectid 257 offset 14024704 count 1
+	item 108 key (14069760 EXTENT_ITEM 4096) itemoff 10535 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de1a0b51f6) extent data backref root 256 objectid 257 offset 14155776 count 1
+	item 109 key (14073856 EXTENT_ITEM 4096) itemoff 10482 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dec187f135) extent data backref root 256 objectid 257 offset 14286848 count 1
+	item 110 key (14077952 EXTENT_ITEM 4096) itemoff 10429 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dea8fe6681) extent data backref root 256 objectid 257 offset 14417920 count 1
+	item 111 key (14082048 EXTENT_ITEM 4096) itemoff 10376 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de7372c642) extent data backref root 256 objectid 257 offset 14548992 count 1
+	item 112 key (14086144 EXTENT_ITEM 4096) itemoff 10323 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de3ff56f5a) extent data backref root 256 objectid 257 offset 14680064 count 1
+	item 113 key (14090240 EXTENT_ITEM 4096) itemoff 10270 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30dee479cf99) extent data backref root 256 objectid 257 offset 14811136 count 1
+	item 114 key (14094336 EXTENT_ITEM 4096) itemoff 10217 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de8d00582d) extent data backref root 256 objectid 257 offset 14942208 count 1
+	item 115 key (14098432 EXTENT_ITEM 4096) itemoff 10164 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de568cf8ee) extent data backref root 256 objectid 257 offset 15073280 count 1
+	item 116 key (14102528 EXTENT_ITEM 4096) itemoff 10111 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de5ff37745) extent data backref root 256 objectid 257 offset 15204352 count 1
+	item 117 key (14106624 EXTENT_ITEM 4096) itemoff 10058 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de847fd786) extent data backref root 256 objectid 257 offset 15335424 count 1
+	item 118 key (14110720 EXTENT_ITEM 4096) itemoff 10005 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30deed064032) extent data backref root 256 objectid 257 offset 15466496 count 1
+	item 119 key (14114816 EXTENT_ITEM 4096) itemoff 9952 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30de368ae0f1) extent data backref root 256 objectid 257 offset 15597568 count 1
+	item 120 key (14118912 EXTENT_ITEM 4096) itemoff 9899 itemsize 53
+		refs 1 gen 11 flags DATA
+		(178 0xdea30defff95f64) extent data backref root 256 objectid 257 offset 15728640 count 1
+	item 121 key (22020096 BLOCK_GROUP_ITEM 8388608) itemoff 9875 itemsize 24
+		block group used 16384 chunk_objectid 256 flags SYSTEM|DUP
+	item 122 key (22052864 METADATA_ITEM 0) itemoff 9842 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x3) tree block backref root CHUNK_TREE
+	item 123 key (30408704 BLOCK_GROUP_ITEM 53673984) itemoff 9818 itemsize 24
+		block group used 245760 chunk_objectid 256 flags METADATA|DUP
+	item 124 key (30523392 METADATA_ITEM 0) itemoff 9785 itemsize 33
+		refs 1 gen 5 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0xfffffffffffffff7) tree block backref root DATA_RELOC_TREE
+	item 125 key (30588928 METADATA_ITEM 0) itemoff 9752 itemsize 33
+		refs 1 gen 9 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x9) tree block backref root UUID_TREE
+	item 126 key (30605312 METADATA_ITEM 0) itemoff 9719 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x7) tree block backref root CSUM_TREE
+	item 127 key (30654464 METADATA_ITEM 0) itemoff 9686 itemsize 33
+		refs 1 gen 9 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x5) tree block backref root FS_TREE
+	item 128 key (30752768 METADATA_ITEM 0) itemoff 9653 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x4) tree block backref root DEV_TREE
+	item 129 key (30785536 METADATA_ITEM 1) itemoff 9620 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 1
+		(176 0x7) tree block backref root CSUM_TREE
+	item 130 key (30801920 METADATA_ITEM 0) itemoff 9587 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x7) tree block backref root CSUM_TREE
+	item 131 key (30818304 METADATA_ITEM 0) itemoff 9554 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x7) tree block backref root CSUM_TREE
+	item 132 key (30834688 METADATA_ITEM 0) itemoff 9521 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x7) tree block backref root CSUM_TREE
+	item 133 key (30867456 METADATA_ITEM 0) itemoff 9488 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x100) tree block backref root 256
+	item 134 key (30916608 METADATA_ITEM 0) itemoff 9455 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x2) tree block backref root EXTENT_TREE
+	item 135 key (30932992 METADATA_ITEM 0) itemoff 9422 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0xa) tree block backref root FREE_SPACE_TREE
+	item 136 key (30949376 METADATA_ITEM 1) itemoff 9389 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 1
+		(176 0x100) tree block backref root 256
+	item 137 key (30965760 METADATA_ITEM 0) itemoff 9356 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x100) tree block backref root 256
+	item 138 key (30982144 METADATA_ITEM 0) itemoff 9323 itemsize 33
+		refs 1 gen 11 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x1) tree block backref root ROOT_TREE
+	item 139 key (84082688 EXTENT_ITEM 33554432) itemoff 9270 itemsize 53
+		refs 121 gen 10 flags DATA
+		(178 0xdea30dea80d95ea) extent data backref root 256 objectid 257 offset 0 count 121
+	item 140 key (84082688 BLOCK_GROUP_ITEM 117440512) itemoff 9246 itemsize 24
+		block group used 33554432 chunk_objectid 256 flags DATA|single

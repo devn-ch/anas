@@ -259,16 +259,21 @@ export function parseTreeBlock(dump: string): TreeBlock {
  * "no item covers this" check is what reports it, rather than a throw from
  * halfway down a tree.
  */
-export function chooseChild(block: TreeBlock, target: BtrfsKey): number {
+export function chooseChildIndex(block: TreeBlock, target: BtrfsKey): number {
   if (block.children.length === 0)
     throw new SelfhealTreeError(`btrfs node ${block.bytenr} has no children`)
-  let chosen = block.children[0].block
-  for (const child of block.children) {
+  let chosen = 0
+  for (const [i, child] of block.children.entries()) {
     if (compareKeys(child.key, target) > 0)
       break
-    chosen = child.block
+    chosen = i
   }
   return chosen
+}
+
+/** The same choice, as the child's bytenr. */
+export function chooseChild(block: TreeBlock, target: BtrfsKey): number {
+  return block.children[chooseChildIndex(block, target)].block
 }
 
 /** Where each tree's root block is, from `btrfs inspect-internal dump-tree -r`. */
@@ -363,7 +368,72 @@ export async function findLeaf(
   root: number,
   target: BtrfsKey,
 ): Promise<string> {
+  return (await findLeafPath(executor, device, root, target)).text
+}
+
+/**
+ * One leaf, plus the descent that reached it — the state {@link nextLeaf} needs.
+ *
+ * `path` is one entry per INTERNAL node visited, outermost first: the node's
+ * child pointers and the index taken out of it. A tree whose root IS a leaf has
+ * an empty path, which is also the honest answer that there is no next leaf.
+ */
+export interface LeafCursor {
+  /** The leaf's dump verbatim, for the existing item parsers. */
+  text: string
+  /** The internal nodes descended through, and the child index taken at each. */
+  path: { children: { key: BtrfsKey, block: number }[], index: number }[]
+}
+
+/** {@link findLeaf}, keeping the descent so the scan can walk ON to the next leaf. */
+export async function findLeafPath(
+  executor: CommandExecutor,
+  device: string,
+  root: number,
+  target: BtrfsKey,
+): Promise<LeafCursor> {
   let bytenr = root
+  const seen = new Set<number>()
+  const path: LeafCursor['path'] = []
+  for (let depth = 0; depth < MAX_TREE_DEPTH; depth++) {
+    if (seen.has(bytenr))
+      throw new SelfhealTreeError(`btrfs tree walk revisited block ${bytenr} — refusing to loop`)
+    seen.add(bytenr)
+    const block = await readTreeBlock(executor, device, bytenr)
+    if (block.leaf)
+      return { text: block.text, path }
+    const index = chooseChildIndex(block, target)
+    path.push({ children: block.children, index })
+    bytenr = block.children[index].block
+  }
+  throw new SelfhealTreeError(`btrfs tree walk from ${root} exceeded ${MAX_TREE_DEPTH} levels`)
+}
+
+/**
+ * The leaf AFTER `cursor`'s, in key order — or null when there is none.
+ *
+ * A forward scan that needs more than one leaf cannot get there by descending
+ * again with a slightly larger key: the descent takes the greatest key ≤ the
+ * target, so a target one byte past the leaf's last item lands in the SAME
+ * leaf and the scan stops on its second iteration (the bug R-second-pass F7
+ * found — `MAX_OWNER_LEAVES` was dead code). The next leaf is reached the way
+ * btrfs itself reaches it: walk back up the recorded path to the deepest node
+ * that still has a sibling to the right, step into it, and descend leftmost.
+ */
+export async function nextLeaf(
+  executor: CommandExecutor,
+  device: string,
+  cursor: LeafCursor,
+): Promise<LeafCursor | null> {
+  let level = cursor.path.length - 1
+  while (level >= 0 && cursor.path[level].index + 1 >= cursor.path[level].children.length)
+    level--
+  if (level < 0)
+    return null
+
+  const path = cursor.path.slice(0, level + 1).map(entry => ({ ...entry }))
+  path[level] = { children: path[level].children, index: path[level].index + 1 }
+  let bytenr = path[level].children[path[level].index].block
   const seen = new Set<number>()
   for (let depth = 0; depth < MAX_TREE_DEPTH; depth++) {
     if (seen.has(bytenr))
@@ -371,8 +441,9 @@ export async function findLeaf(
     seen.add(bytenr)
     const block = await readTreeBlock(executor, device, bytenr)
     if (block.leaf)
-      return block.text
-    bytenr = chooseChild(block, target)
+      return { text: block.text, path }
+    path.push({ children: block.children, index: 0 })
+    bytenr = block.children[0].block
   }
-  throw new SelfhealTreeError(`btrfs tree walk from ${root} exceeded ${MAX_TREE_DEPTH} levels`)
+  throw new SelfhealTreeError(`btrfs tree walk to the leaf after ${cursor.path[level].children[cursor.path[level].index].block} exceeded ${MAX_TREE_DEPTH} levels`)
 }

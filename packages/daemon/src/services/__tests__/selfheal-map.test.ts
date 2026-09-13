@@ -22,6 +22,7 @@ import {
   placeMdByte,
   repairUnitFor,
   segmentForLvByte,
+  selfhealBand,
   SelfhealMapError,
   stripeDataOrder,
 } from '../selfheal-map.js'
@@ -97,7 +98,7 @@ const RAID1 = geometryFromAttributes(
 
 const SEGMENTS = parseDmTable(DM_TABLE)
 /** The rig's single band: its one linear segment on the RAID5 array. */
-const BANDS = SEGMENTS.map(segment => ({ segment, geometry: RAID5 }))
+const BANDS = SEGMENTS.map(segment => selfhealBand(segment, RAID5))
 const CHUNKS = parseChunkItems(CHUNK_TREE)
 
 /**
@@ -207,8 +208,8 @@ describe('selfheal mapping — a multi-band pool', () => {
     parseMdDetailExport(fixture('twoband-mdadm-detail-export-band2.txt'), 3),
   )
   const BANDS_2 = [
-    { segment: TWO_BAND[0], geometry: BAND1 },
-    { segment: TWO_BAND[1], geometry: BAND2 },
+    selfhealBand(TWO_BAND[0], BAND1),
+    selfhealBand(TWO_BAND[1], BAND2),
   ]
   /** Identity chunk: this is about the band hop, not the GT-2 chunk delta. */
   const FLAT_CHUNK = { logical: 0, length: 2 ** 40, deviceOffset: 0, type: 'DATA|single' }
@@ -240,7 +241,7 @@ describe('selfheal mapping — a multi-band pool', () => {
     const lvByte = 811008 * 512 + 1048576
     const right = locateLogicalIn(lvByte, FLAT_CHUNK, BANDS_2)
     // What the pre-R1 engine did: the first segment's geometry for every byte.
-    const wrong = locateLogicalIn(lvByte, FLAT_CHUNK, [{ segment: TWO_BAND[1], geometry: BAND1 }])
+    const wrong = locateLogicalIn(lvByte, FLAT_CHUNK, [selfhealBand(TWO_BAND[1], BAND1)])
     assert.notEqual(right.memberDevice, wrong.memberDevice)
     assert.notEqual(right.memberOffset, wrong.memberOffset)
     assert.notEqual(right.geometry.device, wrong.geometry.device)
@@ -576,6 +577,41 @@ describe('selfheal mapping — the extent tree (selfheal.8)', () => {
     assert.deepEqual(extents.map(e => e.fileOffset), [0, 1052672])
     assert.deepEqual(extents.map(e => e.extentDataOffset), [0, 1052672])
     assert.ok(extents.every(e => e.diskByte === 13631488))
+  })
+
+  /**
+   * F7 (second pass): the forward scan has to CROSS an fs-tree leaf.
+   *
+   * `findLeaf` descends to the leaf holding the greatest key ≤ its target, so a
+   * re-descent with `last + 1` landed in the SAME leaf and the loop exited on
+   * its second iteration — `MAX_OWNER_LEAVES` never did anything. The capture
+   * is a 32 MiB extent cut into 121 surviving pieces by 120 CoW overwrites, in
+   * a real level-1 subvolume tree whose two leaves hold 49 and 72 of them
+   * (PROVENANCE.md, "Leaf-crossing backref fixtures").
+   */
+  it('follows one extent\'s owning items ACROSS an fs-tree leaf boundary', async () => {
+    const roots = parseTreeRoots(fixture('leafspan-dump-tree-roots.txt'))
+    const executor = new MockExecutor()
+    for (const block of [30916608, 30949376, 30965760, 30867456]) {
+      executor.addFixture({
+        command: '/usr/bin/btrfs',
+        args: ['inspect-internal', 'dump-tree', '-b', String(block), '/dev/loop0'],
+        result: { stdout: fixture(`leafspan-node-${block}.txt`), stderr: '', exitCode: 0 },
+      })
+    }
+    const ctx = { mountpoint: '/mnt/leafspan', srcDevice: '/dev/loop0', bands: [], roots, chunks: [], csums: [] }
+
+    // The 64 KiB stripe at the extent's own start. Its one owner in the extent
+    // tree is `84082688 EXTENT_ITEM 33554432`, carrying a single data backref:
+    // `root 256 objectid 257 offset 0 count 121`.
+    const extents = await extentsForStripe(executor, ctx, 256, 257, 84082688)
+    assert.equal(extents.length, 121, 'every piece of the extent, not just the first leaf\'s 49')
+    assert.ok(extents.every(e => e.diskByte === 84082688))
+    // The first leaf's last piece starts at 6,295,552; the 72 pieces past it
+    // are what a scan that cannot cross a leaf never sees.
+    assert.equal(extents.filter(e => e.fileOffset > 6295552).length, 72)
+    assert.equal(extents[0].fileOffset, 0)
+    assert.equal(Math.max(...extents.map(e => e.fileOffset)), 15732736)
   })
 
   it('names no extent where this file owns none — and refuses a foreign subvolume', async () => {

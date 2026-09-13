@@ -836,12 +836,15 @@ down after (`PROVENANCE.md`: "Split-extent fixtures", "Multi-band fixtures").
 
 Four adjacent items, cut but verified, rode along:
 
-- **The compressed fallback.** When the extents cannot be resolved, a stripe is reported
+- **The compressed fallback.** ~~When the extents cannot be resolved, a stripe is reported
   `unidentified` with the reason instead of probing at the kernel's printed offset — for a
   compressed extent that offset is extent-relative (selfheal.8) and names blocks from a window
   that is not the finding. Blocks an operator can hand to a repair have to come from a window
   that was verified. The cost is named: with the mapping out, a finding names its file and not
-  its blocks.
+  its blocks.~~ **REVERSED by F6 below** — the cost was understated (it fell on every extent of
+  every file, not just compressed ones) and the reasoning was half wrong: a probe reads the FILE,
+  so an EIO at the kernel's offset is a real bad block whichever extent it belongs to. The wrong
+  window costs a miss, not a false accusation.
 - **The journal read is bounded.** `journalctl -k -o json` for the scrub window now carries
   `-n 5000` and `-g 'error at logical'` (both error shapes contain it; a journalctl without
   pattern matching is retried without `-g`). Unbounded, a node with tens of thousands of errors
@@ -883,6 +886,66 @@ SUITE: PASS (41/41 cases, 14/14 negative controls)
 B's own geometry (4 members, 512 K chunk), not band A's (6 members, 64 K) — and `7-neg` shows band
 A still repairs normally through the same code. `data=0` on band A is the assertion that runs
 whatever the repair returns.
+
+### Second pass
+
+A second review of the same range (`5d6e249..de17ed1`) found five more, all fixed at the source with a
+regression test that fails on the old code and passes on the new one. Two more fixture captures were
+taken on the stunt node and torn down after (`PROVENANCE.md`: "Leaf-crossing backref fixtures",
+"Multi-sector compressed blob"). The engine suite after them: **SUITE: PASS (41/41 cases, 14/14
+negative controls)**.
+
+- **F3 — the finish-wait is bounded by a POLICY, not by nothing.** `ahr-scrub`'s per-band wait exited
+  only when mdstat AND `sync_action` both read idle, so a band that went `frozen`, or whose check was
+  replaced by a resync/recover/reshape, spun the job for ever — and with R7's active-job exclusion
+  every later scrub or repair on that pool was refused until anasd restarted. A `check` in progress is
+  still waited on for as long as it takes; `frozen` or any non-check sync action ends the wait for that
+  band, recorded as "not checked (sync_action=…)" with NO counter read, and a 7-day absolute ceiling is
+  the last resort with the same verdict. *(`ahr-scrub.test.ts`: frozen mid-check, recover replacing the
+  check, the ceiling, and a long check still polled through.)*
+- **F11 — a check that finishes before the first poll is not "never started".** On a small band a check
+  can run to completion between `mdadm --action=check` returning and the first mdstat read, and the
+  start-wait reported that as never-started and never read the counter — this scrub's own verdict. The
+  band's `last_sync_action` is now snapshotted BEFORE the check is issued and read again at the end of
+  the start window: idle plus `last_sync_action=check` means it ran, and its `mismatch_cnt` is read.
+  *(`ahr-scrub.test.ts`: the scripted "always idle, last_sync_action=check" band warns on its 8
+  mismatches instead of being skipped.)*
+- **F5 — the knobs are saved and restored PER BAND.** R1 gave every on-disk sector its own band, but
+  the repair still took `sectors[0].geometry` for the `rmw_level` save/restore, the sync-knob restore
+  and the outcome's `array`/mapping, while the write, the bounded checks and `rmw_level=0` went to
+  `target.geometry`. A compressed blob straddling a band boundary therefore left band 2 at
+  `rmw_level=0` for good and "restored" band 1 to the value it already had; `reverify` read every
+  sector's `raid1`/`members` out of the first sector's geometry too, so on a mirror-band-plus-parity-
+  band pool it read the wrong disks entirely and called a repairable block unrepairable. Touched bands
+  are now a map keyed by md device, restored one by one; the outcome and the mapping diagnostics name
+  the TARGET's band; `reverify` uses each sector's own `location.geometry`. *(`selfheal-repair.test.ts`:
+  a live 11-sector zstd blob split eight sectors on a RAID1 band and three on a RAID5 band — the repair
+  lands on band 2, band 2's `rmw_level` comes back to 1, and band 1 is not written to at all.)*
+- **F6 — a mapping failure no longer voids the whole pool's findings.** Two faults compounded:
+  `resolveContext` threw for ANY band whose geometry was momentarily unreadable (R1), and the
+  attribution dropped the plain probe whenever the mapping was unavailable. One unreadable band
+  therefore made every file of every band `unidentified` with `badBlocks: []` and nothing to repair.
+  Band geometry is now resolved lazily — carried on the band, raised only where a byte is actually
+  placed on it, and refused up front by the repair gates — so the attribution, which walks the btrfs
+  trees and needs no band at all, still answers. And the stripe is probed at the kernel's offset even
+  with no mapping: `dd` reads the FILE, so a block that comes back EIO is genuinely unreadable
+  whichever extent it belongs to. The wrong window costs a MISS, never a false accusation — and for an
+  uncompressed extent the kernel's offset is exact (GT-3). A probe that finds nothing still reports
+  `unidentified` with the reason. **This corrects the "compressed fallback" cost line above**, which
+  understated it: the cut did not cost "a finding names its file and not its blocks" on compressed
+  extents — it cost that on EVERY extent of EVERY file whenever the mapping was unavailable for any
+  reason at all. *(`ahr-scrub.test.ts`: one of two bands with no readable geometry, findings intact; a
+  stripe with the mapping down probed at the kernel offset and its failing block named; the compressed
+  case with the mapping down still `unidentified`.)*
+- **F7 — the backref scan crosses an fs-tree leaf.** `extentsReferencing` re-descended with
+  `last + 1`, and `findLeaf` takes the greatest key ≤ its target — which for a key one byte past a
+  leaf's last item is that same item, in that same leaf. The scan always stopped on its second
+  iteration and `MAX_OWNER_LEAVES` was dead code, so a large extent split across two leaves handed a
+  repair less than half of itself. The walk now steps to the genuinely next leaf through the recorded
+  descent path (`findLeafPath`/`nextLeaf` in `selfheal-btree.ts`), still bounded by that cap.
+  *(`selfheal-map.test.ts`, on a live capture — a 32 MiB extent cut into 121 pieces by 120 CoW
+  overwrites, in a level-1 subvolume tree whose two leaves hold 49 and 72 of them: the scan returns
+  121, the pre-fix code returned 49.)*
 
 ### Schedule, UI and packaging lane (R8–R10, GLM)
 

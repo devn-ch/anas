@@ -2,7 +2,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { TreeRoots } from './selfheal-btree.js'
 import type { CsumItem } from './selfheal-csum.js'
 import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
-import { chunkItemKey, extentDataKey, extentItemKey, findLeaf, readTreeRoots } from './selfheal-btree.js'
+import { chunkItemKey, extentDataKey, extentItemKey, findLeaf, findLeafPath, nextLeaf, readTreeRoots } from './selfheal-btree.js'
 import { BLOCK_BYTES, kernelName, mdSysPath, readMdAttrOrNull } from './selfheal-io.js'
 
 /**
@@ -346,7 +346,25 @@ export function segmentForLvByte(segments: DmSegment[], lvByte: number): DmSegme
  */
 export interface SelfhealBand {
   segment: DmSegment
-  geometry: MdGeometry
+  /** The device the segment maps onto — named even when its geometry is unreadable. */
+  device: string
+  /**
+   * This band's md geometry, or null when it could not be read.
+   *
+   * Null is deliberate and LOCAL: a band that is momentarily unreadable (or is
+   * not an md array at all) must fail the blocks that live on IT, not the whole
+   * context. The attribution pass never places a byte at all — it walks the
+   * btrfs trees — so a pool with one unreadable band still names its corrupt
+   * files everywhere else (second-pass review F6).
+   */
+  geometry: MdGeometry | null
+  /** Why the geometry is unavailable — the operator's reason, verbatim. */
+  error: string | null
+}
+
+/** A band whose geometry IS in hand — the one shape every caller builds. */
+export function selfhealBand(segment: DmSegment, geometry: MdGeometry): SelfhealBand {
+  return { segment, device: geometry.device, geometry, error: null }
 }
 
 /** The band covering an LV byte — the segment, and the array it maps onto. */
@@ -578,6 +596,15 @@ const MAX_OWNER_LEAVES = 4
  * The items are found by descending to `ref.offset` and collecting, forward,
  * every item of this inode that points AT this extent — the relation the
  * backref actually encodes.
+ *
+ * The scan CROSSES LEAVES. A large extent split by enough CoW overwrites has
+ * its owning items spread over more than one fs-tree leaf, and re-descending
+ * with `last + 1` cannot reach the next one: `findLeaf` takes the greatest key
+ * ≤ its target, which for a key one byte past a leaf's last item is that same
+ * item, in that same leaf. The scan stopped on iteration two and
+ * `MAX_OWNER_LEAVES` never did anything (second-pass review F7). It now steps
+ * to the genuinely next leaf through the recorded descent path, still bounded
+ * by that cap.
  */
 async function extentsReferencing(
   executor: CommandExecutor,
@@ -588,28 +615,30 @@ async function extentsReferencing(
   refOffset: number,
 ): Promise<ExtentItem[]> {
   const found: ExtentItem[] = []
-  let cursor = refOffset
   // Learned from the first match: no owning item starts past ref.offset + ram.
   let limit: number | null = null
+  let cursor = await findLeafPath(executor, ctx.srcDevice, fsRoot, extentDataKey(inode, refOffset))
   for (let leaves = 0; leaves < MAX_OWNER_LEAVES; leaves++) {
-    const leaf = await findLeaf(executor, ctx.srcDevice, fsRoot, extentDataKey(inode, cursor))
-    const items = parseExtentItems(leaf, inode)
-    if (items.length === 0)
+    const items = parseExtentItems(cursor.text, inode)
+    // Past this inode's items entirely — key order puts every EXTENT_DATA item
+    // of one inode together, so a leaf with none of them ends the scan.
+    if (items.length === 0 && found.length > 0)
       break
-    let last = cursor
+    let last: number | null = null
     for (const item of items) {
-      last = Math.max(last, item.fileOffset)
+      last = Math.max(last ?? 0, item.fileOffset)
       if (item.fileOffset < refOffset || item.diskByte !== extentLogical)
         continue
       if (!found.some(e => e.fileOffset === item.fileOffset))
         found.push(item)
       limit = Math.max(limit ?? 0, refOffset + (item.ram ?? item.length ?? 0))
     }
-    if (limit !== null && last >= limit)
+    if (limit !== null && last !== null && last >= limit)
       break
-    if (last <= cursor)
+    const next = await nextLeaf(executor, ctx.srcDevice, cursor)
+    if (next === null)
       break
-    cursor = last + 1
+    cursor = next
   }
   return found
 }
@@ -890,23 +919,41 @@ export async function btrfsDeviceFor(executor: CommandExecutor, mountpoint: stri
  * refused by name — the placement formula below describes md arrays and nothing
  * else, so mapping through anything else would be a guess with a write at the
  * end of it.
+ *
+ * A band whose geometry cannot be read is recorded, NOT thrown (second-pass
+ * review F6). One momentarily-unreadable band used to void the whole context —
+ * and with it the btrfs tree roots, which is all the scrub's attribution pass
+ * needs — so every file of every band came back `unidentified`. The failure is
+ * carried on the band and raised where a byte is actually placed on it
+ * (`locateLogicalIn`), which fails exactly the blocks that live there. The
+ * repair engine's gates refuse such a pool up front, as they always did.
  */
 export async function resolveContext(executor: CommandExecutor, mountpoint: string): Promise<SelfhealContext> {
   const srcDevice = await btrfsDeviceFor(executor, mountpoint)
 
   const bands: SelfhealBand[] = []
+  const band = async (segment: DmSegment, resolveDevice: () => Promise<string>): Promise<SelfhealBand> => {
+    let device = `the dm segment at sector ${segment.startSector}`
+    try {
+      device = await resolveDevice()
+      return { segment, device, geometry: await readBandGeometry(executor, device, segment), error: null }
+    }
+    catch (error) {
+      return { segment, device, geometry: null, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
   const table = await executor.exec(DMSETUP, ['table', srcDevice])
   if (table.exitCode === 0 && table.stdout.trim()) {
     for (const segment of parseDmTable(table.stdout)) {
       const majmin = `${segment.major}:${segment.minor}`
-      const device = `/dev/${await kernelName(executor, `/sys/dev/block/${majmin}`)}`
-      bands.push({ segment, geometry: await readBandGeometry(executor, device, segment) })
+      bands.push(await band(segment, async () => `/dev/${await kernelName(executor, `/sys/dev/block/${majmin}`)}`))
     }
   }
   else {
     // btrfs straight on md (no LVM): the identity segment keeps one code path.
     const segment: DmSegment = { startSector: 0, lengthSectors: Number.MAX_SAFE_INTEGER, major: 0, minor: 0, offsetSector: 0 }
-    bands.push({ segment, geometry: await readBandGeometry(executor, srcDevice, segment) })
+    bands.push(await band(segment, async () => srcDevice))
   }
 
   const roots = await readTreeRoots(executor, srcDevice)
@@ -981,6 +1028,10 @@ export function locateLogicalIn(
 ): MemberLocation {
   const lvByte = logical - chunk.logical + chunk.deviceOffset
   const band = bandForLvByte(bands, lvByte)
+  // The band's geometry is resolved lazily (F6): a byte on an unreadable band
+  // is refused HERE, naming that band — every other band still maps.
+  if (band.geometry === null)
+    throw new SelfhealMapError(`LV byte ${lvByte} is on ${band.device}, whose geometry could not be read: ${band.error ?? 'no reason recorded'}`)
   const seg = band.segment
   const mdByte = lvByte - seg.startSector * 512 + seg.offsetSector * 512
   const placed = placeMdByte(mdByte, band.geometry)

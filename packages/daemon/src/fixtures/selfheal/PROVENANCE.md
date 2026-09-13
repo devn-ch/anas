@@ -110,6 +110,49 @@ run once; the numbers below are its output, recomputed on the node).
 | `split-block-300.b64` | File block 300 read through the filesystem with O_DIRECT. |
 | `split-expected.json` | What the node computed: `logical_byte 14860288` (with the extent data offset) vs `13807616` (without), the stored csum at each (`0x8b9126a3` / `0xa36a7021`), and `crc32c` of the block (`0x8b9126a3`). The csum tree is the arbiter of which arithmetic is right. |
 
+## Leaf-crossing backref fixtures (review remediation F7, 2026-09-13)
+
+A 1 GiB single-device loop rig on the stunt node (`anas-pve`, kernel
+`7.0.14-12-pve`, btrfs-progs `v6.14`; `mkfs.btrfs -m dup -d single
+--sectorsize 4096`, subvolume `@data`, no compression). `f1.bin` = 32 MiB of
+random bytes, synced; then 4 KiB overwritten at every 128 KiB boundary from
+128 KiB to 15,728,640 (120 CoW splits) and synced again. The rig was torn down
+afterwards.
+
+The point of the capture is a subvolume tree that is genuinely MULTI-LEVEL: the
+inode's 241 EXTENT_DATA items do not fit one 16 KiB leaf, so the tree is
+`level 1` with two leaves, and the 121 surviving pieces of the original extent
+are split 49 / 72 across them. That is the only shape in which a forward scan
+has to cross a leaf at all.
+
+| file | what it is |
+|------|------------|
+| `leafspan-dump-tree-roots.txt` | `dump-tree -r` of that filesystem. |
+| `leafspan-node-30949376.txt` | The subvolume tree's ROOT node — `level 1 items 2`, its two child pointers split at key `(257 EXTENT_DATA 6426624)`. |
+| `leafspan-node-30965760.txt` / `leafspan-node-30867456.txt` | The two leaves. The first holds 49 items pointing at `disk byte 84082688` (file offsets 0 … 6,295,552), the second 72 (6,426,624 … 15,732,736). |
+| `leafspan-node-30916608.txt` | The extent tree (one leaf). `item key (84082688 EXTENT_ITEM 33554432)` carries `refs 121` and ONE data backref: `root 256 objectid 257 offset 0 count 121`. |
+
+## Multi-sector compressed blob (review remediation F5, 2026-09-13)
+
+A 1 GiB single-device loop rig on the same node, mounted `compress=zstd`
+(`mkfs.btrfs -m dup -d single --sectorsize 4096`, subvolume `@data`).
+`blob.bin` = 128 KiB of bytes drawn from a four-value alphabet, so zstd
+compresses it to 45,056 bytes — **eleven** 4 KiB on-disk sectors, contiguous
+from logical 13,631,488. Every earlier compressed capture here has
+single-sector blobs, and a blob of one sector cannot straddle anything. Torn
+down afterwards.
+
+| file | what it is |
+|------|------------|
+| `blob-dump-tree-roots.txt` | `dump-tree -r`. |
+| `blob-dump-tree-subvol.txt` | `dump-tree -t 256` (one leaf). Inode 257's single item: `disk byte 13631488 nr 45056`, `offset 0 nr 131072 ram 131072`, `extent compression 3 (zstd)`. |
+| `blob-dump-tree-chunk.txt` | `dump-tree -t 3`. The DATA chunk at logical 13,631,488 has device offset 13,631,488 — delta 0, so the blob's LV bytes ARE its logical bytes, and a test can put a band boundary at any sector of it. |
+| `blob-dump-tree-csum.txt` | `dump-tree -t 7` (one leaf, bytenr 30425088): one EXTENT_CSUM item, `itemoff 16239 itemsize 44` — the eleven entries, one per on-disk sector. |
+
+The repair test that uses it pairs band 1 (the `md-sysfs-raid1.txt` mirror) with
+band 2 (`twoband-md-sysfs-band2.txt`, RAID5) — the AHR shape where a two-disk
+band sits beside a three-disk one — and splits the blob eight sectors / three.
+
 ## Multi-band fixtures (review remediation R1, 2026-09-13)
 
 Six 200 MiB loop files on the same node: two 3-member RAID5 arrays with

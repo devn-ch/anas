@@ -26,7 +26,11 @@ import { BTRFS_STRIPE_BYTES, extentsForStripe, resolveContext } from './selfheal
  *      > 0, read once the check has run AND gone idle) warns immediately: rot
  *      exists, and phase 2 is what names the files. A band md never started is
  *      said so and its counter — which belongs to an earlier check — is not
- *      read at all.
+ *      read at all; a band whose check FINISHED before the first poll is
+ *      recognised from `last_sync_action` and its counter IS read; and a band
+ *      md froze, or took a resync/recover/reshape on instead, ends its own
+ *      wait and is recorded as not checked (the scrub moves to the next band
+ *      rather than spinning).
  *   2. btrfs scrub (start + poll `btrfs scrub status`) — checksums the
  *      filesystem's view of the data — then the ATTRIBUTION pass (story
  *      selfheal.3) names the corrupt files and their failing 4 KiB blocks.
@@ -80,6 +84,19 @@ export const AHR_SCRUB_MISMATCH_DELAY_MS = 1000
  */
 export const AHR_SCRUB_CHECK_START_TIMEOUT_MS = 30000
 
+/**
+ * The LAST-RESORT ceiling on one band's finish-wait (second-pass review F3).
+ *
+ * A check is unbounded BY DESIGN — days on a 20 TB band is normal, and the
+ * poll loop is what keeps the job honest while it runs. The real exit from a
+ * stuck wait is the sync_action policy below (frozen, or any non-check op, ends
+ * the wait for that band immediately). This ceiling exists only for the state
+ * nobody predicted: without it a band that never goes idle spins the job
+ * forever, and with the active-job exclusion (R7) every later scrub or repair
+ * on the pool is refused until anasd restarts.
+ */
+export const AHR_SCRUB_CHECK_FINISH_CEILING_MS = 7 * 24 * 60 * 60 * 1000
+
 export interface AhrScrubOptions {
   /** Poll interval override (tests use 1). */
   pollIntervalMs?: number
@@ -87,6 +104,8 @@ export interface AhrScrubOptions {
   mismatchDelayMs?: number
   /** How long to wait for a band's check to start (tests use a few ms). */
   checkStartTimeoutMs?: number
+  /** Absolute ceiling on a band's finish-wait (tests use a few ms). */
+  checkFinishCeilingMs?: number
 }
 
 /** Minimal structured view of `btrfs scrub status`. */
@@ -149,8 +168,42 @@ export function syncActionArgs(kernelName: string): string[] {
   return [`/sys/block/${kernelName}/md/sync_action`]
 }
 
+/** `/sys/block/<md>/md/last_sync_action` — the last sync op md actually RAN. */
+export function lastSyncActionArgs(kernelName: string): string[] {
+  return [`/sys/block/${kernelName}/md/last_sync_action`]
+}
+
 /** Everything md prints in `sync_action`. Anything else is not an answer. */
 const MD_SYNC_ACTIONS = new Set(['idle', 'none', 'frozen', 'resync', 'recover', 'check', 'repair', 'reshape'])
+
+/** md is doing nothing this wait can watch. */
+function isIdleAction(action: string | null): boolean {
+  return action === null || action === 'idle' || action === 'none'
+}
+
+/** The finish-wait ceiling, in the largest unit that states it plainly. */
+function ceilingText(ms: number): string {
+  if (ms >= 86400000)
+    return `${Math.round(ms / 86400000)}d`
+  if (ms >= 3600000)
+    return `${Math.round(ms / 3600000)}h`
+  return `${ms}ms`
+}
+
+/** One of md's two sync-op attributes, or null when it cannot be read. */
+async function readSyncAttr(
+  executor: CommandExecutor,
+  args: string[],
+): Promise<string | null> {
+  try {
+    const r = await executor.exec(CAT, args)
+    const value = r.exitCode === 0 ? r.stdout.trim() : ''
+    return MD_SYNC_ACTIONS.has(value) ? value : null
+  }
+  catch {
+    return null
+  }
+}
 
 /**
  * md's own word for this array's current sync operation, or null when it cannot
@@ -164,14 +217,21 @@ export async function syncAction(
   executor: CommandExecutor,
   kernelName: string,
 ): Promise<string | null> {
-  try {
-    const r = await executor.exec(CAT, syncActionArgs(kernelName))
-    const value = r.exitCode === 0 ? r.stdout.trim() : ''
-    return MD_SYNC_ACTIONS.has(value) ? value : null
-  }
-  catch {
-    return null
-  }
+  return readSyncAttr(executor, syncActionArgs(kernelName))
+}
+
+/**
+ * The last sync operation md RAN on this array — the evidence a check that
+ * finished before the first poll ever happened (story selfheal.4, F11).
+ *
+ * The same sysfs file the 11.17 md event hook reads to tell a routine check
+ * from a real rebuild.
+ */
+export async function lastSyncAction(
+  executor: CommandExecutor,
+  kernelName: string,
+): Promise<string | null> {
+  return readSyncAttr(executor, lastSyncActionArgs(kernelName))
 }
 
 // ---- Attribution: WHAT is corrupt (story selfheal.3) ------------------------
@@ -697,12 +757,23 @@ export async function pathExists(executor: CommandExecutor, path: string): Promi
  * kernel's offset IS the file offset (GT-3) and the plain 16-block probe is
  * exact.
  *
- * When the extents CANNOT be resolved — the mapping is built once per pass and
- * a failure is permanent for it — the stripe is reported `unidentified` with
- * the reason. It is not probed at the kernel's offset as a consolation: without
- * the extents there is no way to know whether that offset means what it says,
- * and blocks named from the wrong window are worse than blocks not named (the
- * operator can hand them to a repair).
+ * When the extents CANNOT be resolved, the stripe is STILL probed at the
+ * kernel's printed offset (second-pass review F6). The earlier cut dropped the
+ * probe, on the reasoning that a compressed extent's printed offset is
+ * extent-relative (selfheal.8) and names the wrong 64 KiB. Half of that is
+ * right and the conclusion was not: a probe reads the FILE with O_DIRECT, so a
+ * block that comes back EIO is a block of this file that genuinely cannot be
+ * read, whichever extent it belongs to. The wrong window can only cost a MISS,
+ * never a false accusation — and the kernel's offset is EXACT for an
+ * uncompressed extent (GT-3), which is the common case. Dropping it voided the
+ * whole pool's findings whenever the mapping was unavailable for any reason.
+ *
+ * So the rule is: probe what the kernel named; report the blocks that failed;
+ * and when nothing in that window failed AND the mapping was not available to
+ * say where else to look, report `unidentified` with the reason rather than an
+ * empty `badBlocks` that reads as "nothing wrong here". A resolved COMPRESSED
+ * extent still bypasses the printed offset entirely and is probed over its real
+ * file range, which is strictly better than either.
  */
 async function buildFindings(
   executor: CommandExecutor,
@@ -761,11 +832,12 @@ async function buildFindings(
         unidentifiedReason ??= `extent could not be resolved (${mappingError})`
       }
       if (candidates === null) {
-        // The extents could not be resolved, so it is not known whether this
-        // stripe belongs to a COMPRESSED extent — and for a compressed one the
-        // kernel's `offset` is extent-relative (selfheal.8), so probing at it
-        // reads a window that is not the corrupt extent. Say the block was not
-        // identified, and why, rather than name blocks from the wrong place.
+        // Mapping unavailable for this stripe (F6). Probe at the kernel's
+        // offset anyway: an EIO there is a real bad block of this file. If the
+        // extent happens to be compressed the window is the wrong one and the
+        // probe finds nothing — which is a MISS, and `unidentifiedReason` is
+        // already set, so the finding says so instead of reading as clean.
+        badBlocks.push(...await probeStripe(executor, where.path, stripe.offset))
         continue
       }
       if (candidates.length === 0) {
@@ -899,7 +971,6 @@ export async function scrubAhrPool(
     const array = pool.arrays[i]
     const label = `${name}-r${array.band}`
     updateProgress(`phase 1/2: md parity check on ${label}`)
-    await run(executor, MDADM, ['--action=check', array.device])
 
     // /proc/mdstat keys arrays by transient kernel names (GT-2). Resolve the
     // CURRENT kernel name from the stable pin symlink (array.device is always
@@ -907,9 +978,17 @@ export async function scrubAhrPool(
     // from the route-time topology read: md kernel numbers re-enumerate AND get
     // reused across any reassembly between the route read and this check, so a
     // stale md127 could match a DIFFERENT array in mdstat and make us wait on
-    // the wrong device (or none).
+    // the wrong device (or none). Resolved BEFORE the check is issued so the
+    // pre-check snapshot below is genuinely "before"; the check is issued
+    // either way, so an unresolvable name costs the wait, never the check.
     const rp = await executor.exec(REALPATH, [array.device])
     const kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
+    // What md had last run here BEFORE this check — the evidence that says
+    // whether a check that no poll ever saw was ours (F11).
+    const priorAction = kernelName ? await lastSyncAction(executor, kernelName) : null
+
+    await run(executor, MDADM, ['--action=check', array.device])
+
     if (!kernelName) {
       updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
       continue
@@ -921,6 +1000,7 @@ export async function scrubAhrPool(
     // an earlier check and phase 2 runs while md's check is under it.
     let started = false
     let observable = true
+    let alreadyFinished = false
     const startDeadline = Date.now() + (opts?.checkStartTimeoutMs ?? AHR_SCRUB_CHECK_START_TIMEOUT_MS)
     for (;;) {
       const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
@@ -936,16 +1016,32 @@ export async function scrubAhrPool(
         observable = false
         break
       }
-      if (action !== 'idle' && action !== 'none') {
+      if (!isIdleAction(action)) {
         started = true
         break
       }
-      if (Date.now() >= startDeadline)
+      if (Date.now() >= startDeadline) {
+        // ALREADY FINISHED, not never-started (F11). A small band's check can
+        // run to completion between mdadm returning and the very first poll,
+        // and no poll of this window would ever have seen it. md's own record
+        // of what it last ran is the evidence: the array is idle and
+        // `last_sync_action` says the last op was a check, so the counter
+        // sitting there is a check's — and the only check issued in this
+        // window was ours. Without this the band was reported as never checked
+        // and its counter, this scrub's own verdict, was never read.
+        if ((await lastSyncAction(executor, kernelName)) === 'check') {
+          alreadyFinished = true
+          updateProgress(
+            `md check on ${label} finished before the first poll`
+            + `${priorAction !== null && priorAction !== 'check' ? ` (md was last running '${priorAction}')` : ''} — reading its counter`,
+          )
+        }
         break
+      }
       updateProgress(`md check on ${label} (waiting for md to start it)`)
       await sleep(interval)
     }
-    if (!started && observable) {
+    if (!started && observable && !alreadyFinished) {
       // Say it, and read NO counter: `mismatch_cnt` still holds whatever the
       // last check that DID run left there, and reporting it as this scrub's
       // verdict would invent rot (or, worse, clear a real finding).
@@ -953,25 +1049,50 @@ export async function scrubAhrPool(
       continue
     }
 
-    for (;;) {
-      const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
-        .find(a => a.kernelName === kernelName)
-      const action = await syncAction(executor, kernelName)
-      // Array gone from mdstat, or its check finished (and is not queued/parked
-      // behind another sync): move to the next band. A `resync=PENDING` check
-      // (syncPending, sync still null — e.g. an auto-read-only array parks its
-      // check until first write, GT-9) is IN-FLIGHT, not finished: treating it
-      // as done lets the next band's check start and the pending one later
-      // fires concurrently, breaking the strictly-sequential guarantee (§4).
-      // sysfs is consulted alongside mdstat: an op that has left mdstat's
-      // progress line but not yet gone idle is still running.
-      const mdstatIdle = !md || (md.sync?.action !== 'check' && !md.syncDelayed && !md.syncPending)
-      const sysfsIdle = action === null || action === 'idle' || action === 'none'
-      if (mdstatIdle && sysfsIdle)
-        break
-      updateProgress(`md check on ${label}${md?.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
-      await sleep(interval)
+    // FINISH-WAIT, with a deadline policy (second-pass review F3). A `check`
+    // in progress is waited on for as long as it takes — hours or days on a
+    // real band. What is NOT waited on is md doing something else: `frozen`,
+    // or a resync/recover/reshape/repair that replaced our check, means this
+    // band is not being checked for us and never will be in this run. Waiting
+    // on those spun the job forever, and with the active-job exclusion (R7)
+    // that refused every later scrub and repair on the pool until a restart.
+    let checked = true
+    if (!alreadyFinished) {
+      const finishDeadline = Date.now() + (opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)
+      for (;;) {
+        const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
+          .find(a => a.kernelName === kernelName)
+        const action = await syncAction(executor, kernelName)
+        // Array gone from mdstat, or its check finished (and is not queued/parked
+        // behind another sync): move to the next band. A `resync=PENDING` check
+        // (syncPending, sync still null — e.g. an auto-read-only array parks its
+        // check until first write, GT-9) is IN-FLIGHT, not finished: treating it
+        // as done lets the next band's check start and the pending one later
+        // fires concurrently, breaking the strictly-sequential guarantee (§4).
+        // sysfs is consulted alongside mdstat: an op that has left mdstat's
+        // progress line but not yet gone idle is still running.
+        const mdstatIdle = !md || (md.sync?.action !== 'check' && !md.syncDelayed && !md.syncPending)
+        const sysfsIdle = isIdleAction(action)
+        if (mdstatIdle && sysfsIdle)
+          break
+        if (action !== null && !isIdleAction(action) && action !== 'check') {
+          // No counter read: whatever `mismatch_cnt` holds is not this band's
+          // check verdict, and a resync/recover/reshape overwrites it anyway.
+          updateProgress(`${label} was not checked (sync_action=${action}) — md is not running this scrub's check on that band`)
+          checked = false
+          break
+        }
+        if (Date.now() >= finishDeadline) {
+          updateProgress(`${label} was not checked (sync_action=${action ?? 'unreadable'}) — still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling; not waiting on it any longer`)
+          checked = false
+          break
+        }
+        updateProgress(`md check on ${label}${md?.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
+        await sleep(interval)
+      }
     }
+    if (!checked)
+      continue
 
     // The check's verdict: md counted parity mismatches ⇒ rot EXISTS in this
     // band. Phase 2 is what names the files, and it starts right now — say so
