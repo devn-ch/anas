@@ -219,14 +219,17 @@ export async function readScrubTimerNext(executor: CommandExecutor): Promise<str
  * the reload, the enable — must not leave a HALF-WRITTEN pair for the next
  * attempt to trip over. Both previous files are restored byte-for-byte (or
  * removed, when this write was the pair's first), a best-effort reload drops the
- * half-registered units from systemd, and the original error rethrows. The
- * timer's enablement is restored with the files (third pass): `enable --now`
- * enables BEFORE it starts, so a failed start on a first write leaves the
- * `timers.target.wants` symlink dangling over a file the rollback removes — the
- * disable takes it back down; a restored previous pair is re-enabled when the
- * timer was enabled before the write (`is-enabled` is read up front). A
- * ForeignUnitError passes through untouched — nothing was written, nothing to
- * roll back.
+ * half-registered units from systemd BEFORE the enablement call, so systemd does
+ * not act on its cached half-written definition (fourth pass), and the original
+ * error rethrows. The timer's enablement is restored with the files (third
+ * pass): `enable --now` enables BEFORE it starts, so a failed start on a first
+ * write leaves the `timers.target.wants` symlink dangling over a file the
+ * rollback removes — the disable takes it back down; a restored previous pair is
+ * re-enabled when the timer was enabled before the write (`is-enabled` is read
+ * up front), and DISABLED again when it was not — on a rewrite of a disabled
+ * timer the write's own `enable --now` armed it, and the rollback must take it
+ * back down (fourth pass). A ForeignUnitError passes through untouched —
+ * nothing was written, nothing to roll back.
  */
 export async function writeScrubUnits(
   executor: CommandExecutor,
@@ -257,22 +260,29 @@ export async function writeScrubUnits(
       else
         await writeFile(join(dir, name), prev, 'utf-8')
     }
+    // Best-effort: systemd may be holding the CACHED half-written definition,
+    // and the enablement call below acts on the restored files — reload FIRST,
+    // so systemd cannot act on the pair it never should have seen (fourth
+    // pass). A failure here is not fatal: the enablement call and the next
+    // write's own daemon-reload both re-read from disk.
+    await executor.exec(SYSTEMCTL, ['daemon-reload']).catch(() => undefined)
     // Enablement rides the files (third pass). Best-effort both ways — the
     // original failure below is what the operator sees; a rollback systemctl
     // hiccup on top of it would only bury the cause.
-    if (previous[SCRUB_TIMER_NAME] === null) {
-      // A first write: enable --now may have linked the timer before its start
-      // failed — the file is gone now, so the wants symlink must go too.
-      await executor.exec(SYSTEMCTL, ['disable', '--now', SCRUB_TIMER_NAME]).catch(() => undefined)
-    }
-    else if (timerWasEnabled) {
-      // A rewrite: the restored pair was live before — put the enable back
-      // (--now also re-actives the timer; a start that fails again changes
-      // nothing the original error does not already report).
+    if (previous[SCRUB_TIMER_NAME] !== null && timerWasEnabled) {
+      // A rewrite of an ENABLED timer: the restored pair was live before — put
+      // the enable back (--now also re-actives the timer; a start that fails
+      // again changes nothing the original error does not already report).
       await executor.exec(SYSTEMCTL, ['enable', '--now', SCRUB_TIMER_NAME]).catch(() => undefined)
     }
-    // Best-effort: systemd may never have seen the half-written pair.
-    await executor.exec(SYSTEMCTL, ['daemon-reload']).catch(() => undefined)
+    else {
+      // A first write: enable --now may have linked the timer before its start
+      // failed — the file is gone now, so the wants symlink must go too. Or a
+      // rewrite of a DISABLED timer (or an unreadable is-enabled): the write's
+      // own `enable --now` armed a timer that was off before, and the rollback
+      // must take it back down rather than leave it enabled (fourth pass).
+      await executor.exec(SYSTEMCTL, ['disable', '--now', SCRUB_TIMER_NAME]).catch(() => undefined)
+    }
     throw err
   }
 }

@@ -748,6 +748,47 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'), 'the job finishes rather than spinning')
   })
 
+  /**
+   * T4's FOURTH abandonment path (fourth pass): an unresolvable pin symlink
+   * leaves no kernel name to watch the check on — but the check was still
+   * ISSUED (the resolution comment says so deliberately: an unresolvable name
+   * costs the wait, never the check). Walking away without taking it back
+   * armed it beside the next band's check, and the btrfs scrub after that.
+   */
+  it('a band whose kernel name will not resolve has its issued check cancelled before the next band', async () => {
+    const executor = new MockExecutor()
+    // First-match-wins: the failing realpath for t2-r1 is registered FIRST, so
+    // it beats baseExecutor's resolving one — build the executor by hand.
+    executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r1'], result: { stdout: '', stderr: 'realpath: No such file or directory', exitCode: 1 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r2'], result: { stdout: '/dev/md126\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // Catch-all cat: md126 has no scripted sysfs, so its wait behaves as in
+    // every other abandonment test above.
+    executor.addFixture({ command: '/usr/bin/cat', result: { stdout: mdstat([]), stderr: '', exitCode: 0 } })
+
+    const progress: string[] = []
+    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+    assert.ok(
+      progress.includes('Cannot resolve /dev/md/t2-r1 to a kernel device — not waiting on its check'),
+      progress.join(' | '),
+    )
+    // The check WAS issued either way — and taken back before the next band's
+    // is issued and phase 2 runs over both.
+    const idleAt = executor.calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle' && c.args[1] === '/dev/md/t2-r1')
+    const nextCheck = checkIssuedAt(executor, '/dev/md/t2-r2')
+    assert.ok(idleAt > checkIssuedAt(executor, '/dev/md/t2-r1'), 'the check was issued before the band was given up on')
+    assert.ok(idleAt >= 0, 'the unresolvable band\'s check is cancelled')
+    assert.ok(idleAt < nextCheck, 'and cancelled before the next band\'s check is issued')
+    assert.ok(progress.includes('dropped this scrub\'s check on t2-r1 so it cannot run beside the next band\'s'), progress.join(' | '))
+    assert.ok(nextCheck >= 0, 'the scrub goes on: band 2 is still checked')
+    assert.equal(result.btrfsErrors, null, 'the job completes — the cancellation is best-effort, never fatal')
+  })
+
   it('aborted btrfs scrub fails the job', async () => {
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: scrubStatus('aborted'), stderr: '', exitCode: 0 } })
@@ -1567,6 +1608,11 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     // The 16 blocks of the named 64 KiB stripe, and nothing else.
     const dd = executor.calls.filter(c => c.command === '/usr/bin/dd' && c.args[0] === `if=${F}`)
     assert.deepEqual(dd.map(c => c.args[3]), Array.from({ length: 16 }, (_, i) => `skip=${i}`))
+    // T7's fact reaches the reader (fourth pass): blocks found in an
+    // UNVERIFIED window are named, and the window says so beside them.
+    const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
+    assert.ok(body.includes(` (search window unverified: `), body)
+    assert.match(body, /search window unverified: extent could not be resolved/)
   })
 
   // The compressed case with the mapping down: the kernel's offset is
@@ -1592,6 +1638,9 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     assert.equal(finding?.probedUnverified, true, 'the window it looked in was never verified either')
     const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
     assert.ok(body.includes('block not identified'), body)
+    // The unidentified arm already names the reason as its block text — the
+    // unverified suffix must not print the same reason a second time (fourth pass).
+    assert.ok(!body.includes('search window unverified'), body)
   })
 
   /**

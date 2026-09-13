@@ -390,7 +390,9 @@ describe('no mdcheck adoption at daemon start (review F1/F4) — structural guar
     // helper), so bare module reachability cannot read "only via routes/scrub.ts"
     // — the invariant that matters is the WRITE surface: writeScrubUnits /
     // removeScrubUnits are named only by the store layer itself, and the store
-    // is wired only through routes/scrub.ts.
+    // is wired only through routes/scrub.ts. The routes tree is NOT skipped
+    // wholesale (fourth pass): skipping it let ANY route name the write
+    // surface unnoticed — only routes/scrub.ts is the sanctioned door.
     const full = await reachableFrom(INDEX_URL, true)
     assert.ok(
       [...full].some(href => href.endsWith('/scrub-schedule-units.ts')),
@@ -398,11 +400,11 @@ describe('no mdcheck adoption at daemon start (review F1/F4) — structural guar
     )
     const offenders: string[] = []
     for (const href of full) {
-      if (href.includes('/src/routes/'))
-        continue // the routes tree is the sanctioned door
       const rel = href.slice(SRC_ROOT.href.length)
       if (rel === 'services/scrub-schedules.ts' || rel === 'services/scrub-schedule-units.ts')
         continue // the store layer itself
+      if (rel === 'routes/scrub.ts')
+        continue // the sanctioned door
       const src = await readFile(fileURLToPath(new URL(href)), 'utf-8')
       if (/\bwriteScrubUnits\b|\bremoveScrubUnits\b|scrub-schedule-units/.test(src))
         offenders.push(rel)

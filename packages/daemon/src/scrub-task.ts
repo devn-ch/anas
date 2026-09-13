@@ -140,6 +140,12 @@ export async function pollScrubJob(
       })
     }
     catch (err) {
+      // A transport error also breaks the RUN of 404s (fourth pass): whether
+      // the job still exists was not learned — the daemon was not reached at
+      // all — so the two 404s either side of an ECONNREFUSED are not
+      // consecutive, and a daemon that blinks on the socket mid-poll must not
+      // turn a two-404 run into a vanished job.
+      missing = 0
       outage += 1
       if (outage >= outageCap) {
         const message = `scrub job ${jobRef.id} unreachable — the daemon has been unreachable for `

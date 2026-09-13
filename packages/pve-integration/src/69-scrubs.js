@@ -742,6 +742,22 @@
     // COMPRESSED extent — the kernel's offset is extent-relative there, so the
     // count is the whole extent's blast radius, not a stripe probe (selfheal.8)
     // — and one whose corrupt block could not be named at all.
+    //
+    // T7 (third pass) marked the fact on the finding; this window renders it
+    // (fourth pass): a probe made without the mapping searched an UNVERIFIED
+    // window, so the blocks listed are real but not known to be complete. The
+    // suffix rides the counted cells (plain and compressed) — the
+    // `unidentified` cell already names the reason, and a missing or
+    // in-snapshot file was never probed. Muted, with the reason as tooltip.
+    function unverifiedSuffix(rec) {
+        if (!rec.get('probedUnverified')) {
+            return '';
+        }
+        var why = rec.get('reason') || '';
+        return ' <span style="color:var(--anas-muted,gray);" title="'
+            + enc(why) + '">'
+            + enc(t('(search window unverified)')) + '</span>';
+    }
     function renderFindingBlocks(v, meta, rec) {
         if (rec.get('outsideMount')) {
             return '<span style="color:var(--anas-muted,gray);" title="'
@@ -767,7 +783,8 @@
                 + ': ' + (rec.get('blockList') || '');
             meta.tdAttr = 'data-qtip="' + enc(tip) + '"';
             return '<span style="color:var(--anas-warn,#b06a12);">'
-                + enc(t('compressed extent — ') + n + t(' blocks')) + '</span>';
+                + enc(t('compressed extent — ') + n + t(' blocks')) + '</span>'
+                + unverifiedSuffix(rec);
         }
         var n = Number(rec.get('blocks')) || 0;
         var list = rec.get('blockList');
@@ -775,9 +792,10 @@
             ? (t('failing 4 KiB file blocks') + ': ' + list)
             : t('no block inside the reported stripe failed to read — the file was rewritten or repaired since the scrub');
         meta.tdAttr = 'data-qtip="' + enc(tip) + '"';
-        return n
+        return (n
             ? '<span style="color:var(--anas-warn,#b06a12);">' + n + '</span>'
-            : muted('0');
+            : muted('0'))
+            + unverifiedSuffix(rec);
     }
 
     // ---- Repair from parity (selfheal.6) ------------------------------------
@@ -1111,6 +1129,7 @@
                 extentCount: f.extentBlocks ? f.extentBlocks.count : 0,
                 unidentified: !!f.unidentified,
                 reason: f.reason || '',
+                probedUnverified: !!f.probedUnverified,
                 outcome: null
             });
         }
@@ -1141,7 +1160,7 @@
                     store: Ext.create('Ext.data.Store', {
                         fields: ['path', 'subvolume', 'inode', 'blocks', 'blockList', 'stripes',
                             'missing', 'outsideMount', 'compressed', 'extentFirst', 'extentCount',
-                            'unidentified', 'reason',
+                            'unidentified', 'reason', 'probedUnverified',
                             { name: 'blockArray', type: 'auto' },
                             { name: 'outcome', type: 'auto' }],
                         data: rows

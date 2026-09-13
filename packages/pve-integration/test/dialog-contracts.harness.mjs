@@ -7219,6 +7219,55 @@ async function scrubFindingsChecks() {
   eq('scrubs: …and simply has no findings to show', rowFor(grid2, 'ahr0').get('findings'), null)
 }
 
+// Fourth pass — T7's mark is RENDERED, not just carried: a finding whose probe
+// ran without the mapping searched an unverified window, and the bad-block cell
+// says so beside the count, muted, with the reason as tooltip. A finding with
+// blocks found used to read as a complete account of the file.
+const FINDING_UV = {
+  path: '/mnt/anas-ahr/ahr0/db/written.bin',
+  subvolume: '@data',
+  inode: 403,
+  stripes: [{ logical: 31000000, offset: 0, length: 4096 }],
+  badBlocks: [7],
+  probedUnverified: true,
+  reason: 'extent could not be resolved (btrfs dump-tree: no extent tree root)',
+}
+
+async function scrubUnverifiedWindowCheck() {
+  const UV_JOBS = {
+    data: [scrubJob({
+      id: 'juv',
+      at: '2026-09-12T09:00:00.000Z',
+      result: { scrubbed: 'ahr0', btrfsErrors: 'csum=1', checkedArrays: 2, findings: [FINDING_UV], errorsReported: 1, errorsAttributed: 1, unattributed: 0, truncated: false },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': UV_JOBS })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  const ahr0 = rowFor(grid, 'ahr0')
+  ok('scrubs: the unverified-window scrub is the row\'s last completed one', !!ahr0 && !!ahr0.get('findings'))
+  if (!ahr0) { return }
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, ahr0, null, 0, onLink)
+  await settle()
+  const win = openWindow()
+  ok('scrubs: the finding opens the findings window', !!win && win.cls === 'anas-win-scrub-findings')
+  if (!win) { return }
+  const fGrid = findCmp(win, 'anas-grid-scrub-findings')
+  ok('scrubs: the unverified-window finding reaches the row', !!fGrid && fGrid.store.getAt(0).get('probedUnverified') === true)
+  if (!fGrid) { return }
+  const blocksCol = (fGrid.columns || []).find(c => c.dataIndex === 'blocks')
+  const cell = blocksCol.renderer(null, {}, fGrid.store.getAt(0))
+  ok('scrubs: the bad-block count is still shown', />1</.test(cell), cell)
+  ok('scrubs: the unverified-window suffix rides the count, muted',
+    /\(search window unverified\)/.test(cell) && /var\(--anas-muted/.test(cell), cell)
+  ok('scrubs: the reason rides the suffix as the tooltip',
+    /title="[^"]*extent could not be resolved/.test(cell), cell)
+}
+
 // ============================================================================
 //  Scrubs: Repair from parity, in the findings window (story selfheal.6)
 // ============================================================================
@@ -7745,6 +7794,10 @@ created.windows.length = 0
 // Story selfheal.3 — the AHR scrub's findings on the Scrubs row, and the one
 // window they open.
 await scrubFindingsChecks()
+warnings.length = 0
+created.windows.length = 0
+// Fourth pass — the unverified-window suffix is rendered in the bad-block cell.
+await scrubUnverifiedWindowCheck()
 // Story selfheal.4 — the two-phase surface: phases + next run on the row, the
 // cadence selector beside the toggle, the toggle body and its confirm.
 warnings.length = 0

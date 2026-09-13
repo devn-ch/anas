@@ -979,8 +979,10 @@ regression tests that fail on the old code and pass on the new one. No new captu
   name a prefix of a file's extents as if it were the whole set, and a repair offered on that prefix
   reads as a repair of the file. The scan now tracks whether it reached a real end (the inode's items
   ran out, the learned `ref.offset + ram` limit was passed, or the tree had no next leaf) and throws
-  `SelfhealMapError("owner scan truncated at 4 leaves …")` otherwise — a mapping abort for the repair
-  path, and an `unidentified` reason for the attribution, which already catches it.
+  `SelfhealMapError("owner scan truncated at 4 leaves …")` otherwise. `extentsForStripe` has one
+  production caller — the attribution pass — so the throw surfaces there, as the finding's
+  `unidentified` reason; the repair path never calls it. (Fourth pass: an earlier version of this
+  line claimed a mapping abort in the repair path, which is unreachable.)
   *(`selfheal-map.test.ts`: a synthetic level-1 fs tree of five leaves, ten owning items, none past
   the limit — the scan refuses; pre-fix it handed back the eight items its four leaves held.)*
 - **T7 — an unverified probe window says so on the finding.** With the mapping down F6 probes at the
@@ -1093,3 +1095,64 @@ is smartctl's own `jerr("Smartctl open device: %s failed: %s")` line), labeled a
   cheap probe per 8 passes. *(`disk-identity-cache.test.ts` (n): the 1, 2, 4, 8, 8 sequence over
   17 passes; (h)/(i) the backoff inside the first-failure and standby→failure→recovery stories;
   `disks-stale-health.test.ts` the same at the payload level.*)
+### Fourth pass
+
+A fourth narrow review of the same arc (`13cb6b3..cbfd063`, 2026-09-14) found eight more, all
+mechanical, all fixed at the source with a regression test that fails on the old code and passes
+on the new one. No new captures were needed.
+
+- **T4 (again) — the unresolvable-realpath abandonment cancels its check too.** When the band's
+  pin symlink would not resolve, the check was still ISSUED (deliberately: an unresolvable name
+  costs the wait, never the check) but the `continue` walked away without writing `idle` — the
+  fourth abandonment path, after the frozen/recover takeovers, the ceiling and the bounded-window
+  check — so the next band's check, and then the btrfs scrub, ran over an armed parity check. The
+  path now calls `cancelBandCheck` before the `continue`. *(`ahr-scrub.test.ts`: a failing
+  `realpath /dev/md/t2-r1` → `--action=idle /dev/md/t2-r1` issued after that band's check and
+  before the next band's `--action=check`.)*
+- **T7 (again) — the unverified-window suffix is RENDERED.** `probedUnverified` and `reason` were
+  carried on the finding but shown only in the `unidentified` arm, so a finding with blocks found
+  in an unverified window read as a complete account. The notification body appends
+  ` (search window unverified: <reason>)` to the finding's block text (the `unidentified` arm
+  already names the reason, so it does not say it twice), and the findings window renders the same
+  suffix muted in the bad-block cell with the reason as tooltip. *(`ahr-scrub.test.ts`: the
+  mapping-down EIO hit names the suffix with the reason; the unidentified body does not double it.
+  `dialog-contracts.harness.mjs`: the bad-block cell carries the suffix and the tooltip.)*
+- **T6 (doc) — the owner-scan cap's throw reaches the attribution, not the repair path.** The
+  third-pass T6 line claimed a "mapping abort in the repair path", but `extentsForStripe`'s only
+  production caller is the attribution pass; the sentence now says the throw surfaces as the
+  attribution's `unidentified` reason. Doc-only.
+- **T9 (again) — a transport error also breaks the run of 404s.** The `missing` reset from the
+  third pass landed in the HTTP non-404 branch but not the transport-error `catch`, so
+  `404 → ECONNREFUSED → 404 → 404` still declared a vanished job after two real 404s. The catch
+  now resets `missing` beside `outage += 1`. *(`scrub-task.test.ts`: that exact sequence completes;
+  404×3 still vanishes at three confirmations.)*
+- **T3 (again) — the prune gate is the LISTING, not the fleet.** `prunable =
+  disks.every(d => byIdMap.has(d.name))` was all-or-nothing: one disk with no by-id symlink
+  (virtio without a serial, some USB bridges) disabled the prune for ever and the cache grew
+  without bound. `prunable` is now `byIdMap.size > 0` (the listing succeeded), and the route passes
+  `loadMany` the ids that resolved through by-id as the prune's presence list — only fallback ids
+  count as absent. *(`disk-identity-cache.test.ts` (p): a fallback disk alongside a healthy by-id
+  listing — the absent disk is dropped after 3 trusted passes, the named disk and the degraded
+  enumeration behaviour (o) untouched.)*
+- **T8 (again) — the rollback's enablement covers the rewrite-of-a-disabled-timer case.** The
+  `disable --now` arm was gated on the timer file not existing before, so a rewrite of a timer that
+  was disabled beforehand (or whose `is-enabled` read failed closed to false) that failed after the
+  write's own `enable --now` left the timer ARMED. The rollback now disables unless the restored
+  pair was enabled before. *(`scrub-schedule-units.test.ts`: a failed rewrite reading
+  `is-enabled: disabled` → the rollback calls `disable --now` after the failed enable and never
+  re-enables.)*
+- **(same file) — the rollback reloads BEFORE the enablement call.** It ran `enable`/`disable`
+  first and `daemon-reload` last, so systemd could act on its cached half-written definition. The
+  best-effort `daemon-reload` now comes first. *(`scrub-schedule-units.test.ts`: call order asserted
+  in both the re-enable and the disable arm.)*
+- **T6 (again) — an empty owner scan RETURNS empty.** The end-of-scan check was gated on
+  `found.length > 0`, so a file truncated or rewritten since the scrub — leaves holding none of its
+  EXTENT_DATA items — walked all four leaves and threw "truncated" over the honest "no extent of
+  this file covers the reported stripe". A leaf with none of the inode's items past the first is a
+  real end regardless of what was found (the first leaf stays exempt: the descent can land a leaf
+  short of the search key). *(`selfheal-map.test.ts`: a synthetic five-leaf tree, every item
+  another inode's → `[]`, no throw, and the walk ends at the second leaf.)*
+- **T11 (again) — the write-surface guard names its door.** The structural guard's second walk
+  skipped the whole routes tree, so any route could have named `writeScrubUnits`/`removeScrubUnits`
+  unnoticed. Only `routes/scrub.ts` is exempt now. *(`scrub-schedules.test.ts`: same walk, door
+  narrowed — still a string scan, still fast.)*

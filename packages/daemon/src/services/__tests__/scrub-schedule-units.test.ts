@@ -243,6 +243,44 @@ describe('scrub schedule units — CRUD lifecycle (temp dir + mocked systemctl)'
       cmds.lastIndexOf(`enable --now ${SCRUB_TIMER_NAME}`) > cmds.indexOf(`enable --now ${SCRUB_TIMER_NAME}`),
       'the restored pair was re-enabled after the files came back (best-effort — the mock fails it too)',
     )
+    // Fourth pass: the rollback's reload lands BEFORE the enablement call.
+    assert.ok(
+      cmds.lastIndexOf('daemon-reload') < cmds.lastIndexOf(`enable --now ${SCRUB_TIMER_NAME}`),
+      'systemd reloads the restored files before enablement acts on them',
+    )
+  })
+
+  it('a failed rewrite of a DISABLED timer takes the timer back DOWN (fourth pass)', async () => {
+    // The write arms the timer with `enable --now` whatever it was before — so
+    // a rewrite of a disabled timer (or one whose is-enabled read failed
+    // closed) that fails after the enable must not leave it ARMED: the
+    // rollback disable is not reserved for first writes.
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['is-enabled', SCRUB_TIMER_NAME],
+      results: [
+        { stdout: '', stderr: '', exitCode: 0 },
+        { stdout: 'disabled\n', stderr: '', exitCode: 1 },
+      ],
+    })
+    await writeScrubUnits(mock, dir, schedule({ pools: ['ahr0', 'ahr1'] }))
+    mock.addFixture({ command: SYSTEMCTL, args: ['enable', '--now', SCRUB_TIMER_NAME], result: { stdout: '', stderr: 'enable failed', exitCode: 1 } })
+    await assert.rejects(() => writeScrubUnits(mock, dir, schedule({ pools: ['ahr0'] })), /enable failed/)
+    assert.deepEqual(await readScrubSchedule(dir), { kind: 'ahr-scrub', cadence: 'monthly', pools: ['ahr0', 'ahr1'] }, 'the previous schedule survived')
+    const cmds = mock.calls.map(c => c.args.join(' '))
+    assert.ok(
+      cmds.lastIndexOf(`enable --now ${SCRUB_TIMER_NAME}`) < cmds.indexOf(`disable --now ${SCRUB_TIMER_NAME}`),
+      'the rollback does not re-enable a timer that was off before the write',
+    )
+    assert.ok(cmds.includes(`disable --now ${SCRUB_TIMER_NAME}`), 'the rollback takes the armed timer back down')
+    assert.ok(
+      cmds.indexOf(`disable --now ${SCRUB_TIMER_NAME}`) > cmds.lastIndexOf(`enable --now ${SCRUB_TIMER_NAME}`),
+      'the disable follows the enable that armed it',
+    )
+    assert.ok(
+      cmds.lastIndexOf('daemon-reload') < cmds.indexOf(`disable --now ${SCRUB_TIMER_NAME}`),
+      'and systemd reloads the restored files before the disable acts on them',
+    )
   })
 
   it('removeScrubUnits clears the timer\'s Persistent stamp (review R10)', async () => {

@@ -244,6 +244,45 @@ describe('scrub-task runner (selfheal.4 — timer entrypoint)', () => {
     assert.equal(job.status, 'completed', '404, 503, 404, 404 is not three consecutive 404s')
   })
 
+  it('a TRANSPORT error between 404s resets the vanish count too (fourth pass)', async () => {
+    // 404, ECONNREFUSED, 404, 404 — two real 404s split by a poll that never
+    // reached the daemon at all. Whether the job still exists was not learned,
+    // so the run is broken; the old counter was reset only by HTTP answers,
+    // and the third poll here declared a vanished job on two consecutive 404s.
+    const sequence: Array<RunnerResponse | Error> = [
+      { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } },
+      new Error('connect ECONNREFUSED'),
+      { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } },
+      { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } },
+      { statusCode: 200, body: { job: { id: 'j1', status: 'completed', result: { scrubbed: 'p1' } } } },
+    ]
+    let pollIdx = 0
+    const requester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+      const next = sequence[Math.min(pollIdx++, sequence.length - 1)]
+      if (next instanceof Error)
+        throw next
+      return next
+    }
+    const job = await scrubPool(requester, 'p1', { sleep: noSleep, maxAttempts: 10 })
+    assert.equal(job.status, 'completed', '404, ECONNREFUSED, 404, 404 is not three consecutive 404s')
+    // …and the confirmations are still what they say they are: three 404s in a
+    // row DO declare the vanish (the third pass rule, unchanged).
+    let vanishPolls = 0
+    const goneRequester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+      vanishPolls++
+      return { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } }
+    }
+    await assert.rejects(
+      () => scrubPool(goneRequester, 'p1', { sleep: noSleep }),
+      /vanished \(daemon restarted\?\)/,
+    )
+    assert.equal(vanishPolls, 3)
+  })
+
   it('a non-404 failure (500) is an outage, not a vanish — bounded by the outage cap, not 3 polls', async () => {
     const lines: string[] = []
     const origErr = process.stderr.write.bind(process.stderr)

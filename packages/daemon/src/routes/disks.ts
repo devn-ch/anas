@@ -230,11 +230,21 @@ export async function collectDisks(
   // name the fleet: if the by-id listing came back empty or failed, every
   // disk id fell back to serial/kernel name, and pruning on such a list
   // would drop EVERY entry (the sleeping disks' preserved identities
-  // included).
-  const enumerationPrunable = disks.every(d => byIdMap.has(d.name))
+  // included). The gate is the LISTING, not the fleet (fourth pass): one disk
+  // without a by-id symlink (virtio without a serial, some USB bridges) must
+  // not veto pruning for the whole cache for ever. Only the ids that resolved
+  // through by-id count as present — a disk that fell back is named by a
+  // fallback id, which is exactly the kind of entry that goes stale, so it is
+  // pruned like any other absence once the trustworthy listing stops naming it.
+  const enumerationPrunable = byIdMap.size > 0
   await diskIdentityCache.loadMany(
     disks.map(d => ({ id: d.id, path: d.path })),
-    { prunable: enumerationPrunable },
+    {
+      prunable: enumerationPrunable,
+      presentIds: enumerationPrunable
+        ? disks.filter(d => byIdMap.has(d.name)).map(d => d.id)
+        : undefined,
+    },
   )
 
   // Enrich each disk with cached identity, ZFS context, and derived health.

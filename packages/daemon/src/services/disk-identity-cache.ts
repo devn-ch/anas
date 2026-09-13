@@ -165,12 +165,23 @@ export class DiskIdentityCache {
    * (on a box where disks come and go, the maps would otherwise grow without
    * bound for the daemon's lifetime). But a list that cannot name the fleet is
    * no evidence of departure — see {@link pruneAbsent}.
+   *
+   * `presentIds` names the disks the enumeration resolved THROUGH by-id
+   * (fourth pass). Given, it is the presence list for the prune, so a disk
+   * whose id fell back to a serial/kernel name does not count as present —
+   * its fallback entry is exactly the kind that goes stale — while the rest
+   * of the fleet prunes normally. Absent, every listed disk counts.
    */
   async loadMany(
     disks: Array<{ id: string, path: string }>,
-    opts: { prunable?: boolean } = {},
+    opts: { prunable?: boolean, presentIds?: string[] } = {},
   ): Promise<void> {
-    this.pruneAbsent(disks, opts.prunable !== false)
+    this.pruneAbsent(
+      opts.presentIds !== undefined
+        ? opts.presentIds.map(id => ({ id }))
+        : disks,
+      opts.prunable !== false,
+    )
     for (const d of disks)
       this.tickBackoff(d.id)
     const due = disks.filter(d => this.isDue(d.id, this.reading.get(d.id)))
@@ -181,12 +192,13 @@ export class DiskIdentityCache {
 
   /**
    * The topology prune. A key is dropped only when the enumeration is
-   * TRUSTWORTHY — non-empty, and able to name every disk it lists (the caller
-   * passes prunable: false when ids fell back to serial/kernel names, which
-   * happens when the by-id listing came back empty) — and the key has been
-   * absent from such a list for PRUNE_AFTER_ABSENT_PASSES consecutive passes.
-   * One empty `ls /dev/disk/by-id/` must not prune the whole cache, sleeping
-   * disks' preserved identities included.
+   * TRUSTWORTHY — non-empty (the caller passes prunable: false when the by-id
+   * listing came back empty or failed, so no disk was named by id), and
+   * listing only ids that resolved through by-id when the caller passed
+   * `presentIds` — and the key has been absent from such a list for
+   * PRUNE_AFTER_ABSENT_PASSES consecutive passes. One empty
+   * `ls /dev/disk/by-id/` must not prune the whole cache, sleeping disks'
+   * preserved identities included.
    */
   private pruneAbsent(disks: Array<{ id: string }>, prunable: boolean): void {
     if (!prunable || disks.length === 0)

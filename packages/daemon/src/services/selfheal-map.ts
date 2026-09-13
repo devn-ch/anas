@@ -636,8 +636,16 @@ async function extentsReferencing(
   for (let leaves = 0; leaves < MAX_OWNER_LEAVES; leaves++) {
     const items = parseExtentItems(cursor.text, inode)
     // Past this inode's items entirely — key order puts every EXTENT_DATA item
-    // of one inode together, so a leaf with none of them ends the scan.
-    if (items.length === 0 && found.length > 0) {
+    // of one inode together, so a leaf with none of them ends the scan. The
+    // FIRST leaf is exempt: the descent takes the greatest key ≤ its target,
+    // so it can land a leaf short of the search key (the inode's items start
+    // on the next leaf), and an empty first leaf says nothing about whether
+    // more follow. `found.length > 0` used to gate this (third pass) — but a
+    // file truncated or rewritten since the scrub holds none of its old items
+    // anywhere, so the scan then walked every leaf to the cap and threw
+    // "truncated" over what is an honest, complete answer: no extent of this
+    // file covers the reported stripe (fourth pass).
+    if (items.length === 0 && leaves > 0) {
       complete = true
       break
     }

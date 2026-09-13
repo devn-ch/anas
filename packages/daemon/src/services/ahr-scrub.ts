@@ -1004,7 +1004,14 @@ function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult
           : f.unidentified
             ? `block not identified (${f.reason ?? 'no reason recorded'})`
             : `${f.badBlocks.length} bad 4K block(s)`
-    return `  ${f.path} — ${blocks}`
+    // T7's fact, carried to the reader (fourth pass): a probe made without the
+    // mapping searched an unverified window, so the blocks listed are real but
+    // not known to be complete. The `unidentified` arm already names the
+    // reason as its block text — repeating it in the suffix would say it twice.
+    const unverified = f.probedUnverified && !f.unidentified
+      ? ` (search window unverified: ${f.reason ?? 'no reason recorded'})`
+      : ''
+    return `  ${f.path} — ${blocks}${unverified}`
   })
   if (findings.length > NOTIFY_PATH_LIMIT)
     lines.push(`  …and ${findings.length - NOTIFY_PATH_LIMIT} more`)
@@ -1072,6 +1079,11 @@ export async function scrubAhrPool(
     await run(executor, MDADM, ['--action=check', array.device])
 
     if (!kernelName) {
+      // A FOURTH abandonment path (fourth pass): the check above WAS issued —
+      // the comment before the resolution says so deliberately — so walking
+      // away without taking it back leaves it armed beside the next band's
+      // check, exactly like every other abandonment. Best-effort, same door.
+      updateProgress(await cancelBandCheck(executor, array.device, label, null))
       updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
       continue
     }

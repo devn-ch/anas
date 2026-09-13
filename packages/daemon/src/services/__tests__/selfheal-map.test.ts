@@ -692,6 +692,91 @@ describe('selfheal mapping — the extent tree (selfheal.8)', () => {
     )
   })
 
+  /**
+   * Fourth pass — the other half of the cap: a leaf holding NONE of the
+   * inode's items used to end the scan only when something had already been
+   * found (`found.length > 0`). A file truncated or rewritten since the scrub
+   * holds none of its old EXTENT_DATA items anywhere, so the scan walked all
+   * four leaves and threw "owner scan truncated" over what is a real end —
+   * the honest "no extent of this file covers the reported stripe" the
+   * attribution turns into an `unidentified` reason.
+   *
+   * SYNTHETIC tree (not a capture): a level-1 fs tree of five leaves, every
+   * item in them belonging to a DIFFERENT inode (258) — for inode 257 the
+   * scan is empty everywhere, and the cap is reachable only if emptiness does
+   * not end the walk.
+   */
+  it('a scan whose leaves hold none of the inode\'s items returns [] — it does not refuse', async () => {
+    const EXTENT = 13631488
+    const RAM = 33554432
+    const leafBlock = (n: number): number => 40000 + n * 16
+    /** Two items per leaf, all of them inode 258's — none of them 257's. */
+    const leaf = (n: number): string => [
+      'btrfs-progs v6.14',
+      `leaf ${leafBlock(n)} items 2 free space 100 generation 11 owner 256`,
+      ...[0, 1].flatMap((k) => {
+        const fileOffset = (n * 2 + k) * 131072
+        return [
+          `\titem ${k} key (258 EXTENT_DATA ${fileOffset}) itemoff 16230 itemsize 53`,
+          '\t\tgeneration 11 type 1 (regular)',
+          `\t\textent data disk byte ${EXTENT + n} nr ${RAM}`,
+          `\t\textent data offset ${fileOffset} nr 131072 ram ${RAM}`,
+          '\t\textent compression 0 (none)',
+        ]
+      }),
+      '',
+    ].join('\n')
+    const node = [
+      'btrfs-progs v6.14',
+      'node 30000 level 1 items 5 generation 11 owner 256',
+      ...Array.from({ length: 5 }, (_, n) => `\tkey (258 EXTENT_DATA ${n * 262144}) block ${leafBlock(n)} gen 11`),
+      '',
+    ].join('\n')
+    const extentLeaf = [
+      'btrfs-progs v6.14',
+      'leaf 20000 items 1 free space 100 generation 11 owner EXTENT_TREE',
+      `\titem 0 key (${EXTENT} EXTENT_ITEM ${RAM}) itemoff 16230 itemsize 53`,
+      '\t\trefs 1 gen 11 flags DATA',
+      '\t\t(178 0xdea30de73813529) extent data backref root 256 objectid 257 offset 0 count 1',
+      '',
+    ].join('\n')
+
+    const executor = new MockExecutor()
+    const block = (bytenr: number, text: string): void => {
+      executor.addFixture({
+        command: '/usr/bin/btrfs',
+        args: ['inspect-internal', 'dump-tree', '-b', String(bytenr), '/dev/loop0'],
+        result: { stdout: text, stderr: '', exitCode: 0 },
+      })
+    }
+    block(20000, extentLeaf)
+    block(30000, node)
+    for (let n = 0; n < 5; n++)
+      block(leafBlock(n), leaf(n))
+
+    const ctx = {
+      mountpoint: '/mnt/empty',
+      srcDevice: '/dev/loop0',
+      bands: [],
+      roots: { chunk: 1, csum: 2, extent: 20000, bySubvolume: new Map([[256, 30000]]) },
+      chunks: [],
+      csums: [],
+    }
+    assert.deepEqual(
+      await extentsForStripe(executor, ctx, 256, 257, EXTENT),
+      [],
+      'an empty owner scan is a complete answer here, not a truncation',
+    )
+    // …and the walk ENDED: the first leaf's emptiness is ambiguous (the
+    // descent can land a leaf short of the search key), but the second leaf's
+    // is not — only the node and the first TWO leaves were read, not all four
+    // of the cap.
+    const fsBlocks = executor.calls
+      .filter(c => c.command === '/usr/bin/btrfs' && Number(c.args[3]) >= 30000)
+      .map(c => Number(c.args[3]))
+    assert.deepEqual(fsBlocks, [30000, 40000, 40016], `the scan stopped at the second leaf (${fsBlocks.join(', ')})`)
+  })
+
   it('names no extent where this file owns none — and refuses a foreign subvolume', async () => {
     const executor = treeExecutor()
     const ctx = compressedRigContext()

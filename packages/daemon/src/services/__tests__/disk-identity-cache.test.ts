@@ -500,4 +500,61 @@ describe('DiskIdentityCache — smartctl never wakes a sleeping disk', () => {
     assert.ok(cache.getCached('ata-A'))
     assert.ok(cache.getCached('ata-B'))
   })
+
+  it('(p) one fallback disk does not veto pruning for the rest of the fleet (fourth pass)', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdb'], result: normalResult() })
+    executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdc'], result: normalResult() })
+    executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdd'], result: normalResult() })
+    const cache = new DiskIdentityCache(executor)
+
+    await cache.loadMany([
+      { id: 'ata-A', path: '/dev/sdb' },
+      { id: 'ata-B', path: '/dev/sdc' },
+    ])
+    assert.ok(cache.getCached('ata-A'))
+    assert.ok(cache.getCached('ata-B'))
+
+    // The by-id listing came back EMPTY (T3, unchanged): the route passes
+    // prunable: false with no presentIds — nothing prunes. sdd's identity is
+    // taken under its fallback kernel id, the only name such a pass has.
+    await cache.loadMany(
+      [
+        { id: 'sdb', path: '/dev/sdb' },
+        { id: 'sdd', path: '/dev/sdd' },
+      ],
+      { prunable: false },
+    )
+    assert.ok(cache.getCached('ata-A'), 'an empty by-id listing still names no fleet')
+    assert.ok(cache.getCached('ata-B'))
+
+    // Now the listing is HEALTHY, but sdd has no by-id symlink (virtio without
+    // a serial, some USB bridges) and falls back to its kernel name every
+    // pass. The old route gate (`disks.every(d => byIdMap.has(d.name))`) read
+    // that ONE fallback as "the list cannot name the fleet" and pruning never
+    // ran again — the cache grew without bound for the daemon's lifetime. The
+    // gate is the LISTING; only ids that resolved through by-id count as
+    // present, so the by-id fleet prunes normally — and a STILL-LISTED
+    // fallback key is exactly the kind of entry that goes stale, so it does
+    // not linger either.
+    const pass = () => cache.loadMany(
+      [
+        { id: 'ata-A', path: '/dev/sdb' },
+        { id: 'sdd', path: '/dev/sdd' },
+      ],
+      { prunable: true, presentIds: ['ata-A'] },
+    )
+    await pass()
+    assert.ok(cache.getCached('ata-B'), 'one absent pass beside a fallback disk: still kept')
+    await pass()
+    assert.ok(cache.getCached('ata-B'), 'two absent passes: still kept')
+    await pass()
+    assert.equal(cache.getCached('ata-B'), null, 'three trusted absent passes: dropped, fallback disk notwithstanding')
+    assert.ok(cache.getCached('ata-A'), 'the disk the listing names by id is untouched')
+    // The fallback key's fate is only observable through its probes: dropped
+    // at the third pass, re-measured in the same pass. Under the old shape
+    // (presence = the whole list) its measured entry was cached for ever.
+    const sddProbes = executor.calls.filter(c => c.command === SMARTCTL && c.args.includes('/dev/sdd')).length
+    assert.equal(sddProbes, 2, 'the fallback entry was dropped and re-measured, not cached for ever')
+  })
 })
