@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { isSmartctlStandby, parseSmartctl, standbySmartData } from '../smartctl.js'
+import { isSmartctlProbeFailure, isSmartctlStandby, parseSmartctl, standbySmartData } from '../smartctl.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/system')
@@ -132,6 +132,72 @@ describe('isSmartctlStandby', () => {
 
   it('exit 2 + non-JSON stdout without the power-mode message → false', () => {
     assert.equal(isSmartctlStandby({ stdout: 'Device open failed', stderr: 'unable to open /dev/sdb', exitCode: 2 }), false)
+  })
+})
+
+describe('isSmartctlProbeFailure', () => {
+  it('a synthesized smartctl 7.5 "open device failed" document → true', () => {
+    // The document smartctl --json emits when it cannot open the device:
+    // VALID JSON, exit bit 1, a severity 'error' message, and no device
+    // fields at all. The envelope mirrors smartctl-standby-skip.json; the
+    // message is smartctl's own `jerr("Smartctl open device: %s failed: %s")`
+    // line (severity 'error').
+    const doc = loadFixture('smartctl-open-device-failed.json')
+    assert.equal(isSmartctlProbeFailure(doc), true)
+  })
+
+  it('an open-failed document is NOT a standby skip (the caller checks that first)', () => {
+    const doc = loadFixture('smartctl-open-device-failed.json')
+    assert.equal(isSmartctlStandby({ stdout: JSON.stringify(doc), exitCode: 2 }), false, 'no power-mode message — not a skip')
+    assert.equal(isSmartctlProbeFailure(doc), true, '…and it IS a failure')
+  })
+
+  it('exit bit 1 with no device identity → true', () => {
+    assert.equal(isSmartctlProbeFailure({ smartctl: { exit_status: 2 } }), true)
+  })
+
+  it('a severity error message → true', () => {
+    assert.equal(
+      isSmartctlProbeFailure({ smartctl: { messages: [{ string: 'Smart Read Error Log failed: I/O error', severity: 'error' }] } }),
+      true,
+    )
+  })
+
+  it('no device fields at all → true', () => {
+    assert.equal(isSmartctlProbeFailure({ json_format_version: [1, 0] }), true)
+  })
+
+  it('a measured document → false', () => {
+    assert.equal(
+      isSmartctlProbeFailure({
+        smartctl: { exit_status: 0 },
+        device: { name: '/dev/sdb' },
+        model_name: 'WDC WD2003FZEX-00SRLA0',
+        serial_number: 'WD-123456789',
+      }),
+      false,
+    )
+  })
+
+  it('a dying-but-readable disk (exit 1, smart_status failed, full identity, no error message) → false', () => {
+    // The "overall-health ... FAILED" line lands in the document's `output`,
+    // not in smartctl.messages — a failing disk is still MEASURED, so its
+    // smartHealthy: false reaches the payload instead of being classified as
+    // a probe failure.
+    assert.equal(
+      isSmartctlProbeFailure({
+        smartctl: { exit_status: 1, messages: [{ string: 'SMART overall-health self-assessment test result: FAILED!', severity: 'information' }] },
+        smart_status: { passed: false },
+        device: { name: '/dev/sdb' },
+        model_name: 'WDC WD2003FZEX-00SRLA0',
+        serial_number: 'WD-123456789',
+      }),
+      false,
+    )
+  })
+
+  it('a SMART-unsupported disk with identity (the QEMU fixture) → false', () => {
+    assert.equal(isSmartctlProbeFailure(loadFixture('smartctl.json')), false)
   })
 })
 

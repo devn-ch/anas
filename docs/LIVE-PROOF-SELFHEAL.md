@@ -1016,8 +1016,6 @@ F2+F8 — uninstall removes ALL FOUR ANAS unit families (`anas-snap-*`, `anas-ba
 
 F9 — a vanished scrub job (404) ends the wait after 3 consecutive confirmations (~30 s: a job id is a randomUUID and cannot come back) with a "job vanished (daemon restarted?) — moving to the next pool" journald line, instead of blocking pools 2..n for the old 24 h backstop; the transport-outage handling keeps its own bounded retry, and other non-200s count as outage, not vanish.
 
-### Third pass
-
 Third review of the same schedule/packaging surface (`de17ed1..13cb6b3`, 2026-09-13), all fixed at the
 source with a regression test that fails on the old code and passes on the new one.
 
@@ -1052,3 +1050,46 @@ source with a regression test that fails on the old code and passes on the new o
   (`unlinkQuiet`, `runSystemctl`, the hand-rolled marker regex, the unit-dir listing/reads) now come
   from `systemd-unit-store.ts` like the other three stores; the marker regex is byte-identical
   (`markerRegex('X-ANAS-Task=')`), behaviour unchanged. *(`replication-units.test.ts` green unchanged.)*
+
+A third review of `de17ed1..13cb6b3` (the disk-identity cache) found three more, all fixed at
+the source with a regression test that fails on the old code and passes on the new one, plus the
+bounded probe retry the review asked for. One new fixture, `smartctl-open-device-failed.json` —
+SYNTHESIZED in the real 7.5 shape (the envelope mirrors `smartctl-standby-skip.json`; the message
+is smartctl's own `jerr("Smartctl open device: %s failed: %s")` line), labeled as such in
+`disk-identity-cache.test.ts`.
+
+- **T1 — a failed probe is classified FROM THE DOCUMENT, not from a parse error.** smartctl
+  `--json` emits a VALID document on an open failure (exit bit 1, a severity 'error' message, no
+  device fields), and the executor resolves on a non-zero exit — so the round-2 `error` branch
+  (parse-throw only) never fired: a real failure came back as a MEASURED all-null identity,
+  overwrote the good one, and cached as a hit for the daemon's lifetime. `isSmartctlProbeFailure`
+  now classifies the parsed document — no device identity, or `smartctl.exit_status & 2`, or a
+  severity 'error' message — with standby checked FIRST (a sleeping disk is still a skip) and a
+  dying-but-readable disk still measured (its FAILED line lands in the document's `output`, not
+  in `smartctl.messages`). *(`smartctl.test.ts` for the classifier — including the QEMU
+  SMART-unsupported fixture and the dying-disk case; `disk-identity-cache.test.ts` (l)/(m):
+  open-failed after a good reading keeps the measured identity, `stale: 'probe-failed'`,
+  re-probed; on a never-measured disk the plain unknown; the standby document is still a
+  standby.*)
+- **T3 — prune only on a list that can name the fleet, and only after repeated absence.** One
+  empty `ls /dev/disk/by-id/` made every id fall back to serial/kernel name and pruned the WHOLE
+  cache, sleeping disks' preserved identities included. `collectDisks` now passes the list as
+  prunable or not (prunable = every disk's kernel name is in the by-id map), an empty list never
+  prunes, and an entry is dropped only after 3 consecutive passes of absence from a trustworthy
+  list. *(`disk-identity-cache.test.ts` (k)/(o): empty enumeration prunes nothing, one-pass
+  absence kept, three-pass absence dropped; a degraded enumeration (kernel-name fallback) keeps
+  the fleet intact across the glitch and the next healthy pass.*)
+- **T10 — `stale` is only ever over a REAL reading.** A probe failure on a never-measured disk
+  reported `stale: true` over an empty/standby placeholder — "last known" about a reading that
+  never happened. `stale` is set only when a measured entry exists; the never-measured case keeps
+  `staleReason: 'probe-failed'` (the re-probe duty) without the mark, so the payload is the plain
+  unmarked unknown. *(`disk-identity-cache.test.ts` (i)/(m); `disks-stale-health.test.ts`: the
+  standby→failure payload is unmarked at every step, marked only once a measured reading exists.*)
+- **The probe retry is bounded.** A failing disk was re-probed on EVERY pass with no limit. Each
+  consecutive failure now delays the next attempt 1, 2, 4, … passes, capped at 8; any answering
+  probe (standby or measured) clears it. This supersedes the round-2 "a never-answering disk is
+  cached and not re-probed at all" for the FIRST failure — a transient first failure (a udev race
+  at boot) no longer blanks the disk for the daemon's lifetime, and a dead path costs at most one
+  cheap probe per 8 passes. *(`disk-identity-cache.test.ts` (n): the 1, 2, 4, 8, 8 sequence over
+  17 passes; (h)/(i) the backoff inside the first-failure and standby→failure→recovery stories;
+  `disks-stale-health.test.ts` the same at the payload level.*)

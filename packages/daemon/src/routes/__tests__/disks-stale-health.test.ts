@@ -112,7 +112,7 @@ describe('GET /v1/disks — stale/standby health is marked in the payload', () =
     assert.equal(disk.smartStaleReason, undefined)
   })
 
-  it('a first-ever probe failure is the plain unknown, unmarked', async () => {
+  it('a first-ever probe failure is the plain unknown, unmarked — and the retry is alive, bounded', async () => {
     const { fetch, smartCallCount } = world([
       failureResult(),
       { stdout: NORMAL_IDENTITY_JSON, stderr: '', exitCode: 0 },
@@ -123,12 +123,17 @@ describe('GET /v1/disks — stale/standby health is marked in the payload', () =
     assert.equal(disk.healthStatus, 'unknown')
     assert.equal(disk.smartStale, undefined, 'no prior reading — nothing to call stale')
 
-    // cached as before: a never-answering disk is not re-probed every pass
-    await fetch()
-    assert.equal(smartCallCount(), 1)
+    // failure 1 waits one pass: the next fetch probes again, and the disk
+    // answers — a transient first failure must not blank the disk for the
+    // daemon's lifetime
+    const recovered = await fetch()
+    assert.equal(recovered.modelFamily, 'Western Digital Red Pro')
+    assert.equal(recovered.smartHealthy, true)
+    assert.equal(recovered.smartStale, undefined)
+    assert.equal(smartCallCount(), 2)
   })
 
-  it('a seen disk whose probe fails is reported stale, re-probed, and recovers', async () => {
+  it('a seen disk whose probe fails is reported, re-probed with backoff, and recovers', async () => {
     const { fetch, smartCallCount } = world([
       standbyResult(),
       failureResult(),
@@ -142,21 +147,29 @@ describe('GET /v1/disks — stale/standby health is marked in the payload', () =
     assert.equal(asleep.smartHealthy, null)
     assert.equal(asleep.smartStale, undefined)
 
-    // 2 — the probe failed: the reading is last known, marked, and the disk
-    //    was re-probed (a standby reading is not a cache hit).
+    // 2 — the probe failed: nothing was ever measured, so the payload is the
+    //    plain unknown — UNMARKED ("last known" would be a claim about a
+    //    reading that never happened). The disk IS re-probed (a standby
+    //    reading is not a cache hit).
     const failed = await fetch()
-    assert.equal(failed.smartStale, true)
-    assert.equal(failed.smartStaleReason, 'probe-failed')
-    assert.equal(failed.smartHealthy, null, 'nothing was ever measured — the unknown stands, marked')
+    assert.equal(failed.smartStale, undefined, 'nothing was ever measured — nothing to call stale')
+    assert.equal(failed.smartStaleReason, undefined)
+    assert.equal(failed.smartHealthy, null, 'nothing was ever measured — the unknown stands, unmarked')
     assert.equal(smartCallCount(), 2)
 
-    // 3 — the failure is NOT a permanent cache entry: the next pass probes again
+    // 3 — failure 1 waited one pass: the next fetch probes again, and it
+    //    fails again — still the plain unknown, still re-probing
     const failedAgain = await fetch()
-    assert.equal(failedAgain.smartStale, true)
-    assert.equal(failedAgain.smartStaleReason, 'probe-failed')
+    assert.equal(failedAgain.smartStale, undefined)
+    assert.equal(failedAgain.smartStaleReason, undefined)
     assert.equal(smartCallCount(), 3)
 
-    // 4 — smartctl answers: a fresh measured reading, the marks gone
+    // 4 — failure 2 waits two passes: this fetch does not probe
+    const waiting = await fetch()
+    assert.equal(waiting.smartHealthy, null)
+    assert.equal(smartCallCount(), 3, 'backoff — a disk that keeps failing is not probed on every pass')
+
+    // 5 — smartctl answers: a fresh measured reading, the marks gone
     const recovered = await fetch()
     assert.equal(recovered.modelFamily, 'Western Digital Red Pro')
     assert.equal(recovered.smartHealthy, true)

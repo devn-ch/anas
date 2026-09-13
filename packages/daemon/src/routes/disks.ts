@@ -225,8 +225,17 @@ export async function collectDisks(
 
   const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
 
-  // Lazy-load identity cache for all disks in parallel
-  await diskIdentityCache.loadMany(disks.map(d => ({ id: d.id, path: d.path })))
+  // Lazy-load identity cache for all disks in parallel. The list doubles as
+  // the topology refresh, which may prune entries — but only when it can
+  // name the fleet: if the by-id listing came back empty or failed, every
+  // disk id fell back to serial/kernel name, and pruning on such a list
+  // would drop EVERY entry (the sleeping disks' preserved identities
+  // included).
+  const enumerationPrunable = disks.every(d => byIdMap.has(d.name))
+  await diskIdentityCache.loadMany(
+    disks.map(d => ({ id: d.id, path: d.path })),
+    { prunable: enumerationPrunable },
+  )
 
   // Enrich each disk with cached identity, ZFS context, and derived health.
   return disks.map((d) => {

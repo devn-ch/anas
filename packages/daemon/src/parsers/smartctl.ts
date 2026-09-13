@@ -71,6 +71,41 @@ export function isSmartctlStandby(result: { stdout: string, stderr?: string, exi
   return false
 }
 
+/**
+ * Classify a PARSED `smartctl --json` document as a probe FAILURE.
+ *
+ * smartctl emits a VALID document even when the probe failed: for an open
+ * failure it exits with bit 1 set (`-n standby` never got to the power-mode
+ * check) and reports the failure in `smartctl.messages` with
+ * `severity: 'error'` — and carries no device fields at all. The executor
+ * RESOLVES on a non-zero exit (it does not throw), so the document reaches
+ * the caller as a successful parse, and a "measured" identity built from it
+ * is all null: cache it as a hit and the disk's model/serial/health is
+ * blank for the daemon's lifetime.
+ *
+ * The caller checks {@link isSmartctlStandby} FIRST: a standby skip also
+ * exits with bit 1, and only what is neither a skip nor a measurement is
+ * classified here. A disk that measures fine but FAILS its SMART check
+ * (exit 1, `smart_status.passed: false`) is NOT a probe failure — the
+ * "overall-health ... FAILED" line lands in the document's `output`, not in
+ * `smartctl.messages`, so a dying-but-readable disk is still measured.
+ */
+export function isSmartctlProbeFailure(data: {
+  smartctl?: { exit_status?: number, messages?: Array<{ string?: string, severity?: string }> }
+  device?: { name?: string }
+  model_name?: string
+  serial_number?: string
+  [key: string]: unknown
+}): boolean {
+  const smartctl = data.smartctl
+  if (smartctl?.exit_status != null && (smartctl.exit_status & 2) !== 0)
+    return true
+  if (smartctl?.messages?.some(m => m.severity === 'error'))
+    return true
+  // No device identity at all — the probe got nothing back.
+  return !data.device && !data.model_name && !data.serial_number
+}
+
 /** The SmartData payload for a disk we refused to wake: placeholders + the standby flag. */
 export function standbySmartData(): SmartData {
   return {

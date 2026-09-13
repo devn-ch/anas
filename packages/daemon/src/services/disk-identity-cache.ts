@@ -6,7 +6,7 @@
  */
 
 import type { CommandExecutor } from '../executor/types.js'
-import { isSmartctlStandby } from '../parsers/smartctl.js'
+import { isSmartctlProbeFailure, isSmartctlStandby } from '../parsers/smartctl.js'
 
 export interface DiskIdentity {
   /** Human-readable model family, e.g. "Western Digital Red Pro" */
@@ -19,7 +19,7 @@ export interface DiskIdentity {
   firmwareVersion: string | null
   /** Interface/protocol, e.g. "SATA 3.2, 6.0 Gb/s" */
   interface: string | null
-  /** Whether TRIM is available (SSDs) */
+  /** Whether TRIM is available (SSD) */
   trimSupport: boolean
   /** SMART health: true=passed, false=failed, null=not supported/unknown */
   smartHealthy: boolean | null
@@ -30,36 +30,69 @@ export interface DiskIdentity {
    */
   standby?: boolean
   /**
-   * The reported identity is the LAST KNOWN one, not a fresh reading: the disk
-   * was asleep when read (`staleReason: 'standby'`) or the probe failed
-   * (`staleReason: 'probe-failed'`). Only meaningful with a prior reading — a
-   * never-seen standby disk carries `standby` without `stale` (there is no
-   * prior reading to be stale relative to).
+   * The reported identity is the LAST MEASURED one, not a fresh reading: the
+   * disk has a measured reading, and this pass was a standby skip
+   * (`staleReason: 'standby'`) or the probe failed
+   * (`staleReason: 'probe-failed'`). Never set on a disk that was never
+   * measured — there is no reading to be stale relative to; its
+   * `staleReason` then carries only the re-probe duty.
    */
   stale?: boolean
-  /** Why the reading is stale — it was a standby skip, or the probe failed. */
+  /**
+   * Why the reading is not a fresh measurement — it was a standby skip, or
+   * the probe failed. Also carried by a never-measured disk whose probe
+   * failed, where it is what keeps the re-probes alive, with no `stale`.
+   */
   staleReason?: 'standby' | 'probe-failed'
 }
+
+/**
+ * Bounded re-probe state per failing disk. Each consecutive failure delays
+ * the next attempt by 2^(failures-1) passes, capped — a disk that fails
+ * forever must not be probed on every pass, nor never: the first failure of
+ * a disk that later answers must not blank it for the daemon's lifetime.
+ * Any answering probe (a standby skip or a measurement) clears it.
+ */
+interface ProbeBackoff {
+  failures: number
+  /** Passes to wait before the next attempt. */
+  skip: number
+}
+
+const MAX_PROBE_BACKOFF_PASSES = 8
+
+function probeBackoffSkip(failures: number): number {
+  return Math.min(2 ** (failures - 1), MAX_PROBE_BACKOFF_PASSES)
+}
+
+/**
+ * A device that has left the topology is dropped only after this many
+ * CONSECUTIVE passes of absence from a trustworthy enumeration — one empty
+ * `ls /dev/disk/by-id/` must not cost the fleet its identities.
+ */
+const PRUNE_AFTER_ABSENT_PASSES = 3
 
 export class DiskIdentityCache {
   /**
    * The last MEASURED identity per disk (an awake reading). A standby reading
    * never touches it — the disk may sleep for days under the spindown policy
    * and its measured identity stays the truth to report in the meantime. A
-   * failed probe touches it only when the disk was never measured (the
-   * unknown, cached so a never-answering disk is not re-probed every pass);
-   * a disk WITH a measured identity reports that identity, stale, and is
-   * re-probed on every pass until it answers again.
+   * failed probe never touches it either: it is not a measurement, and
+   * `stale` is reported only over a real entry here.
    */
   private measured = new Map<string, DiskIdentity>()
   /**
    * The latest reading to REPORT per disk: the measured identity, the measured
    * identity marked `standby` + `stale`, the last reading marked
-   * `stale: 'probe-failed'` after a failed probe, or (a disk never seen awake)
-   * placeholders marked `standby` with no health claim.
+   * `stale: 'probe-failed'` after a failed probe on a measured disk, or a
+   * placeholder (never seen awake) with no health claim.
    */
   private reading = new Map<string, DiskIdentity>()
   private pending = new Map<string, Promise<DiskIdentity>>()
+  /** Bounded re-probe state per disk — see ProbeBackoff. */
+  private backoff = new Map<string, ProbeBackoff>()
+  /** Consecutive passes a key has been absent from a TRUSTWORTHY enumeration. */
+  private absentPasses = new Map<string, number>()
   private executor: CommandExecutor
 
   constructor(executor: CommandExecutor) {
@@ -74,22 +107,37 @@ export class DiskIdentityCache {
   /**
    * Whether a disk's reading needs a fresh probe: it was never read, the last
    * reading was a standby skip (the disk may have woken), or the last probe
-   * failed (smartctl may work again). A clean measured reading is a cache hit
-   * — the identity does not change for the daemon's lifetime.
+   * failed and its backoff has drained. A clean measured reading is a cache
+   * hit — the identity does not change for the daemon's lifetime.
    */
-  private isDue(reading: DiskIdentity | undefined): boolean {
+  private isDue(diskId: string, reading: DiskIdentity | undefined): boolean {
     if (!reading)
       return true
-    return !!reading.standby || reading.staleReason === 'probe-failed'
+    if (reading.standby)
+      return true
+    if (reading.staleReason === 'probe-failed') {
+      // A failed probe re-probes — but bounded: wait out the backoff.
+      const state = this.backoff.get(diskId)
+      return !state || state.skip <= 0
+    }
+    return false
+  }
+
+  /** One pass has happened for this disk: advance it toward its next attempt. */
+  private tickBackoff(diskId: string): void {
+    const state = this.backoff.get(diskId)
+    if (state && state.skip > 0)
+      state.skip--
   }
 
   /**
    * Get the reading for a disk, re-reading smartctl when the reading is due
-   * (standby skip or failed probe — the disk may have woken or recovered).
+   * (standby skip, or a failed probe whose backoff has drained).
    */
   async get(diskId: string, devicePath: string): Promise<DiskIdentity> {
+    this.tickBackoff(diskId)
     const reading = this.reading.get(diskId)
-    if (reading && !this.isDue(reading))
+    if (reading && !this.isDue(diskId, reading))
       return reading
 
     // Deduplicate concurrent requests for the same disk
@@ -109,28 +157,56 @@ export class DiskIdentityCache {
 
   /**
    * Load readings for multiple disks in parallel. Disks whose reading is due
-   * (standby skip or failed probe) are re-read; measured disks are left alone.
+   * (standby skip, or a failed probe whose backoff has drained) are re-read;
+   * measured disks are left alone.
    *
    * The disk list is also the TOPOLOGY REFRESH: the cache is keyed per device,
    * and a device that has left the fleet must not leave its entries behind
    * (on a box where disks come and go, the maps would otherwise grow without
-   * bound for the daemon's lifetime).
+   * bound for the daemon's lifetime). But a list that cannot name the fleet is
+   * no evidence of departure — see {@link pruneAbsent}.
    */
-  async loadMany(disks: Array<{ id: string, path: string }>): Promise<void> {
-    const present = new Set(disks.map(d => d.id))
-    for (const key of [...this.measured.keys()]) {
-      if (!present.has(key))
-        this.measured.delete(key)
-    }
-    for (const key of [...this.reading.keys()]) {
-      if (!present.has(key))
-        this.reading.delete(key)
-    }
-
-    const due = disks.filter(d => this.isDue(this.reading.get(d.id)))
+  async loadMany(
+    disks: Array<{ id: string, path: string }>,
+    opts: { prunable?: boolean } = {},
+  ): Promise<void> {
+    this.pruneAbsent(disks, opts.prunable !== false)
+    for (const d of disks)
+      this.tickBackoff(d.id)
+    const due = disks.filter(d => this.isDue(d.id, this.reading.get(d.id)))
     if (due.length === 0)
       return
     await Promise.all(due.map(d => this.get(d.id, d.path)))
+  }
+
+  /**
+   * The topology prune. A key is dropped only when the enumeration is
+   * TRUSTWORTHY — non-empty, and able to name every disk it lists (the caller
+   * passes prunable: false when ids fell back to serial/kernel names, which
+   * happens when the by-id listing came back empty) — and the key has been
+   * absent from such a list for PRUNE_AFTER_ABSENT_PASSES consecutive passes.
+   * One empty `ls /dev/disk/by-id/` must not prune the whole cache, sleeping
+   * disks' preserved identities included.
+   */
+  private pruneAbsent(disks: Array<{ id: string }>, prunable: boolean): void {
+    if (!prunable || disks.length === 0)
+      return
+    const present = new Set(disks.map(d => d.id))
+    for (const key of [...this.reading.keys()]) {
+      if (present.has(key)) {
+        this.absentPasses.delete(key)
+        continue
+      }
+      const n = (this.absentPasses.get(key) ?? 0) + 1
+      if (n < PRUNE_AFTER_ABSENT_PASSES) {
+        this.absentPasses.set(key, n)
+        continue
+      }
+      this.reading.delete(key)
+      this.measured.delete(key)
+      this.backoff.delete(key)
+      this.absentPasses.delete(key)
+    }
   }
 
   private async load(diskId: string, devicePath: string): Promise<DiskIdentity> {
@@ -140,7 +216,9 @@ export class DiskIdentityCache {
       // Report the last measured identity marked standby+stale, or a
       // no-claim placeholder if the disk was never seen awake. The measured
       // map is untouched, and this reading is NOT a cache hit: the disk may
-      // wake at any time, so the next pass retries.
+      // wake at any time, so the next pass retries. The disk did ANSWER
+      // (smartctl read its power state), so any re-probe backoff is cleared.
+      this.backoff.delete(diskId)
       const last = this.measured.get(diskId)
       const identity = last
         ? { ...last, standby: true, stale: true, staleReason: 'standby' as const }
@@ -153,29 +231,31 @@ export class DiskIdentityCache {
       // measured identity (one transient smartctl failure blanking
       // model/serial/health for the daemon's lifetime was the bug), and it
       // must not end the re-probes: the reading is not a cache hit, so the
-      // next pass probes again. Report what the disk last had — the measured
-      // identity, else its latest reading — marked stale.
+      // disk is probed again — but BOUNDED, since a disk that fails forever
+      // must not be probed on every pass. Each consecutive failure doubles
+      // the delay (1, 2, 4, … passes, capped).
+      const failures = (this.backoff.get(diskId)?.failures ?? 0) + 1
+      this.backoff.set(diskId, { failures, skip: probeBackoffSkip(failures) })
       const prior = this.reading.get(diskId)
-      if (prior) {
-        const identity = {
-          ...(this.measured.get(diskId) ?? prior),
-          // The power mode is no longer known either — the probe did not get
-          // to report it. Only the staleness stands.
-          standby: false,
-          stale: true,
-          staleReason: 'probe-failed' as const,
-        }
-        this.reading.set(diskId, identity)
-        return identity
+      const last = this.measured.get(diskId)
+      const identity = {
+        ...(last ?? prior ?? emptyIdentity()),
+        // The power mode is no longer known either — the probe did not get
+        // to report it.
+        standby: false,
+        // `stale` is "last known, not current" — a claim only a REAL prior
+        // reading can support. A disk never measured gets the re-probe duty
+        // (staleReason) without the mark: "last known" about a reading that
+        // never happened would be a lie.
+        ...(last
+          ? { stale: true, staleReason: 'probe-failed' as const }
+          : { staleReason: 'probe-failed' as const }),
       }
-      // The FIRST probe of this disk failed: there is no reading to keep, so
-      // there is nothing to blank. The empty identity, cached — a disk that
-      // never answers must not be re-probed every pass (existing behaviour).
-      const identity = emptyIdentity()
-      this.measured.set(diskId, identity)
       this.reading.set(diskId, identity)
       return identity
     }
+    // A fresh measurement: the disk answers, so the backoff is over.
+    this.backoff.delete(diskId)
     this.measured.set(diskId, result.identity)
     this.reading.set(diskId, result.identity)
     return result.identity
@@ -189,9 +269,27 @@ export class DiskIdentityCache {
       // exits without issuing anything that would spin it up. -iH is identity +
       // health check (no full scan), fast.
       const result = await this.executor.exec('/usr/sbin/smartctl', ['-n', 'standby', '-iH', '--json', devicePath])
+      // Standby FIRST: a standby skip also exits with bit 1, so the power-mode
+      // check must win the classification or a sleeping disk reads as a
+      // failure.
       if (isSmartctlStandby(result))
         return { kind: 'standby' }
-      const data = JSON.parse(result.stdout)
+      let data: any
+      try {
+        data = JSON.parse(result.stdout)
+      }
+      catch {
+        // not a document at all — the raw failure text is the only record
+        return { kind: 'error' }
+      }
+      // smartctl --json emits a VALID document on failure too (an open
+      // failure: exit bit 1, a severity 'error' message, no device fields),
+      // and the executor RESOLVES on a non-zero exit — so a real probe
+      // failure arrives here as a "successful" parse. Classify it, or the
+      // all-null identity it would build overwrites a good measured one and
+      // caches as a hit: the disk blank for the daemon's lifetime.
+      if (isSmartctlProbeFailure(data))
+        return { kind: 'error' }
       return {
         kind: 'measured',
         identity: {
@@ -206,7 +304,7 @@ export class DiskIdentityCache {
       }
     }
     catch {
-      // smartctl failed or returned invalid JSON. Report the error — NOT a
+      // smartctl failed (could not even start). Report the error — NOT a
       // measured reading: an empty measured identity would overwrite a good
       // one and cache as a hit, so the disk was never probed again, even once
       // smartctl recovered. load() decides what the error means per disk.

@@ -15,13 +15,21 @@ import { DiskIdentityCache } from '../disk-identity-cache.js'
  * is never a cache hit: the disk may wake at any time, so the next pass
  * retries.
  *
- * A probe FAILURE (smartctl failed or returned invalid JSON) is not a
- * measurement either: it keeps the disk's last known reading, reports it
- * `stale: 'probe-failed'`, and re-probes on the next pass — one transient
- * failure must not blank the identity for the daemon's lifetime or end the
- * re-probes. Only a disk whose FIRST probe ever fails gets the empty
- * `unknown` identity, cached as before (a never-answering disk is not
- * re-probed every pass).
+ * A probe FAILURE is not a measurement either: it keeps the disk's last known
+ * reading and re-probes — one transient failure must not blank the identity
+ * for the daemon's lifetime or end the re-probes. Re-probes are BOUNDED,
+ * though: each consecutive failure doubles the delay (1, 2, 4, … passes,
+ * capped at 8), so a disk that fails forever is not probed on every pass.
+ * `stale` ("last known, not current") is only ever reported OVER A REAL
+ * MEASURED READING — a never-measured disk whose probe fails is the plain
+ * unknown, unmarked.
+ *
+ * Crucially, the failure must be classified FROM THE DOCUMENT, not from a
+ * parse error: smartctl --json emits a VALID document on an open failure
+ * (exit bit 1, a severity 'error' message, no device fields), and the
+ * executor RESOLVES on a non-zero exit — so the document reaches the parser
+ * as a "successful" read. A "measured" identity built from it is all null,
+ * and caching that as a hit would blank the disk and never probe it again.
  */
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -46,6 +54,19 @@ const STANDBY_SKIP_75 = readFileSync(
   'utf-8',
 )
 
+/**
+ * The document smartctl --json emits when it cannot open the device —
+ * SYNTHESIZED in the real 7.5 shape (the envelope mirrors
+ * smartctl-standby-skip.json; the message is smartctl's own
+ * `jerr("Smartctl open device: %s failed: %s")` line, severity 'error',
+ * exit bit 1). A VALID document on a FAILED probe: the all-null-identity
+ * bug's trigger.
+ */
+const OPEN_DEVICE_FAILED_75 = readFileSync(
+  join(__dirname, '../../fixtures/system/smartctl-open-device-failed.json'),
+  'utf-8',
+)
+
 function standbyResult(): { stdout: string, stderr: string, exitCode: number } {
   return {
     stdout: JSON.stringify({
@@ -67,6 +88,11 @@ function failureResult(): { stdout: string, stderr: string, exitCode: number } {
 
 function normalResult() {
   return { stdout: NORMAL_IDENTITY, stderr: '', exitCode: 0 }
+}
+
+/** A real-shape probe failure: VALID JSON, exit bit 1, no device fields. */
+function openFailedResult() {
+  return { stdout: OPEN_DEVICE_FAILED_75, stderr: '', exitCode: 2 }
 }
 
 describe('DiskIdentityCache — smartctl never wakes a sleeping disk', () => {
@@ -196,26 +222,33 @@ describe('DiskIdentityCache — smartctl never wakes a sleeping disk', () => {
     assert.deepEqual(call.args.slice(0, 2), ['-n', 'standby'])
   })
 
-  it('(h) a first-ever probe failure caches the empty identity (unknown), with no marks', async () => {
+  it('(h) a first-ever probe failure is the plain unknown — unmarked, with backoff-bounded retries', async () => {
     const executor = new MockExecutor()
     // No fixture at all → mock's command-not-found (exit 127), invalid JSON.
     const cache = new DiskIdentityCache(executor)
 
     const identity = await cache.get('ata-WDC_A', '/dev/sdb')
     assert.equal(identity.smartHealthy, null)
-    assert.equal(identity.standby, undefined, 'a failure is not a power-mode skip')
+    assert.equal(identity.standby, false, 'a failure is not a power-mode skip')
     assert.equal(identity.stale, undefined, 'there was no prior reading to be stale relative to')
-    assert.equal(identity.staleReason, undefined)
+    assert.equal(identity.staleReason, 'probe-failed', 'the re-probe duty rides on the reason, not the mark')
 
+    // Bounded, not never, not every pass: failure 1 waits one pass, failure 2
+    // waits two. (The old "cached so a never-answering disk is not re-probed
+    // at all" left a transient first failure — a udev race at boot — blanking
+    // the disk for the daemon's lifetime.)
+    const smartCalls = () => executor.calls.filter(c => c.command === SMARTCTL).length
     await cache.get('ata-WDC_A', '/dev/sdb')
-    const smartCalls = executor.calls.filter(c => c.command === SMARTCTL)
-    assert.equal(smartCalls.length, 1, 'a disk that never answers is cached, as before')
+    assert.equal(smartCalls(), 2, 'a failing disk is re-probed — failure 1 waited one pass')
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(), 2, 'failure 2 waits two passes — not probed on every pass')
   })
 
-  it('(i) a probe failure on a seen disk keeps the last known reading, marks it stale, and re-probes', async () => {
+  it('(i) a probe failure on a seen disk keeps the last known reading, backs off, and recovers', async () => {
     const executor = new MockExecutor()
-    // asleep, then a transient failure that STICKS for a pass, then the disk
-    // answers — the failure must neither blank the reading nor end the probes
+    // asleep, then a transient failure that STICKS across passes, then the
+    // disk answers — the failure must neither blank the reading, nor become
+    // an every-pass hammer
     executor.addFixture({
       command: SMARTCTL,
       args: ARGS,
@@ -228,14 +261,19 @@ describe('DiskIdentityCache — smartctl never wakes a sleeping disk', () => {
 
     const failed = await cache.get('ata-WDC_A', '/dev/sdb')
     assert.equal(failed.standby, false, 'the power mode is no longer known — the probe did not get to report it')
-    assert.equal(failed.stale, true, 'the reading is last known, not current')
+    assert.equal(failed.stale, undefined, 'nothing was ever MEASURED — "last known" would be a claim about a reading that never happened')
     assert.equal(failed.staleReason, 'probe-failed')
-    assert.equal(failed.smartHealthy, null, 'nothing was ever measured — the unknown stands, marked')
+    assert.equal(failed.smartHealthy, null, 'nothing was ever measured — the unknown stands, unmarked')
 
     const failedAgain = await cache.get('ata-WDC_A', '/dev/sdb')
-    assert.equal(failedAgain.staleReason, 'probe-failed', 'still stale')
+    assert.equal(failedAgain.staleReason, 'probe-failed', 'still unmarked-failed')
     let smartCalls = executor.calls.filter(c => c.command === SMARTCTL)
-    assert.equal(smartCalls.length, 3, 'a failed probe is not a cache hit — re-probed on the next pass')
+    assert.equal(smartCalls.length, 3, 'failure 1 waited one pass — re-probed on the next')
+
+    // the second failure waits two passes: this pass does not probe
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    smartCalls = executor.calls.filter(c => c.command === SMARTCTL)
+    assert.equal(smartCalls.length, 3, 'backoff — a disk that keeps failing is not probed on every pass')
 
     const recovered = await cache.get('ata-WDC_A', '/dev/sdb')
     assert.equal(recovered.deviceModel, 'WDC WD2003FZEX-00SRLA0', 'once smartctl answers, the identity is measured for real')
@@ -284,7 +322,7 @@ describe('DiskIdentityCache — smartctl never wakes a sleeping disk', () => {
     assert.equal(smartCalls.length, 3, 'probe, failed re-probe, recovered re-probe')
   })
 
-  it('(k) devices that leave the topology are pruned from the cache', async () => {
+  it('(k) a device that leaves the topology is pruned only after three consecutive absent passes', async () => {
     const executor = new MockExecutor()
     executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdb'], result: normalResult() })
     executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdc'], result: normalResult() })
@@ -297,15 +335,169 @@ describe('DiskIdentityCache — smartctl never wakes a sleeping disk', () => {
     assert.ok(cache.getCached('ata-A'), 'both disks loaded')
     assert.ok(cache.getCached('ata-B'))
 
-    // sdc is pulled: the next topology refresh lists only sdb.
+    // sdc is pulled: absent from the next refresh — one pass proves nothing
+    // (a momentary enumeration glitch must not cost the fleet its entries)
     await cache.loadMany([{ id: 'ata-A', path: '/dev/sdb' }])
-    assert.equal(cache.getCached('ata-B'), null, 'the removed device\'s entry is dropped')
-    assert.ok(cache.getCached('ata-A'), 'the surviving device keeps its entry')
+    assert.ok(cache.getCached('ata-B'), 'one absent pass: still kept')
+    await cache.loadMany([{ id: 'ata-A', path: '/dev/sdb' }])
+    assert.ok(cache.getCached('ata-B'), 'two absent passes: still kept')
+    await cache.loadMany([{ id: 'ata-A', path: '/dev/sdb' }])
+    assert.equal(cache.getCached('ata-B'), null, 'three absent passes: dropped')
 
     // The dropped device is re-probed if it comes back — no stale entry lingers.
     await cache.loadMany([{ id: 'ata-B', path: '/dev/sdc' }])
     assert.equal(cache.getCached('ata-B')?.deviceModel, 'WDC WD2003FZEX-00SRLA0')
     const smartCalls = executor.calls.filter(c => c.command === SMARTCTL)
     assert.equal(smartCalls.length, 3)
+  })
+
+  it('(l) an open-failed DOCUMENT after a good reading keeps the measured identity, stale, and re-probes', async () => {
+    // The T1 bug, end to end: the executor RESOLVES on the non-zero exit, so
+    // smartctl's open-failure document (valid JSON, exit bit 1, severity
+    // 'error', no device fields) reached JSON.parse "successfully" and came
+    // back as a MEASURED all-null identity — overwriting the good one and
+    // caching as a hit, so the disk was blank and never probed again.
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: SMARTCTL,
+      args: ARGS,
+      results: [normalResult(), openFailedResult(), openFailedResult(), normalResult()],
+    })
+    const cache = new DiskIdentityCache(executor)
+
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    // A measured reading is a cache hit — the only live path to a failing
+    // probe on a disk WITH a measured entry is through a standby phase, so
+    // drive the re-probe the way the cache would see it (test (j)'s path):
+    const cacheAny = cache as unknown as { reading: Map<string, object> }
+    cacheAny.reading.set('ata-WDC_A', { standby: true })
+
+    const failed = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(failed.deviceModel, 'WDC WD2003FZEX-00SRLA0', 'the measured identity survives the open-failed document')
+    assert.equal(failed.modelFamily, 'Western Digital Red Pro')
+    assert.equal(failed.smartHealthy, true, 'the last measured health survives — never blanked')
+    assert.equal(failed.stale, true, 'a REAL measured reading was taken — this one is last known')
+    assert.equal(failed.staleReason, 'probe-failed')
+    assert.equal(failed.standby, false)
+
+    // failure 1 waited one pass: the disk is probed again — and it fails
+    // again, still keeping the measured identity
+    const failedAgain = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(failedAgain.deviceModel, 'WDC WD2003FZEX-00SRLA0')
+    assert.equal(failedAgain.staleReason, 'probe-failed')
+    let smartCalls = executor.calls.filter(c => c.command === SMARTCTL)
+    assert.equal(smartCalls.length, 3, 'a failed probe is not a cache hit — re-probed')
+
+    // failure 2 waits two passes…
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    smartCalls = executor.calls.filter(c => c.command === SMARTCTL)
+    assert.equal(smartCalls.length, 3, '…and is honored')
+
+    // …and the disk answers: a fresh measured reading, the marks gone
+    const recovered = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(recovered.stale, undefined, 'fresh again once the probe succeeds')
+    assert.equal(recovered.smartHealthy, true)
+    smartCalls = executor.calls.filter(c => c.command === SMARTCTL)
+    assert.equal(smartCalls.length, 4)
+  })
+
+  it('(m) an open-failed document on a never-measured disk is the plain unknown — no stale, retries alive', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: SMARTCTL, args: ARGS, result: openFailedResult() })
+    const cache = new DiskIdentityCache(executor)
+
+    const identity = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(identity.deviceModel, null)
+    assert.equal(identity.smartHealthy, null, 'unknown — and NOT a cached all-null "measurement"')
+    assert.equal(identity.stale, undefined, 'nothing was ever measured — there is no reading to be stale relative to')
+    assert.equal(identity.staleReason, 'probe-failed', 'the re-probe duty, without the mark')
+    assert.equal(identity.standby, false)
+
+    // The old bug: the valid failure document parsed as an all-null MEASURED
+    // identity and cached as a hit — never probed again, even once smartctl
+    // recovered. Now failure 1 waits one pass and the retry is alive.
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    const smartCalls = executor.calls.filter(c => c.command === SMARTCTL)
+    assert.equal(smartCalls.length, 2, 'the retry is alive — bounded, not dead')
+  })
+
+  it('(n) a disk that keeps failing backs off 1, 2, 4, … up to 8 passes between probes', async () => {
+    const executor = new MockExecutor()
+    // asleep once, then failing forever (the last result repeats)
+    executor.addFixture({ command: SMARTCTL, args: ARGS, results: [standbyResult(), failureResult()] })
+    const cache = new DiskIdentityCache(executor)
+
+    const smartCalls = () => executor.calls.filter(c => c.command === SMARTCTL).length
+    async function pass() {
+      await cache.get('ata-WDC_A', '/dev/sdb')
+    }
+
+    await pass() // 1: asleep
+    assert.equal(smartCalls(), 1)
+    await pass() // 2: fails (1) — next attempt 1 pass later
+    assert.equal(smartCalls(), 2)
+    await pass() // 3: fails (2) — next attempt 2 passes later
+    assert.equal(smartCalls(), 3)
+    await pass() // 4: backoff
+    assert.equal(smartCalls(), 3)
+    await pass() // 5: fails (3) — next attempt 4 passes later
+    assert.equal(smartCalls(), 4)
+    await pass() // 6: backoff
+    await pass() // 7: backoff
+    await pass() // 8: backoff
+    assert.equal(smartCalls(), 4)
+    await pass() // 9: fails (4) — next attempt 8 passes later
+    assert.equal(smartCalls(), 5)
+    await pass() // 10: backoff
+    await pass() // 11: backoff
+    await pass() // 12: backoff
+    await pass() // 13: backoff
+    await pass() // 14: backoff
+    await pass() // 15: backoff
+    await pass() // 16: backoff
+    assert.equal(smartCalls(), 5)
+    await pass() // 17: fails (5) — capped at 8
+    assert.equal(smartCalls(), 6)
+  })
+
+  it('(o) an empty or degraded enumeration prunes nothing — the fleet keeps its identities', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdb'], result: normalResult() })
+    executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdc'], result: normalResult() })
+    const cache = new DiskIdentityCache(executor)
+
+    await cache.loadMany([
+      { id: 'ata-A', path: '/dev/sdb' },
+      { id: 'ata-B', path: '/dev/sdc' },
+    ])
+    assert.ok(cache.getCached('ata-A'))
+    assert.ok(cache.getCached('ata-B'))
+
+    // The T3 bug, end to end: ls /dev/disk/by-id/ came back empty for one
+    // pass, so every disk id fell back to the kernel name — pruning on such
+    // a list would drop the WHOLE cache (the sleeping disks' preserved
+    // identities included), and every id would re-fall-back next pass.
+    await cache.loadMany(
+      [
+        { id: 'sdb', path: '/dev/sdb' },
+        { id: 'sdc', path: '/dev/sdc' },
+      ],
+      { prunable: false },
+    )
+    assert.ok(cache.getCached('ata-A'), 'the by-id entries survive a degraded enumeration')
+    assert.ok(cache.getCached('ata-B'))
+
+    // and an empty enumeration (lsblk returned nothing) prunes nothing either
+    await cache.loadMany([])
+    assert.ok(cache.getCached('ata-A'))
+    assert.ok(cache.getCached('ata-B'))
+
+    // the next healthy pass re-establishes the by-id names; the fleet is intact
+    await cache.loadMany([
+      { id: 'ata-A', path: '/dev/sdb' },
+      { id: 'ata-B', path: '/dev/sdc' },
+    ])
+    assert.ok(cache.getCached('ata-A'))
+    assert.ok(cache.getCached('ata-B'))
   })
 })
