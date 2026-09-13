@@ -579,8 +579,15 @@ export function parseExtentTreeItems(dump: string): ExtentTreeItem[] {
  * `[ref.offset, ref.offset + ram_bytes)`, so they are adjacent in key order and
  * a couple of leaves cover them. The cap is what keeps a walk bounded when the
  * tree says something this code did not expect.
+ *
+ * Reaching it is a REFUSAL, never an answer (third pass, T6): a scan cut off
+ * at the cap returns exactly what "there were no more owning items" returns,
+ * and the difference between those two is the difference between a file's
+ * whole extent list and an arbitrary prefix of it. Attribution would name a
+ * subset of the bad blocks as if it were all of them, and a repair would be
+ * handed a partial list with nothing to say the rest existed.
  */
-const MAX_OWNER_LEAVES = 4
+export const MAX_OWNER_LEAVES = 4
 
 /**
  * The EXTENT_DATA items of one file that reference ONE on-disk extent.
@@ -604,7 +611,9 @@ const MAX_OWNER_LEAVES = 4
  * item, in that same leaf. The scan stopped on iteration two and
  * `MAX_OWNER_LEAVES` never did anything (second-pass review F7). It now steps
  * to the genuinely next leaf through the recorded descent path, still bounded
- * by that cap.
+ * by that cap — and EXHAUSTING the cap throws {@link SelfhealMapError} rather
+ * than returning the prefix it had reached, which is indistinguishable from a
+ * complete answer (third pass, T6).
  */
 async function extentsReferencing(
   executor: CommandExecutor,
@@ -617,13 +626,21 @@ async function extentsReferencing(
   const found: ExtentItem[] = []
   // Learned from the first match: no owning item starts past ref.offset + ram.
   let limit: number | null = null
+  /**
+   * The scan reached an END — the inode's items ran out, the learned limit was
+   * passed, or the tree had no next leaf. False when only the cap stopped it,
+   * which is the one exit that does not know whether it saw everything.
+   */
+  let complete = false
   let cursor = await findLeafPath(executor, ctx.srcDevice, fsRoot, extentDataKey(inode, refOffset))
   for (let leaves = 0; leaves < MAX_OWNER_LEAVES; leaves++) {
     const items = parseExtentItems(cursor.text, inode)
     // Past this inode's items entirely — key order puts every EXTENT_DATA item
     // of one inode together, so a leaf with none of them ends the scan.
-    if (items.length === 0 && found.length > 0)
+    if (items.length === 0 && found.length > 0) {
+      complete = true
       break
+    }
     let last: number | null = null
     for (const item of items) {
       last = Math.max(last ?? 0, item.fileOffset)
@@ -633,12 +650,21 @@ async function extentsReferencing(
         found.push(item)
       limit = Math.max(limit ?? 0, refOffset + (item.ram ?? item.length ?? 0))
     }
-    if (limit !== null && last !== null && last >= limit)
+    if (limit !== null && last !== null && last >= limit) {
+      complete = true
       break
+    }
     const next = await nextLeaf(executor, ctx.srcDevice, cursor)
-    if (next === null)
+    if (next === null) {
+      complete = true
       break
+    }
     cursor = next
+  }
+  if (!complete) {
+    throw new SelfhealMapError(
+      `owner scan truncated at ${MAX_OWNER_LEAVES} leaves — the items referencing extent ${extentLogical} for inode ${inode} do not end within the bound, so the ${found.length} found so far are a prefix, not this file's extents in that stripe`,
+    )
   }
   return found
 }

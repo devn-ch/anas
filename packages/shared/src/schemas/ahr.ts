@@ -642,8 +642,27 @@ export const AhrScrubFinding = z.object({
    * only holds when the probe knew where to look.
    */
   unidentified: z.boolean().optional(),
-  /** Why the block could not be named — the operator's reason, verbatim. */
+  /**
+   * Why the block could not be named — the operator's reason, verbatim.
+   *
+   * Present WITH a non-empty `badBlocks` too: the blocks named are real, and
+   * the reason says why the rest of the file's stripes named none.
+   */
   reason: z.string().optional(),
+  /**
+   * At least one stripe of this file was probed WITHOUT the mapping — at the
+   * offset the kernel printed, because the btrfs-tree chain could not be
+   * followed (selfheal.5's helper unavailable, or a per-stripe resolve error).
+   *
+   * The blocks in `badBlocks` are still real (an EIO at a file offset is an
+   * EIO), but the SEARCH WINDOW is unverified: for a compressed extent the
+   * kernel's offset names the wrong 64 KiB, so bad blocks outside it would not
+   * have been found. Additive and optional — a daemon that knew nothing of it
+   * simply omits it. The UI shows the blocks AND says the window could not be
+   * verified (with `reason`), so a repair of those blocks is not read as a
+   * repair of the whole file.
+   */
+  probedUnverified: z.boolean().optional(),
   /**
    * The path does not exist any more (deleted between the scrub and the probe,
    * or an unresolvable subvolume). The finding is still reported — the kernel

@@ -13,6 +13,7 @@ import {
   geometryFromAttributes,
   locateLogicalIn,
   logicalToLvByte,
+  MAX_OWNER_LEAVES,
   memberOffsetOn,
   parseChunkItems,
   parseDmTable,
@@ -612,6 +613,83 @@ describe('selfheal mapping — the extent tree (selfheal.8)', () => {
     assert.equal(extents.filter(e => e.fileOffset > 6295552).length, 72)
     assert.equal(extents[0].fileOffset, 0)
     assert.equal(Math.max(...extents.map(e => e.fileOffset)), 15732736)
+  })
+
+  /**
+   * T6 (third pass) — exhausting `MAX_OWNER_LEAVES` used to return silently,
+   * and a truncated scan's result is byte-for-byte what "there were no more
+   * owning items" returns. Attribution would then name a PREFIX of the file's
+   * extents as if it were all of them, and a repair offered on that prefix
+   * reads as a repair of the file.
+   *
+   * SYNTHETIC tree (not a capture): a level-1 fs tree whose five leaves each
+   * hold two EXTENT_DATA items of inode 257 pointing at the same 32 MiB
+   * extent, none of them past the learned `ref.offset + ram` limit — so the
+   * only thing that can stop the scan is the cap.
+   */
+  it('refuses a truncated owner scan rather than returning the prefix it reached', async () => {
+    const LEAVES = 5
+    const EXTENT = 13631488
+    const RAM = 33554432
+    const leafBlock = (n: number): number => 40000 + n * 16
+    /** Two owning items per leaf, at ascending file offsets well under RAM. */
+    const leaf = (n: number): string => [
+      'btrfs-progs v6.14',
+      `leaf ${leafBlock(n)} items 2 free space 100 generation 11 owner 256`,
+      ...[0, 1].flatMap((k) => {
+        const fileOffset = (n * 2 + k) * 131072
+        return [
+          `\titem ${k} key (257 EXTENT_DATA ${fileOffset}) itemoff 16230 itemsize 53`,
+          '\t\tgeneration 11 type 1 (regular)',
+          `\t\textent data disk byte ${EXTENT} nr ${RAM}`,
+          `\t\textent data offset ${fileOffset} nr 131072 ram ${RAM}`,
+          '\t\textent compression 0 (none)',
+        ]
+      }),
+      '',
+    ].join('\n')
+    const node = [
+      'btrfs-progs v6.14',
+      `node 30000 level 1 items ${LEAVES} generation 11 owner 256`,
+      ...Array.from({ length: LEAVES }, (_, n) => `\tkey (257 EXTENT_DATA ${n * 262144}) block ${leafBlock(n)} gen 11`),
+      '',
+    ].join('\n')
+    const extentLeaf = [
+      'btrfs-progs v6.14',
+      'leaf 20000 items 1 free space 100 generation 11 owner EXTENT_TREE',
+      `\titem 0 key (${EXTENT} EXTENT_ITEM ${RAM}) itemoff 16230 itemsize 53`,
+      `\t\trefs ${LEAVES * 2} gen 11 flags DATA`,
+      `\t\t(178 0xdea30de73813529) extent data backref root 256 objectid 257 offset 0 count ${LEAVES * 2}`,
+      '',
+    ].join('\n')
+
+    const executor = new MockExecutor()
+    const block = (bytenr: number, text: string): void => {
+      executor.addFixture({
+        command: '/usr/bin/btrfs',
+        args: ['inspect-internal', 'dump-tree', '-b', String(bytenr), '/dev/loop0'],
+        result: { stdout: text, stderr: '', exitCode: 0 },
+      })
+    }
+    block(20000, extentLeaf)
+    block(30000, node)
+    for (let n = 0; n < LEAVES; n++)
+      block(leafBlock(n), leaf(n))
+
+    const ctx = {
+      mountpoint: '/mnt/cap',
+      srcDevice: '/dev/loop0',
+      bands: [],
+      roots: { chunk: 1, csum: 2, extent: 20000, bySubvolume: new Map([[256, 30000]]) },
+      chunks: [],
+      csums: [],
+    }
+    assert.equal(MAX_OWNER_LEAVES, 4, 'the cap this case is built to outrun')
+    await assert.rejects(
+      extentsForStripe(executor, ctx, 256, 257, EXTENT),
+      (err: unknown) => err instanceof SelfhealMapError && /owner scan truncated at 4 leaves/.test((err as Error).message),
+      'the scan refuses instead of handing back the 8 items its 4 leaves held',
+    )
   })
 
   it('names no extent where this file owns none — and refuses a foreign subvolume', async () => {

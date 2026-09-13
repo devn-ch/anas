@@ -947,6 +947,55 @@ negative controls)**.
   overwrites, in a level-1 subvolume tree whose two leaves hold 49 and 72 of them: the scan returns
   121, the pre-fix code returned 49.)*
 
+### Third pass
+
+A third review of the same arc (`de17ed1..13cb6b3`) found four more, fixed at the source with
+regression tests that fail on the old code and pass on the new one. No new captures were needed.
+
+- **T2 — a fast check is proven by the COUNTER, not by `last_sync_action`.** F11's evidence was
+  `last_sync_action = check` alone, and that attribute is PERSISTENT: it reads `check` for ever on
+  any node that has run mdcheck, so "idle + check" is also the resting state of an array nobody
+  touched, and exactly what a check aborted two seconds in by a member failure leaves behind — with
+  a partial or stale `mismatch_cnt` beside it, reported as this scrub's verdict. `mismatch_cnt` and
+  `last_sync_action` are now BOTH snapshotted before the check is issued; md zeroes the counter at a
+  sync start, so a band is counted only when the counter MOVED, `last_sync_action` says `check`, and
+  the array is idle. Short of that the band is "check state unknown — not counted": no rot claimed,
+  no clean bill given. `priorAction` earns its snapshot too — a value that changed under us says md
+  did take a check, which sharpens the unknown wording. *(`ahr-scrub.test.ts`: the aborted shape
+  (counter unchanged at 8) is UNKNOWN and warns nothing; a genuine fast check whose counter was
+  zeroed (8 → 0) is counted and clean; 0 → 8 is counted and warns.)*
+- **T4 — an abandoned band's check is CANCELLED, not left armed.** When the finish-wait gives a band
+  up (frozen, a foreign sync op, the ceiling) it wrote no `idle`, so ANAS's requested check stayed
+  armed while the next band's check was issued — and on thaw two parity checks ran at once across
+  what are very often the same spindles, against §4's strictly-sequential rule. Every abandonment now
+  writes `idle` through `mdadm --action=idle` (the same front door that issued the check, the way
+  `boundedWindowCheck` ends its own bounded one) before the `continue`, best-effort and recorded in
+  the progress line; on a frozen array md refuses it, and the line says the check may still run when
+  it thaws rather than claiming a cancellation that did not happen. *(`ahr-scrub.test.ts`: frozen and
+  recover takeovers and the ceiling each write idle before the next band's check is issued; a frozen
+  band whose idle is refused says so and the scrub carries on.)*
+- **T6 — exhausting the owner-scan cap REFUSES.** F7 made `MAX_OWNER_LEAVES` live, and hitting it
+  returned silently — byte-for-byte what "there were no more owning items" returns. Attribution would
+  name a prefix of a file's extents as if it were the whole set, and a repair offered on that prefix
+  reads as a repair of the file. The scan now tracks whether it reached a real end (the inode's items
+  ran out, the learned `ref.offset + ram` limit was passed, or the tree had no next leaf) and throws
+  `SelfhealMapError("owner scan truncated at 4 leaves …")` otherwise — a mapping abort for the repair
+  path, and an `unidentified` reason for the attribution, which already catches it.
+  *(`selfheal-map.test.ts`: a synthetic level-1 fs tree of five leaves, ten owning items, none past
+  the limit — the scan refuses; pre-fix it handed back the eight items its four leaves held.)*
+- **T7 — an unverified probe window says so on the finding.** With the mapping down F6 probes at the
+  kernel's printed offset, which for a compressed extent names the wrong 64 KiB — so the blocks found
+  are real but the list of them is not known to be complete, and nothing on the finding said that.
+  Worse, `reason` attached only when `badBlocks` was empty, so one lucky stripe of a multi-stripe file
+  erased the reason every other stripe had for finding nothing. `AhrScrubFinding` gains an additive
+  optional `probedUnverified: boolean`, set whenever any stripe of the file was probed without the
+  mapping, and `reason` is now kept alongside a non-empty `badBlocks`. `unidentified` still means "no
+  block could be named at all". The findings window and the notification belong to another lane; what
+  they should render off the pair is stated in the code: the blocks, plus a plain line that the search
+  window could not be verified and why. *(`ahr-scrub.test.ts`: mapping down with one EIO hit →
+  `probedUnverified: true` with the reason kept; mapping up → the field absent; the schema round-trip
+  carries a finding with blocks AND a reason.)*
+
 ### Schedule, UI and packaging lane (R8–R10, GLM)
 
 R8 — mdcheck adoption on upgrade: on daemon start, a node with no `anas-scrub` units, mdcheck enabled and ≥1 AHR pool is adopted onto the timer (all pools, monthly, mdcheck disabled, one audit line); the note distinguishes the legacy mdcheck-only state from a true double; uninstall removes the schedule units and re-enables mdcheck's timers.

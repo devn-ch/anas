@@ -184,6 +184,23 @@ function mappingFixtures(
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'dump-tree', '-b', subvolRoot, device], result: { stdout: selfhealFixture(trees.subvolLeaf), stderr: '', exitCode: 0 } })
 }
 
+/**
+ * Where this scrub ISSUED a band's check — the line every counter read is
+ * judged against. A read before it is the pre-issue snapshot (T2: md zeroes
+ * `mismatch_cnt` at a sync start, so the old value is the only thing that can
+ * prove a new one is new); a read after it is a verdict read.
+ */
+function checkIssuedAt(executor: MockExecutor, device: string): number {
+  return executor.calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' && c.args[1] === device)
+}
+
+/** Every `mismatch_cnt` read for one band, as call indexes. */
+function counterReads(executor: MockExecutor, kernel: string): number[] {
+  return executor.calls
+    .map((c, i) => (c.command === '/usr/bin/cat' && c.args[0] === `/sys/block/${kernel}/md/mismatch_cnt` ? i : -1))
+    .filter(i => i >= 0)
+}
+
 /** The argv `probeFileBlock` (selfheal-io) issues for one file block. */
 function probeArgs(path: string, block: number): string[] {
   return [`if=${path}`, 'iflag=direct', 'bs=4096', `skip=${block}`, 'count=1', 'of=/dev/null', 'status=none']
@@ -273,7 +290,10 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     // still before phase 2 starts. (A later mdstat poll exists — r2's check —
     // and rightly does not gate md127's read.)
     const mdstatPolls = calls.map((c, i) => c.command === '/usr/bin/cat' && c.args[0] === '/proc/mdstat' ? i : -1).filter(i => i >= 0)
-    const cntRead = calls.findIndex(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt')
+    // The FIRST read is the pre-issue snapshot (T2); the verdict is the last.
+    const reads = counterReads(executor, 'md127')
+    assert.ok(reads[0] < checkIssuedAt(executor, '/dev/md/t2-r1'), 'the counter is snapshotted before the check is issued')
+    const cntRead = reads.at(-1)!
     assert.ok(mdstatPolls[1] < cntRead && cntRead < scrubStart, 'the counter is read once the band is idle, before phase 2')
   })
 
@@ -438,7 +458,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
     const calls = executor.calls
     const actionReads = calls.map((c, i) => (c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/sync_action' ? i : -1)).filter(i => i >= 0)
-    const cntRead = calls.findIndex(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt')
+    const cntRead = counterReads(executor, 'md127').at(-1)!
     const scrubStart = calls.findIndex(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start')
     assert.ok(actionReads.length >= 3, `md was polled until it started and again until it ended (saw ${actionReads.length})`)
     assert.ok(actionReads.filter(i => i < cntRead).length >= 3, 'the counter is read only after the check has started AND ended')
@@ -462,9 +482,12 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     const progress: string[] = []
     await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
 
-    assert.ok(
-      !executor.calls.some(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt'),
-      'no counter is read for a check that never ran',
+    // The pre-issue snapshot is read (T2 needs it); nothing is read AFTER the
+    // check was issued, so no number is ever taken as this band's verdict.
+    assert.deepEqual(
+      counterReads(executor, 'md127').filter(i => i > checkIssuedAt(executor, '/dev/md/t2-r1')),
+      [],
+      'no counter is read as the verdict of a check that never ran',
     )
     assert.ok(progress.some(m => m.includes('never started the check on t2-r1')), progress.join(' | '))
     assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'no rot is claimed from a stale number')
@@ -478,10 +501,15 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    * small band a check can run AND complete between `mdadm --action=check`
    * returning and the first poll, which every poll of the start window then
    * reads as idle. That was reported as "never started" and the counter — this
-   * scrub's own verdict — was never read. md's record of what it last RAN is
-   * the evidence.
+   * scrub's own verdict — was never read.
+   *
+   * T2 (third pass) — `last_sync_action` alone is NOT that evidence: it is
+   * persistent, so it reads `check` for ever on any node that has run mdcheck.
+   * The counter is what md moves at a sync start, so a counter that MOVED
+   * since the pre-issue snapshot is the proof, and this is the shape that
+   * carries it.
    */
-  it('a check that finished before the first poll is not "never started" — its counter IS read', async () => {
+  it('a check that finished before the first poll is not "never started" — its MOVED counter is the verdict', async () => {
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
@@ -494,21 +522,27 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       { stdout: 'resync\n', stderr: '', exitCode: 0 },
       { stdout: 'check\n', stderr: '', exitCode: 0 },
     ] })
-    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
+    // md zeroed the counter when it took the check and left 8 behind: the
+    // number MOVED, which is what says this is a new check's count.
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), results: [
+      { stdout: '0\n', stderr: '', exitCode: 0 },
+      { stdout: '8\n', stderr: '', exitCode: 0 },
+    ] })
 
     const progress: string[] = []
     await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
 
     const calls = executor.calls
     const priorRead = calls.findIndex(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/last_sync_action')
-    const issued = calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[1] === '/dev/md/t2-r1')
+    const issued = checkIssuedAt(executor, '/dev/md/t2-r1')
     assert.ok(priorRead >= 0 && priorRead < issued, 'the prior sync action is snapshotted BEFORE the check is issued')
+    assert.ok(counterReads(executor, 'md127')[0] < issued, 'and so is the counter it has to be compared against')
     assert.ok(
-      calls.some(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt'),
+      counterReads(executor, 'md127').some(i => i > issued),
       'the completed check\'s counter is read',
     )
     assert.ok(!progress.some(m => m.includes('never started')), progress.join(' | '))
-    assert.ok(progress.some(m => m.includes('finished before the first poll')), progress.join(' | '))
+    assert.ok(progress.some(m => m.includes('finished before the first poll') && m.includes('counter moved from 0 to 8')), progress.join(' | '))
     // The counter is this check's, so its verdict is reported.
     const warns = calls.filter(c => c.command === '/usr/bin/perl')
     assert.equal(warns.length, 1)
@@ -516,10 +550,83 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   })
 
   /**
+   * T2 (third pass) — the aborted-check shape, which the `last_sync_action`
+   * test alone could not tell from a completed one.
+   *
+   * `last_sync_action` is PERSISTENT: a node that has ever run mdcheck reads
+   * `check` there for ever. So "idle + last_sync_action=check" is also exactly
+   * what a check killed two seconds in by a member failure leaves behind — and
+   * the `mismatch_cnt` sitting beside it is a partial or a stale count.
+   * Reporting it as this scrub's verdict invents rot (or clears real rot).
+   * The counter never moved, so nothing is claimed either way.
+   */
+  it('a check that aborted (idle + a persistent last_sync_action=check, counter unmoved) is UNKNOWN, not a verdict', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
+    // The node ran mdcheck months ago; the attribute has said `check` ever since.
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/last_sync_action'], result: { stdout: 'check\n', stderr: '', exitCode: 0 } })
+    // 8 before, 8 after — an old count, never zeroed, so no sync op ran here.
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
+
+    const progress: string[] = []
+    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+    assert.ok(
+      progress.some(m => m.startsWith('check state unknown on t2-r1 — not counted')),
+      progress.join(' | '),
+    )
+    assert.ok(!progress.some(m => m.includes('finished before the first poll')), progress.join(' | '))
+    assert.equal(
+      executor.calls.filter(c => c.command === '/usr/bin/perl').length,
+      0,
+      'a stale 8 is not this scrub\'s rot — and an unknown band is never reported clean either',
+    )
+    // The scrub goes on: band 2 and phase 2 still run.
+    assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'))
+  })
+
+  /**
+   * T2's other half: the GENUINE fast check. md zeroed the counter when it
+   * took the check and the band came back clean, so 8 → 0 — a move, and
+   * therefore a verdict: counted, and clean.
+   */
+  it('a genuine fast check whose counter was ZEROED is counted — and reported clean', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/last_sync_action'], result: { stdout: 'check\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), results: [
+      { stdout: '8\n', stderr: '', exitCode: 0 },
+      { stdout: '0\n', stderr: '', exitCode: 0 },
+    ] })
+
+    const progress: string[] = []
+    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+    assert.ok(progress.some(m => m.includes('finished before the first poll') && m.includes('counter moved from 8 to 0')), progress.join(' | '))
+    assert.ok(!progress.some(m => m.includes('check state unknown')), progress.join(' | '))
+    assert.equal(
+      executor.calls.filter(c => c.command === '/usr/bin/perl').length,
+      0,
+      'the band was counted and it counted zero mismatches — the stale 8 is not warned about',
+    )
+  })
+
+  /**
    * F3 (second pass) — the finish-wait exited only when mdstat AND sync_action
    * both read idle, so a band that went `frozen` (or was taken over by another
    * sync op) spun the job forever. With the active-job exclusion (R7) that
    * refused every later scrub and repair on the pool until anasd restarted.
+   *
+   * T4 (third pass) — and walking away is not enough. ANAS's `--action=check`
+   * is still ARMED on the band it gave up on, so it has to be taken back
+   * before the next band's check is issued; otherwise both run at once on
+   * shared spindles when the array thaws (§4, strictly sequential).
    */
   for (const takeover of ['frozen', 'recover'] as const) {
     it(`stops waiting on a band whose check became '${takeover}', and checks the next band`, async () => {
@@ -539,17 +646,55 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
 
       assert.equal(result.btrfsErrors, null)
-      assert.ok(
-        !executor.calls.some(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt'),
-        'no counter is read for a band md is not checking for us',
+      assert.deepEqual(
+        counterReads(executor, 'md127').filter(i => i > checkIssuedAt(executor, '/dev/md/t2-r1')),
+        [],
+        'no counter is read as the verdict of a band md is not checking for us',
       )
       assert.ok(progress.includes(`t2-r1 was not checked (sync_action=${takeover}) — md is not running this scrub's check on that band`), progress.join(' | '))
       assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'no rot is claimed from a stale number')
+      // T4: this scrub's check is taken back off the abandoned band BEFORE the
+      // next band's is issued — the two must never run together (§4).
+      const idleAt = executor.calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle' && c.args[1] === '/dev/md/t2-r1')
+      const nextCheck = checkIssuedAt(executor, '/dev/md/t2-r2')
+      assert.ok(idleAt >= 0, 'the abandoned band\'s check is cancelled')
+      assert.ok(idleAt < nextCheck, 'and cancelled before the next band\'s check is issued')
+      assert.ok(progress.some(m => m.includes('this scrub\'s check on t2-r1')), progress.join(' | '))
       // The scrub goes ON: band 2 is checked and phase 2 runs.
-      assert.ok(executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[1] === '/dev/md/t2-r2'))
+      assert.ok(nextCheck >= 0)
       assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'))
     })
   }
+
+  /**
+   * T4, the honest half: md REFUSES `idle` on a frozen array (EBUSY). The
+   * cancel is best-effort — it never fails the scrub — and the progress line
+   * says plainly that the check may still fire when the array thaws, rather
+   * than claiming a cancellation that did not happen.
+   */
+  it('a frozen band that refuses idle is said so — the scrub carries on', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], results: [
+      { stdout: 'check\n', stderr: '', exitCode: 0 },
+      { stdout: 'frozen\n', stderr: '', exitCode: 0 },
+    ] })
+    // mdadm's own refusal, the way md reports it.
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--action=idle', '/dev/md/t2-r1'], result: { stdout: '', stderr: 'mdadm: failed to set action for /dev/md/t2-r1: Device or resource busy', exitCode: 1 } })
+
+    const progress: string[] = []
+    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+    assert.ok(
+      progress.some(m => m.includes('could not drop this scrub\'s check on t2-r1') && m.includes('may still run when it thaws')),
+      progress.join(' | '),
+    )
+    // Best-effort: the refusal never fails the job, and band 2 is still checked.
+    assert.ok(checkIssuedAt(executor, '/dev/md/t2-r2') >= 0)
+    assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'))
+  })
 
   it('a long check is waited out — polled for as long as md says `check`, then the counter', async () => {
     const executor = baseExecutor()
@@ -590,10 +735,16 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
     assert.equal(result.checkedArrays, 2)
     assert.ok(progress.some(m => m.includes('t2-r1 was not checked (sync_action=check) — still not idle after the 5ms ceiling')), progress.join(' | '))
-    assert.ok(
-      !executor.calls.some(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/mismatch_cnt'),
-      'no counter is read for a band whose check never ended',
+    assert.deepEqual(
+      counterReads(executor, 'md127').filter(i => i > checkIssuedAt(executor, '/dev/md/t2-r1')),
+      [],
+      'no counter is read as the verdict of a band whose check never ended',
     )
+    // T4: the ceiling abandons the band with the check still running on it —
+    // so idle goes in before the next band's check is issued.
+    const idleAt = executor.calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle' && c.args[1] === '/dev/md/t2-r1')
+    assert.ok(idleAt >= 0 && idleAt < checkIssuedAt(executor, '/dev/md/t2-r2'), 'the ceiling writes idle before moving on')
+    assert.ok(progress.includes('dropped this scrub\'s check on t2-r1 so it cannot run beside the next band\'s'), progress.join(' | '))
     assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'), 'the job finishes rather than spinning')
   })
 
@@ -1174,6 +1325,19 @@ describe('AhrScrubResult schema (shared, additive)', () => {
           unidentified: true,
           reason: 'no block of the reported stripe read back with an error — the file was rewritten or repaired since the scrub',
         },
+        // T7 — blocks WERE named, in a window the mapping could not verify.
+        // Both facts ride the same finding: `reason` is no longer gated on an
+        // empty `badBlocks`, and `probedUnverified` says the search window
+        // itself is not known to have been the right one.
+        {
+          path: '/mnt/anas-ahr/t2/@data/comp/partial.bin',
+          subvolume: '@data',
+          inode: 261,
+          stripes: [{ logical: 953417728, offset: 0, length: 4096 }],
+          badBlocks: [5],
+          reason: 'extent could not be resolved (btrfs dump-tree -r /dev/t2/t2-vol failed)',
+          probedUnverified: true,
+        },
       ],
       errorsReported: 2,
       errorsAttributed: 2,
@@ -1326,6 +1490,9 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     assert.equal(finding?.compressed, true)
     assert.deepEqual(finding?.extentBlocks, { first: 32, count: 32 })
     assert.equal(finding?.unidentified, undefined)
+    // T7: the mapping resolved the window, so there is nothing to qualify.
+    assert.equal(finding?.probedUnverified, undefined)
+    assert.equal(finding?.reason, undefined)
 
     // The probe read the file's whole extent range — every one of the 16
     // compressed blobs lives inside the one named stripe — and nothing at the
@@ -1363,7 +1530,15 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
    * dropped the probe and voided the WHOLE pool's findings whenever the mapping
    * was unavailable for any reason at all.
    */
-  it('a stripe whose mapping is unavailable is still probed at the kernel offset — a block that EIOs there is real', async () => {
+  /**
+   * T7 (third pass) is the other half of F6: the probe's window was never
+   * verified, and the finding has to SAY so. For a compressed extent the
+   * kernel's offset names the wrong 64 KiB, so bad blocks outside it are
+   * simply not looked for — and `reason` used to be attached only when
+   * `badBlocks` was empty, so one lucky stripe erased the reason every other
+   * stripe of the file had for finding nothing.
+   */
+  it('a stripe whose mapping is unavailable is still probed at the kernel offset — a block that EIOs there is real, and the window is marked unverified', async () => {
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
@@ -1385,6 +1560,10 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     assert.deepEqual(finding?.badBlocks, [5], 'the failing block of the named stripe is reported')
     assert.equal(finding?.compressed, undefined, 'an unresolved stripe claims no compression')
     assert.equal(finding?.unidentified, undefined, 'a block was named, so the finding is not unidentified')
+    // T7: a block WAS found, and the window it was found in is still unverified
+    // — both facts survive, so the list is not read as the whole file's story.
+    assert.equal(finding?.probedUnverified, true)
+    assert.match(finding?.reason ?? '', /extent could not be resolved/)
     // The 16 blocks of the named 64 KiB stripe, and nothing else.
     const dd = executor.calls.filter(c => c.command === '/usr/bin/dd' && c.args[0] === `if=${F}`)
     assert.deepEqual(dd.map(c => c.args[3]), Array.from({ length: 16 }, (_, i) => `skip=${i}`))
@@ -1410,6 +1589,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     assert.deepEqual(finding?.badBlocks, [])
     assert.equal(finding?.unidentified, true)
     assert.match(finding?.reason ?? '', /extent could not be resolved/)
+    assert.equal(finding?.probedUnverified, true, 'the window it looked in was never verified either')
     const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
     assert.ok(body.includes('block not identified'), body)
   })

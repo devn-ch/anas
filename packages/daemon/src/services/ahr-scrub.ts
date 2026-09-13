@@ -27,10 +27,13 @@ import { BTRFS_STRIPE_BYTES, extentsForStripe, resolveContext } from './selfheal
  *      exists, and phase 2 is what names the files. A band md never started is
  *      said so and its counter — which belongs to an earlier check — is not
  *      read at all; a band whose check FINISHED before the first poll is
- *      recognised from `last_sync_action` and its counter IS read; and a band
- *      md froze, or took a resync/recover/reshape on instead, ends its own
- *      wait and is recorded as not checked (the scrub moves to the next band
- *      rather than spinning).
+ *      recognised from `last_sync_action` TOGETHER WITH a `mismatch_cnt` that
+ *      moved (md zeroes the counter at a sync start — `last_sync_action` is
+ *      persistent and proves nothing on its own), and only then is its counter
+ *      the verdict; and a band md froze, or took a resync/recover/reshape on
+ *      instead, has this scrub's check CANCELLED (`--action=idle`, so it
+ *      cannot fire beside the next band's) and is recorded as not checked —
+ *      the scrub moves to the next band rather than spinning.
  *   2. btrfs scrub (start + poll `btrfs scrub status`) — checksums the
  *      filesystem's view of the data — then the ATTRIBUTION pass (story
  *      selfheal.3) names the corrupt files and their failing 4 KiB blocks.
@@ -232,6 +235,50 @@ export async function lastSyncAction(
   kernelName: string,
 ): Promise<string | null> {
   return readSyncAttr(executor, lastSyncActionArgs(kernelName))
+}
+
+/**
+ * Take back the check this scrub asked for on a band it is walking away from
+ * (third pass, T4).
+ *
+ * The finish-wait abandons a band md froze, took another sync op on, or simply
+ * never finished before the ceiling. ANAS's `--action=check` is still ARMED on
+ * it in every one of those cases, and the loop moves straight on to issue the
+ * next band's check — so when the array thaws, or the resync ends, two parity
+ * checks run at once across disks that are very often the same spindles. §4's
+ * whole point is that a scrub's reads are strictly sequential.
+ *
+ * Written the way `boundedWindowCheck` ends its own bounded check (`idle` into
+ * `sync_action`), through mdadm's own front door — the same door two lines up
+ * issued the check — and BEST-EFFORT: md refuses `idle` on a frozen array
+ * (EBUSY), and a failure here is worth a sentence in the progress line, never
+ * a failed scrub. Returns what to say about it.
+ */
+async function cancelBandCheck(
+  executor: CommandExecutor,
+  device: string,
+  label: string,
+  action: string | null,
+): Promise<string> {
+  let failure: string | null = null
+  try {
+    const r = await executor.exec(MDADM, ['--action=idle', device])
+    if (r.exitCode !== 0)
+      failure = r.stderr.trim() || `mdadm --action=idle exited ${r.exitCode}`
+  }
+  catch (err) {
+    failure = err instanceof Error ? err.message : String(err)
+  }
+  if (action === 'frozen') {
+    // md refuses idle while the array is frozen, so this one is expected to
+    // bounce — say plainly that the check may still be armed when it thaws.
+    return failure === null
+      ? `asked md to drop this scrub's check on ${label}`
+      : `could not drop this scrub's check on ${label} (${failure}) — md refuses idle on a frozen array, so the check may still run when it thaws`
+  }
+  return failure === null
+    ? `dropped this scrub's check on ${label} so it cannot run beside the next band's`
+    : `could not drop this scrub's check on ${label} (${failure}) — it may still run beside a later band's`
 }
 
 // ---- Attribution: WHAT is corrupt (story selfheal.3) ------------------------
@@ -774,6 +821,14 @@ export async function pathExists(executor: CommandExecutor, path: string): Promi
  * empty `badBlocks` that reads as "nothing wrong here". A resolved COMPRESSED
  * extent still bypasses the printed offset entirely and is probed over its real
  * file range, which is strictly better than either.
+ *
+ * And the window says so about ITSELF (T7, third pass). A probe made with the
+ * mapping down sets `probedUnverified` on the finding, and the `reason` is kept
+ * even when blocks WERE found — the blocks named are real, the list of them is
+ * not known to be complete. The findings window and the notification belong to
+ * another owner; what they should render off this pair is: blocks listed, plus
+ * a plain line that the search window could not be verified and why, so a
+ * repair offered on those blocks is not read as a repair of the whole file.
  */
 async function buildFindings(
   executor: CommandExecutor,
@@ -818,6 +873,8 @@ async function buildFindings(
     const badBlocks: number[] = []
     let extentRange: ExtentBlockRange | null = null
     let unidentifiedReason: string | null = null
+    /** At least one stripe of this file was probed with the mapping down (T7). */
+    let probedUnverified = false
     for (const stripe of group.stripes) {
       let candidates: ExtentItem[] | null = null
       if (mapping !== null) {
@@ -837,6 +894,14 @@ async function buildFindings(
         // extent happens to be compressed the window is the wrong one and the
         // probe finds nothing — which is a MISS, and `unidentifiedReason` is
         // already set, so the finding says so instead of reading as clean.
+        //
+        // MARK IT (T7). The blocks this probe names are real, but the WINDOW
+        // was never verified: a compressed extent's printed offset names the
+        // wrong 64 KiB, so blocks outside it can be bad with nothing here to
+        // say so. `probedUnverified` carries that fact whether or not the
+        // probe happened to hit — a lucky stripe must not read as a complete
+        // account of the file.
+        probedUnverified = true
         badBlocks.push(...await probeStripe(executor, where.path, stripe.offset))
         continue
       }
@@ -867,7 +932,13 @@ async function buildFindings(
       stripes: group.stripes,
       badBlocks,
       ...(extentRange ? { compressed: true, extentBlocks: extentRange } : {}),
-      ...(badBlocks.length === 0 && unidentifiedReason ? { unidentified: true, reason: unidentifiedReason } : {}),
+      // `unidentified` still means "no block could be named at all", so it
+      // stays gated on an EMPTY badBlocks — but the REASON is kept either way
+      // (T7). One stripe of a multi-stripe file resolving and hitting used to
+      // erase the reason every other stripe had for finding nothing, and the
+      // finding then read as a complete list of this file's bad blocks.
+      ...(unidentifiedReason ? { ...(badBlocks.length === 0 ? { unidentified: true } : {}), reason: unidentifiedReason } : {}),
+      ...(probedUnverified ? { probedUnverified: true } : {}),
     })
   }
   return findings
@@ -983,9 +1054,20 @@ export async function scrubAhrPool(
     // either way, so an unresolvable name costs the wait, never the check.
     const rp = await executor.exec(REALPATH, [array.device])
     const kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
-    // What md had last run here BEFORE this check — the evidence that says
-    // whether a check that no poll ever saw was ours (F11).
+    // What md had last run here BEFORE this check, AND the counter it left —
+    // together, the only evidence that says whether a check no poll ever saw
+    // was ours and ran to the end (F11, third pass).
+    //
+    // `last_sync_action` on its own proves nothing about THIS check. It is
+    // PERSISTENT: any node that has ever run mdcheck reads `check` there for
+    // ever, so "idle and last_sync_action=check" is the resting state of a
+    // perfectly ordinary array and matches a check that was aborted two
+    // seconds in by a member failure exactly as well as one that completed.
+    // `mismatch_cnt` is the discriminator — md ZEROES it when a sync op
+    // starts, so a counter that MOVED since this snapshot is proof a sync op
+    // ran here after we issued ours.
     const priorAction = kernelName ? await lastSyncAction(executor, kernelName) : null
+    const priorMismatch = kernelName ? await mismatchCount(executor, kernelName) : null
 
     await run(executor, MDADM, ['--action=check', array.device])
 
@@ -1001,6 +1083,10 @@ export async function scrubAhrPool(
     let started = false
     let observable = true
     let alreadyFinished = false
+    /** The proven verdict of a check that finished before the first poll. */
+    let finishedMismatch: number | null = null
+    /** md is idle and last ran a check, but nothing proves it was THIS one. */
+    let checkStateUnknown = false
     const startDeadline = Date.now() + (opts?.checkStartTimeoutMs ?? AHR_SCRUB_CHECK_START_TIMEOUT_MS)
     for (;;) {
       const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
@@ -1021,20 +1107,40 @@ export async function scrubAhrPool(
         break
       }
       if (Date.now() >= startDeadline) {
-        // ALREADY FINISHED, not never-started (F11). A small band's check can
-        // run to completion between mdadm returning and the very first poll,
-        // and no poll of this window would ever have seen it. md's own record
-        // of what it last ran is the evidence: the array is idle and
-        // `last_sync_action` says the last op was a check, so the counter
-        // sitting there is a check's — and the only check issued in this
-        // window was ours. Without this the band was reported as never checked
-        // and its counter, this scrub's own verdict, was never read.
-        if ((await lastSyncAction(executor, kernelName)) === 'check') {
+        // Three states look identical here — a small band's check that RAN TO
+        // COMPLETION between mdadm returning and the first poll (F11), a check
+        // md never took at all, and a check that started and died two seconds
+        // in — and md is idle in all three. They are told apart from md's own
+        // records, and a band is counted only when all of the evidence agrees
+        // (third pass, T2):
+        //
+        //   · `last_sync_action` = check  — the last op md RAN here was a check
+        //   · `mismatch_cnt` MOVED        — md zeroed it at a sync start, so
+        //                                   the number is a new one, not the
+        //                                   stale one this band already held
+        //   · `sync_action` idle          — whatever ran, it is over
+        //
+        // Anything short of that is "unknown", NOT a verdict: no rot is
+        // claimed from a counter that may be a previous check's, and no clean
+        // bill is given to a band whose check may have died at 2%.
+        const lastAction = await lastSyncAction(executor, kernelName)
+        if (lastAction !== 'check')
+          break // md's last op here was not a check at all: ours never started.
+        // The counter finalizes as the sync thread winds down, the same settle
+        // the verdict read below takes.
+        await sleep(mismatchDelay)
+        const nowMismatch = await mismatchCount(executor, kernelName)
+        if (priorMismatch !== null && nowMismatch !== null && nowMismatch !== priorMismatch) {
           alreadyFinished = true
+          finishedMismatch = nowMismatch
           updateProgress(
             `md check on ${label} finished before the first poll`
-            + `${priorAction !== null && priorAction !== 'check' ? ` (md was last running '${priorAction}')` : ''} — reading its counter`,
+            + `${priorAction !== null && priorAction !== 'check' ? ` (md was last running '${priorAction}')` : ''}`
+            + ` — its counter moved from ${priorMismatch} to ${nowMismatch}`,
           )
+        }
+        else {
+          checkStateUnknown = true
         }
         break
       }
@@ -1042,10 +1148,20 @@ export async function scrubAhrPool(
       await sleep(interval)
     }
     if (!started && observable && !alreadyFinished) {
-      // Say it, and read NO counter: `mismatch_cnt` still holds whatever the
-      // last check that DID run left there, and reporting it as this scrub's
-      // verdict would invent rot (or, worse, clear a real finding).
-      updateProgress(`md never started the check on ${label} — this band was not checked (its mismatch_cnt belongs to an earlier check)`)
+      // Say it, and read NO counter as a verdict: `mismatch_cnt` still holds
+      // whatever the last check that DID run left there, and reporting it as
+      // this scrub's verdict would invent rot (or, worse, clear a real
+      // finding). `priorAction` earns its snapshot here — md updates
+      // `last_sync_action` when an op BEGINS, so a value that changed under us
+      // says md did take a check, and an unmoved counter then says that check
+      // did not run to the end.
+      updateProgress(
+        !checkStateUnknown
+          ? `md never started the check on ${label} — this band was not checked (its mismatch_cnt belongs to an earlier check)`
+          : priorAction !== 'check'
+            ? `check state unknown on ${label} — not counted (md took a check and is idle again, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing says the check ran to the end)`
+            : `check state unknown on ${label} — not counted (md is idle and last ran a check, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing tells this scrub's check from an earlier one)`,
+      )
       continue
     }
 
@@ -1057,6 +1173,8 @@ export async function scrubAhrPool(
     // on those spun the job forever, and with the active-job exclusion (R7)
     // that refused every later scrub and repair on the pool until a restart.
     let checked = true
+    /** What md was doing when this band's finish-wait gave up on it (T4). */
+    let abandonedOn: string | null = null
     if (!alreadyFinished) {
       const finishDeadline = Date.now() + (opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)
       for (;;) {
@@ -1080,26 +1198,41 @@ export async function scrubAhrPool(
           // check verdict, and a resync/recover/reshape overwrites it anyway.
           updateProgress(`${label} was not checked (sync_action=${action}) — md is not running this scrub's check on that band`)
           checked = false
+          abandonedOn = action
           break
         }
         if (Date.now() >= finishDeadline) {
           updateProgress(`${label} was not checked (sync_action=${action ?? 'unreadable'}) — still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling; not waiting on it any longer`)
           checked = false
+          abandonedOn = action
           break
         }
         updateProgress(`md check on ${label}${md?.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
         await sleep(interval)
       }
     }
-    if (!checked)
+    if (!checked) {
+      // Never walk away leaving our check armed on the band (T4): the next
+      // band's check is issued immediately after this `continue`.
+      updateProgress(await cancelBandCheck(executor, array.device, label, abandonedOn))
       continue
+    }
 
     // The check's verdict: md counted parity mismatches ⇒ rot EXISTS in this
     // band. Phase 2 is what names the files, and it starts right now — say so
     // in one warning rather than leaving the operator staring at a number (§e).
     // Read only now: idle, plus the settle the counter needs (selfheal.4).
-    await sleep(mismatchDelay)
-    const mismatches = await mismatchCount(executor, kernelName)
+    // The finished-before-the-first-poll path already took that settle and
+    // read the counter to PROVE the check ran — that read IS the verdict, and
+    // reading again would only risk catching the zero of a newer sync op.
+    let mismatches: number | null
+    if (alreadyFinished) {
+      mismatches = finishedMismatch
+    }
+    else {
+      await sleep(mismatchDelay)
+      mismatches = await mismatchCount(executor, kernelName)
+    }
     if (mismatches !== null && mismatches > 0) {
       await pveNotify(
         executor,
