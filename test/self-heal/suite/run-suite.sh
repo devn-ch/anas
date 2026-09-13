@@ -19,7 +19,8 @@ GTDIR=$(cd "$HERE/../gt" && pwd)
 ssh "$NODE" 'mkdir -p /root/gtsh/suite /root/gtsh/suite-out'
 rsync -a --delete --exclude out/ --exclude LAST-RUN.md \
     "$HERE/" "$NODE:/root/gtsh/suite/"
-rsync -a "$GTDIR/lib.sh" "$GTDIR/00-rig.sh" "$NODE:/root/gtsh/"
+rsync -a "$GTDIR/lib.sh" "$GTDIR/00-rig.sh" "$GTDIR/00-rig-twoband.sh" \
+    "$NODE:/root/gtsh/"
 
 set +e
 # REPAIR_CMD has to cross the ssh boundary explicitly — ssh carries no

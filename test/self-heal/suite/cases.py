@@ -15,16 +15,18 @@ import json
 import os
 
 from common import (BS, LOGS, SUITE_OUT, array_end_sectors, bounded_end_check,
-                    bounded_range_check, bounded_window_check, call_repair,
-                    chunk_sectors, components, drop_caches, fail_member,
-                    full_check, locate_block, make_snap, md_attr,
-                    md_attr_or_none, md_geometry, readd_member, read_direct,
-                    regen, remove_snap, restore_sync_knobs, sig_for,
-                    snapshot_read, write_direct)
+                    bounded_range_check, bounded_window_check, btrfs_chunk_ranges,
+                    btrfs_metadata_ranges, call_repair, chunk_sectors, components,
+                    drop_caches, fail_member, file_sector_digests, full_check,
+                    locate_block, make_marker, make_snap, md_attr, md_attr_or_none,
+                    md_geometry, readd_member, read_direct, regen, remove_snap,
+                    restore_sync_knobs, reverse_predict, sig_for, snapshot_read,
+                    write_direct)
 from oracle import (ORACLE_SNAP, corrupt_block, disambiguate_data_slot,
                     scan_device, scan_members)
 
 REPAIR_SNAP = ".anas-repair-snap"
+TX_PROBE_SNAP = ".anas-tx-probe"
 REPORT_PATH = f"{SUITE_OUT}/last-repair.json"
 
 STEPS = ["pin", "resolve", "reverify", "precheck", "rmw", "reconstruct",
@@ -44,14 +46,18 @@ class Recorder:
 
 
 class CaseCtx:
-    """Per-rig context: md array, mountpoint, members, marker files."""
+    """Per-rig context: md array(s), mountpoint, members, marker files.
+    Single-band rigs pass one md device; the two-band rig (case 7, the AHR
+    pool shape) passes both band arrays — `mddev` is the first (band A) and
+    `members` spans every band, which is what the oracle scans."""
 
-    def __init__(self, mddev: str, mountpoint: str, tag: str):
-        self.mddev = mddev
+    def __init__(self, mddevs: list[str], mountpoint: str, tag: str):
+        self.mddevs = mddevs
+        self.mddev = mddevs[0]
         self.mp = mountpoint
         self.tag = tag
-        self.members = components(mddev)
-        self.geo = md_geometry(mddev)
+        self.members = [m for md in mddevs for m in components(md)]
+        self.geo = md_geometry(self.mddev)
         self.files = {}          # marker name -> path
         self.located = {}        # (file, block) -> (dev, off) — scan-located only
 
@@ -595,6 +601,261 @@ def case6_raid1(ctx: CaseCtx, rec: Recorder) -> None:
         okc = 300 in r["ok"] and r["data"].get(300) == want
         rec.add("case", "6-cold", "post-repair cold snapshot read of the block "
                 "matches the original", okc,
+                f"eio={r['eio']} content_match={okc}")
+    finally:
+        remove_snap(ctx.mp, REPAIR_SNAP)
+
+
+# ---------------------------------------------------------------- case 7
+
+def _tb_map(ctx: CaseCtx, path: str, block: int) -> dict:
+    """Verification-side mapping for the two-band rig: file block -> btrfs
+    logical -> chunk hop -> LV byte -> the dm table segment that covers it ->
+    THAT array's geometry. The segment comes from the dm table — never from a
+    single-array predict — and each array's chunk is read from its own sysfs
+    (F4, per array): the two bands of this rig disagree on purpose."""
+    from common import (chunk_data_map, dm_segments, dump_tree,
+                        extent_for_offset, file_extents, find_btrfs_dev,
+                        md_geometry, predict, segment_for)
+    srcdev = find_btrfs_dev(ctx.mp)
+    exts = file_extents(srcdev, ctx.mp, path)
+    e = extent_for_offset(exts, block * BS)
+    assert e["comp"] == "none", f"case 7 markers are uncompressed, got {e['comp']}"
+    logical = e["disk"] + (block * BS - e["foff"])
+    clog, cdev, _ = chunk_data_map(dump_tree(srcdev, 3), logical)
+    lv = logical - clog + cdev
+    segs = dm_segments(srcdev)
+    seg = segment_for(segs, lv)
+    geo = md_geometry(seg["dev"])
+    md_byte = lv - seg["start"] + seg["ss"] * 512
+    p = predict(md_byte, geo)
+    return {"srcdev": srcdev, "segs": segs, "segment": segs.index(seg),
+            "mddev": seg["dev"], "geo": geo, "lv": lv, "md_byte": md_byte,
+            "extent": e, "disk": p["disk"], "moff": p["moff"],
+            "stripe": p["stripe"], "parity_disk": p["parity_disk"],
+            "q_disk": p["q_disk"]}
+
+
+def _tb_band(ctx: CaseCtx, dev: str) -> int:
+    """Which band array owns member `dev` (0=A, 1=B) — records the scan hit."""
+    for i, md in enumerate(ctx.mddevs):
+        if dev in components(md):
+            return i
+    raise RuntimeError(f"member {dev} is in no band array of {ctx.mddevs}")
+
+
+def _tb_blocks(ctx: CaseCtx) -> dict:
+    """Find one signature marker block in EACH segment of the LV: the rig is
+    filled past band A's segment (300 MiB of plain filler, then the 500 MiB
+    marker b1), and the LV byte of each signature block is mapped to its
+    segment from the dm table. If b1 did not cross into segment 2, a second
+    400 MiB marker (b2) is written until it does. Cached on ctx — case 7 and
+    its control share the same blocks. Returns
+    {'seg1': (path, block), 'seg2': (path, block), 'maps': {(name, block): map}}."""
+    if getattr(ctx, "tb_blocks", None) is not None:
+        return ctx.tb_blocks
+    marks = {"b1": (300, 40000, 80000, 120000)}
+    found: dict[int, tuple[str, int]] = {}
+    maps: dict[tuple[str, int], dict] = {}
+    for fname, blocks in marks.items():
+        path = ctx.files[fname]
+        for b in blocks:
+            m = _tb_map(ctx, path, b)
+            maps[(fname, b)] = m
+            found.setdefault(m["segment"], (path, b))
+    if 1 not in found:
+        # b1 did not cross into segment 2 — keep writing until one does
+        ctx.files["b2"] = make_marker("b2", "random", 400 * 1024 * 1024,
+                                      seed=13, blocks=(300, 50000, 90000))
+        for b in (300, 50000, 90000):
+            m = _tb_map(ctx, ctx.files["b2"], b)
+            maps[("b2", b)] = m
+            found.setdefault(m["segment"], (ctx.files["b2"], b))
+    if 0 not in found or 1 not in found:
+        raise RuntimeError(f"two-band rig: no marker block in segment "
+                           f"{1 if 0 not in found else 2} of the LV: {found}")
+    ctx.tb_blocks = {"seg1": found[0], "seg2": found[1], "maps": maps}
+    return ctx.tb_blocks
+
+
+def case7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
+    """TWO-BAND rig (the AHR pool shape: the LV is the linear concatenation of
+    two md arrays — band A 64K chunk, band B 512K chunk, different on purpose).
+    Corrupt the marker block that lives in SEGMENT 2 (band B) on its member —
+    the oracle scans the members of BOTH arrays and records which — and repair.
+    The repair must use the array that OWNS the byte (band B, its own
+    chunk/geometry). The assertion that would have caught review finding R1 (a
+    repair that places every block with the FIRST segment's geometry) runs
+    regardless of the repair's exit: NO DATA on band A changed. The repair's
+    own snapshot commits a btrfs transaction, and btrfs's transaction writes
+    — the superblock mirrors and the SYSTEM/METADATA chunks — can all land in
+    segment 1 of this rig, so band-A members legitimately change there. Every
+    changed sector is mapped back through band A's geometry to its LV byte and
+    must fall in: md's own superblock region, a measured superblock-mirror
+    block (the mirrors are measured by running the repair's own transaction
+    first — their positions are not stable across mkfs runs), or a
+    SYSTEM/METADATA chunk stripe. Then an evicted bounded check over band B's
+    stripe reads 0 and a cold snapshot read matches."""
+    bl = _tb_blocks(ctx)
+    path, block = bl["seg2"]
+    name = os.path.basename(path).removesuffix(".bin")
+    m = bl["maps"][(name, block)]
+    band_a_devs = components(ctx.mddevs[0])
+    segA = m["segs"][0]
+    assert segA["dev"] == ctx.mddevs[0], \
+        f"rig: the first dm segment is {segA['dev']}, expected band A {ctx.mddevs[0]}"
+
+    # R1 baseline: per-sector digests of every band-A member, plus btrfs's
+    # housekeeping ranges from the chunk tree (re-read after the repair, in
+    # case a transaction moved metadata), so the after-compare can classify
+    # every changed sector.
+    #
+    # Superblock mirrors first: the repair's snapshot commits a transaction
+    # whose super writes can land anywhere on segment 1, and the mirror
+    # positions are NOT stable across mkfs runs (measured on identical rigs:
+    # a live super at 64 KiB + 64 MiB, a magic-less csum block at 1 MiB, an
+    # all-zero 320 KiB mirror a transaction later fills). No fixed list
+    # survives that — so measure the set: run the SAME transaction the repair
+    # runs (RO snapshot create + delete) and record the band-A 4K blocks it
+    # writes, mapped to LV bytes through band A's geometry.
+    probe_b = {d: file_sector_digests(d) for d in band_a_devs}
+    make_snap(ctx.mp, TX_PROBE_SNAP)
+    remove_snap(ctx.mp, TX_PROBE_SNAP)
+    probe_a = {d: file_sector_digests(d) for d in band_a_devs}
+    tx_blocks: set[int] = set()
+    for i, d in enumerate(band_a_devs):
+        for s, (pb, pa) in enumerate(zip(probe_b[d], probe_a[d])):
+            if pb != pa:
+                moff = s * BS
+                if moff < ctx.geo["data_offset"]:
+                    continue        # md's own super region — carved out below
+                tx_blocks.add(reverse_predict(i, moff, ctx.geo)
+                              - segA["ss"] * 512 + segA["start"])
+
+    # a measured block inside a DATA chunk would be a BLIND SPOT for the R1
+    # assertion below (a data write landing there would be carved out as
+    # housekeeping). The probe ran right after the markers' sync, so btrfs
+    # writes no data here — a hit is harness contamination and fails the
+    # suite rather than silently weakening the assertion.
+    data_ranges = btrfs_chunk_ranges(m["srcdev"], "DATA")
+    probe_data = [b for b in tx_blocks
+                  if any(lo <= b < hi for lo, hi in data_ranges)]
+    rec.add("case", "7-txprobe", "the tx-probe transaction touched no DATA chunk "
+            "(the measured housekeeping set has no blind spot for the R1 "
+            "assertion)", not probe_data,
+            f"{len(tx_blocks)} band-A blocks measured, {len(probe_data)} in a "
+            f"data chunk" + (f": {probe_data[:8]}" if probe_data else ""))
+
+    before = probe_a   # nothing changes between the probe and the repair
+    excl = btrfs_metadata_ranges(m["srcdev"])
+
+    # --- injector: the oracle scans the members of BOTH arrays
+    dev, off, boff = ctx.corrupt_below_md(path, block)
+    band = _tb_band(ctx, dev)
+    hit = (f"m{components(ctx.mddevs[band]).index(dev)} of band "
+           f"{chr(65 + band)} ({os.path.basename(dev)})")
+    rec.add("case", "7-scan", "oracle scan (members of both arrays) located the "
+            "segment-2 block on a band-B member", band == 1,
+            f"hit {hit}; verification-side map: m{m['disk']} of {m['mddev']}, "
+            f"stripe {m['stripe']}, member offset {m['moff']}")
+
+    rc, rep, out = run_repair(ctx, path, block, tag="c7r")
+
+    # --- the R1 assertion, run regardless of rc: no DATA write on band A
+    after = {d: file_sector_digests(d) for d in band_a_devs}
+    excl += btrfs_metadata_ranges(m["srcdev"])
+    doff = ctx.geo["data_offset"]
+    housekeeping = data = 0
+    bad_sectors = []
+    for i, d in enumerate(band_a_devs):
+        b, a = before[d], after[d]
+        if b == a:
+            continue
+        for s, (hb, ha) in enumerate(zip(b, a)):
+            if hb == ha:
+                continue
+            moff = s * BS
+            if moff < doff:
+                housekeeping += 1      # md's own superblock region: never file data
+                continue
+            lv = reverse_predict(i, moff, ctx.geo) - segA["ss"] * 512 + segA["start"]
+            if lv in tx_blocks or any(lo <= lv < hi for lo, hi in excl):
+                housekeeping += 1
+            else:
+                data += 1
+                if len(bad_sectors) < 5:
+                    bad_sectors.append(f"{os.path.basename(d)}@{moff} (LV {lv})")
+    rec.add("case", "7-bandA-untouched", "no DATA write on band A: every changed "
+            "band-A sector is btrfs superblock/metadata housekeeping (the R1 "
+            "assertion)", data == 0,
+            f"changed sectors: {housekeeping + data} — housekeeping={housekeeping} "
+            f"data={data}" + (f" — DATA CHANGED: {bad_sectors}" if data else ""))
+
+    ok = rc == 0 and rep.get("postcheck_mismatch") == 0
+    same = (rep.get("stripe") == m["stripe"] and rep.get("disk") == m["disk"]
+            and rep.get("n") == m["geo"]["n"])
+    rec.add("case", "7-repair", "two-band: REPAIR_CMD of the segment-2 (band B) "
+            "marker block exits 0 using band B's geometry", ok and same,
+            f"rc={rc} postcheck={rep.get('postcheck_mismatch')} n={rep.get('n')} "
+            f"(band B n={m['geo']['n']}) disk=m{rep.get('disk')} "
+            f"stripe={rep.get('stripe')} reason={rep.get('reason', '')[:120]}")
+    if not (ok and same):
+        return
+
+    # --- band B's member block equals the original
+    want = regen(name)[block * BS:(block + 1) * BS]
+    got = read_direct(dev, boff, BS)
+    rec.add("case", "7-member", "band-B member block equals the original after "
+            "repair", got == want, f"{os.path.basename(dev)}@{boff} match={got == want}")
+
+    # --- evicted bounded check over band B's stripe reads 0
+    mm = bounded_window_check(m["mddev"], m["stripe"])
+    rec.add("case", "7-bcheck", "evicted bounded check over band B's stripe reads 0",
+            mm == 0, f"stripe {m['stripe']} of {os.path.basename(m['mddev'])}: "
+                     f"mismatch_cnt={mm}")
+
+    # --- cold snapshot read matches
+    snap = make_snap(ctx.mp, REPAIR_SNAP)
+    try:
+        drop_caches()
+        r = snapshot_read(os.path.join(snap, os.path.basename(path)), [block])
+        okc = block in r["ok"] and r["data"][block] == want
+        rec.add("case", "7-cold", "post-repair cold snapshot read of the "
+                "segment-2 block matches the original", okc,
+                f"eio={r['eio']} content_match={okc}")
+    finally:
+        remove_snap(ctx.mp, REPAIR_SNAP)
+
+
+def control7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
+    """Negative control: a marker in SEGMENT 1 (band A) repairs normally —
+    both segments of the concatenated LV are reachable, so the segment-2
+    repair in case 7 is not a fluke of the rig. The scan hit must be on a
+    band-A member; the post-repair cold snapshot read matches."""
+    bl = _tb_blocks(ctx)
+    path, block = bl["seg1"]
+    name = os.path.basename(path).removesuffix(".bin")
+    m = bl["maps"][(name, block)]
+    dev, off, boff = ctx.corrupt_below_md(path, block)
+    band = _tb_band(ctx, dev)
+    want = regen(name)[block * BS:(block + 1) * BS]
+    rc, rep, out = run_repair(ctx, path, block, tag="c7n")
+    ok = rc == 0 and rep.get("postcheck_mismatch") == 0 and band == 0
+    rec.add("control", "7-neg", "segment-1 (band A) marker repairs normally "
+            "(both segments reachable)", ok,
+            f"rc={rc} postcheck={rep.get('postcheck_mismatch')} scan hit band "
+            f"{chr(65 + band)} m{components(ctx.mddevs[band]).index(dev)} "
+            f"(band A expected), disk=m{rep.get('disk')} stripe={rep.get('stripe')} "
+            f"reason={rep.get('reason', '')[:120]}")
+    if not ok:
+        return
+    snap = make_snap(ctx.mp, REPAIR_SNAP)
+    try:
+        drop_caches()
+        r = snapshot_read(os.path.join(snap, os.path.basename(path)), [block])
+        okc = block in r["ok"] and r["data"][block] == want
+        rec.add("control", "7-neg2", "post-repair cold snapshot read of the "
+                "segment-1 block matches the original", okc,
                 f"eio={r['eio']} content_match={okc}")
     finally:
         remove_snap(ctx.mp, REPAIR_SNAP)

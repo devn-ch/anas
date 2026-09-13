@@ -26,8 +26,8 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common import (GT, KEEP, LOGS, SUITE_OUT, md_attr, make_marker, mddev_workdir,
-                    rig_up, teardown_all, remove_snap)
+from common import (GT, KEEP, LOGS, SUITE_OUT, build_two_band_rig, md_attr,
+                    make_marker, mddev_workdir, rig_up, teardown_all, remove_snap)
 from oracle import ORACLE_SNAP
 import cases as C
 from cases import Recorder, REPAIR_SNAP
@@ -38,6 +38,11 @@ RIG5_FILES = [("c1", "random", 8 * 1024 * 1024, 1, [300]),
               ("c5", "random", 4 * 1024 * 1024, 5, [300, 700])]
 RIG6_FILES = [("r1", "random", 8 * 1024 * 1024, 1, [300, 1000, 1400])]
 RIG1_FILES = [("l1", "random", 4 * 1024 * 1024, 7, [300])]
+# Two-band rig: plain filler (no signatures — an explicit empty block list) to
+# push the data past band A's segment, then the marker whose signature blocks
+# must land in BOTH segments (case 7 maps them from the dm table).
+TWOBAND_FILES = [("f1", "random", 300 * 1024 * 1024, 11, []),
+                 ("b1", "random", 500 * 1024 * 1024, 12, [300, 40000, 80000, 120000])]
 
 
 def write_markers(ctx, specs):
@@ -60,7 +65,45 @@ def case_fn(cid: str, ctx, rec: Recorder, level: int) -> None:
         return C.case5_above_md(ctx, rec)
     if cid == "6":
         return C.case6_raid1(ctx, rec)
+    if cid == "7":
+        return C.case7_two_band(ctx, rec)
+    if cid == "7-neg":
+        return C.control7_two_band(ctx, rec)
     raise KeyError(cid)
+
+
+def run_two_band_rig(rec: Recorder, notes: list[str]) -> None:
+    """The AHR pool shape (review finding R1's missing case): two md arrays
+    (bands) as the PVs of one VG, one LV spanning both in band order, DIFFERENT
+    chunk sizes. Case 7 corrupts a segment-2 (band B) marker block and the
+    repair must not touch band A; the control repairs a segment-1 block."""
+    try:
+        mda, mdb, work, segs = build_two_band_rig()
+    except Exception:
+        notes.append("two-band rig: FAILED to build:\n"
+                     f"{traceback.format_exc()[-600:]}")
+        raise
+    ctx = C.CaseCtx([mda, mdb], work, "tb")
+    # record the dm table's segment layout (the rig's defining fact)
+    notes.append(
+        f"two-band rig: LV is {len(segs)} linear segments from the dm table — "
+        f"band A {mda} (RAID5 6×200 MiB, 64K) LV [0, "
+        f"{segs[0]['length'] // (1024 * 1024)} MiB), band B {mdb} (RAID5 4×200 MiB, "
+        f"512K) LV [{segs[1]['start'] // (1024 * 1024)}, "
+        f"{(segs[1]['start'] + segs[1]['length']) // (1024 * 1024)} MiB)")
+    write_markers(ctx, TWOBAND_FILES)
+    for cid in ("7", "7-neg"):
+        kind = "case" if cid == "7" else "control"
+        try:
+            case_fn(cid, ctx, rec, 5)
+        except Exception:
+            rec.add(kind, cid, f"case {cid} (two-band rig) crashed", False,
+                    traceback.format_exc()[-500:])
+            notes.append(f"case {cid} on the two-band rig: crashed:\n"
+                         f"{traceback.format_exc()[-800:]}")
+    remove_snap(work, REPAIR_SNAP)
+    remove_snap(work, ORACLE_SNAP)
+    teardown_retry()
 
 
 def run_rig(level: int, rec: Recorder, notes: list[str], chunk: str = "64K",
@@ -72,7 +115,7 @@ def run_rig(level: int, rec: Recorder, notes: list[str], chunk: str = "64K",
                      f"{traceback.format_exc()[-600:]}")
         raise
     md, work = mddev_workdir()
-    ctx = C.CaseCtx(md, work, tag or f"r{level}")
+    ctx = C.CaseCtx([md], work, tag or f"r{level}")
 
     write_markers(ctx, files or [])
     if compress:
@@ -148,7 +191,7 @@ def teardown_retry() -> None:
         if "/root/gtsh" in line:
             subprocess.run(["losetup", "-d", line.split(":")[0]],
                            stdin=subprocess.DEVNULL, capture_output=True)
-    for name in ("gtsh1", "gtsh5", "gtsh6"):
+    for name in ("gtsh1", "gtsh5", "gtsh6", "gtshA", "gtshB"):
         p = f"/dev/md/{name}"
         if os.path.lexists(p) and not os.path.exists(p):
             os.unlink(p)   # dangling symlink to a stopped array
@@ -193,8 +236,10 @@ def write_report(rec: Recorder, notes: list[str]) -> tuple[str, str, bool]:
         f"- REPAIR_CMD: `{m['repair_cmd']}`",
         "- rigs: RAID5 (6 × 200 MiB loops), RAID6 (7 × 200 MiB loops),"
         " RAID5 at md's 512 KiB chunk (6 × 200 MiB loops, parity case only),"
-        " and RAID1 (2 × 200 MiB loops) — built fresh per run, torn down after"
-        " (see test/self-heal/gt/00-rig.sh)",
+        " RAID1 (2 × 200 MiB loops), and the two-band AHR shape (RAID5"
+        " 6 × 200 MiB @ 64K + RAID5 4 × 200 MiB @ 512K in one VG/LV, case 7)"
+        " — built fresh per run, torn down after"
+        " (see test/self-heal/gt/00-rig.sh and 00-rig-twoband.sh)",
         "",
         "## Cases",
         "",
@@ -248,6 +293,10 @@ def main() -> int:
         # reads 0 — case 6 with its negative control
         ("RAID1", lambda: run_rig(1, rec, notes, files=RIG1_FILES,
                                   cases=("6",))),
+        # the AHR pool shape (review finding R1): the LV is the linear
+        # concatenation of TWO md arrays (bands) with different chunk sizes —
+        # a segment-2 repair must not touch the other band
+        ("two-band", lambda: run_two_band_rig(rec, notes)),
     ]
     try:
         teardown_retry()

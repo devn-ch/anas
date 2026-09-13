@@ -113,12 +113,25 @@ describe('isSmartctlStandby', () => {
     assert.equal(isSmartctlStandby({ stdout: JSON.stringify({ model_name: 'X' }), exitCode: 0 }), false)
   })
 
-  it('exit 2 + non-JSON stdout → false', () => {
-    assert.equal(isSmartctlStandby({ stdout: 'Device is in STANDBY mode, exit(2)', exitCode: 2 }), false)
+  it('exit 2 + 7.5 "(OS)" wording in the JSON document → true', () => {
+    const doc = loadFixture('smartctl-standby-skip.json')
+    assert.equal(isSmartctlStandby({ stdout: JSON.stringify(doc), exitCode: 2 }), true)
+  })
+
+  it('exit 2 + plain-text STANDBY message on stdout (no JSON document) → true', () => {
+    assert.equal(isSmartctlStandby({ stdout: 'Device is in STANDBY mode, exit(2)', exitCode: 2 }), true)
+  })
+
+  it('exit 2 + STANDBY message on stderr only → true', () => {
+    assert.equal(isSmartctlStandby({ stdout: '', stderr: 'Device is in STANDBY (OS) mode, exit(2)\n', exitCode: 2 }), true)
   })
 
   it('exit 2 + no standby message → false (bit 1 alone is not proof of standby)', () => {
     assert.equal(isSmartctlStandby({ stdout: JSON.stringify({ smartctl: { messages: [{ string: 'Device open failed' }] } }), exitCode: 2 }), false)
+  })
+
+  it('exit 2 + non-JSON stdout without the power-mode message → false', () => {
+    assert.equal(isSmartctlStandby({ stdout: 'Device open failed', stderr: 'unable to open /dev/sdb', exitCode: 2 }), false)
   })
 })
 

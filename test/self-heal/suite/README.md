@@ -18,6 +18,7 @@ never the ANAS install, never `/dev/sda*` or `/dev/zd*`.
 | 4 | `REPAIR_FAIL_AT=<step>` injected at every step boundary of the reference repair (11 steps): exit 70, `rmw_level`/`sync_min`/`sync_max`/`sync_action` restored, no transient snapshot left, then a full md check covers the whole array again | 4-neg: a clean run repairs and restores everything |
 | 5 | above-md rot (junk written THROUGH md, parity agrees): pre-check diagnoses it, exit 3, `precheck_mismatch == 0` | 5-neg: below-md rot in the same file repairs normally, not exit 3 |
 | 6 | RAID1 (2 legs, GT-16: no `rmw_level`, no `stripe_cache_size`, `chunk_size` reads 0): corrupt the marker block on ONE leg behind md — the signature is on BOTH legs, the injector picks one hit and records which — repair must exit 0 and the block must read back correct on BOTH legs afterwards (md writes every leg); post-repair cold snapshot read matches | 6-neg: BEFORE the repair, a cold read through md may be served either leg — the control records which leg md served and whether the btrfs read EIOs accordingly; both outcomes are legitimate, so it asserts only coherence (EIO iff md served the corrupt bytes) and that the rot is real on the member |
+| 7 | **Two-band rig — the AHR pool shape (review finding R1).** Two md arrays (bands) as the PVs of one VG, one LV spanning both in band order with DIFFERENT chunks on purpose (band A RAID5 6×200 MiB @ 64K, band B RAID5 4×200 MiB @ 512K) — the LV is a linear concatenation, and the segment that owns each byte comes from the dm table, never from one array's geometry. The rig is filled past segment 1 until a marker block lands in segment 2 (band B); corrupt that block on its member (the oracle scans the members of BOTH arrays and records which one it hit) and repair: exit 0 using band B's OWN geometry, the member block reads back the original, an evicted bounded check over band B's stripe reads 0, cold snapshot read matches. The assertion R1 exists to be caught by runs REGARDLESS of the repair's exit: no DATA write on band A — the repair's own snapshot commits a btrfs transaction whose superblock/metadata writes can all sit in segment 1, so every changed band-A 4K block is mapped back to its LV byte through band A's geometry and must fall in md's superblock region, a measured superblock-mirror block, or a SYSTEM/METADATA chunk stripe. The mirrors are measured by the tx-probe (7-txprobe): the suite runs the SAME transaction the repair runs (RO snapshot create + delete) before the baseline and records the band-A blocks it writes — a measured block inside a DATA chunk FAILS the suite (the assertion would have a blind spot) | 7-neg: a marker in segment 1 (band A) repairs normally — both segments of the concatenated LV are reachable, so the segment-2 repair is not a rig fluke; 7-neg2: the post-repair cold snapshot read of the segment-1 block matches |
 
 Each case records its verdict and a detail line; the final line of the report
 is `SUITE: PASS|FAIL (n/m cases, k/l negative controls)` and the suite exits 0
@@ -36,8 +37,9 @@ REPAIR_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-repair.js" \
 REPORT_NAME=LAST-RUN-engine.md test/self-heal/suite/run-suite.sh
 ```
 
-`run-suite.sh` rsyncs this directory (+ `../gt/lib.sh` and `../gt/00-rig.sh`)
-to `/root/gtsh/` on the node, runs `python3 /root/gtsh/suite/suite.py` there
+`run-suite.sh` rsyncs this directory (+ `../gt/lib.sh`, `../gt/00-rig.sh` and
+`../gt/00-rig-twoband.sh`) to `/root/gtsh/` on the node, runs
+`python3 /root/gtsh/suite/suite.py` there
 over ssh, pulls `report.md`/`report.json` back into `out/`, and copies the
 report to `LAST-RUN.md` (the committed record of the last full run) — or to
 `REPORT_NAME` when one is given, so a run with a different `REPAIR_CMD` does not
@@ -47,7 +49,8 @@ box, everything else happens on the node.) `REPAIR_CMD` is exported across the
 ssh boundary explicitly — ssh carries no environment of its own.
 
 Requires on the node: python3, mdadm, lvm2, btrfs-progs, ~5 GB free under
-`/root`, and 7 loop devices.
+`/root`, and 10 loop devices (the two-band rig uses 6+4; the rigs are torn
+down between runs, so never more than one rig's loops at a time).
 
 ## REPAIR_CMD contract
 
@@ -78,8 +81,8 @@ reference implementation and checked when present.
 
 | REPAIR_CMD | report | result |
 |---|---|---|
-| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 34/34 cases, 12/12 controls |
-| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 34/34 cases, 12/12 controls |
+| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 41/41 cases, 14/14 controls |
+| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 34/34 cases, 12/12 controls (2026-09-12 — before case 7 existed; not yet re-run against the two-band rig) |
 
 The engine covers everything the reference does and adds the RAID6 Q-syndrome
 reconstruction as a fallback when the P-based XOR fails arbitration (a stripe
@@ -89,7 +92,10 @@ case 4 injects into the eleven steps both share. Since the hardening round the
 suite has a RAID1 case (case 6), which both implementations pass; the engine
 also repairs a RAID1 block whose mirror legs DISAGREE from the second leg (the
 reference exits 2 — its RAID1 candidates are the surviving legs, and it
-refuses when they disagree), a shape the suite does not build.
+refuses when they disagree), a shape the suite does not build. Since the
+two-band round (2026-09-13, review finding R1) the suite has case 7 on the
+AHR-shape rig, which the reference passes and the engine has not yet been
+re-run against — its 34/34 record above predates the two-band rig.
 
 Two differences the suite cannot see, both about scale and layout rather than
 correctness on a rig:
@@ -231,6 +237,33 @@ correctness on a rig:
   (`stop_stale_gtsh_arrays`, matched against `/proc/mdstat` so a foreign
   array is never touched); and a rig that still will not build is recorded
   as a FAIL rather than crashing the run and hiding the rigs after it.
+- **btrfs's superblock mirrors are not stable across mkfs runs** (measured on
+  IDENTICAL fresh rigs — same size, same options, two runs): one rig carried
+  live supers at 64 KiB and 64 MiB (csum + `_BHRfS_M` magic), a magic-less
+  csum+fsid block at 1 MiB whose csum no transaction updates, and an
+  ALL-ZERO 320 KiB block (one run's transaction filled it, the manually
+  measured one's left it untouched); on another rig the transactions filled
+  the 64 MiB + 64 KiB mirror too. LV 0 is all zero and never rewritten. No
+  fixed offset list survives this, and a magic scan
+  cannot see a zero mirror — so case 7's tx-probe does not guess: it runs
+  the repair's own transaction (RO snapshot create + delete) right before
+  the baseline digests and measures the band-A 4K blocks it writes (on the
+  populated rig: the live supers plus metadata tree blocks, always
+  0 in a DATA chunk — a probe hit inside one fails 7-txprobe, because the
+  R1 assertion would then have a blind spot). The measured count still
+  varies per run (27–52 blocks: the metadata-tree tail of the transaction
+  depends on tree state), which is expected — the set is re-measured every
+  run, never assumed.
+- **The two-band rig's LV is a linear concatenation, read from the dm table.**
+  `dmsetup table <LV>` gives one `linear` segment per band (band order), each
+  with its own start sector into the band array; `common.dm_segments` parses
+  it and the suite asserts the table is exactly two linear segments in band
+  order at build time. Every byte→array mapping (verification side and the
+  reference repair) takes the covering segment from THAT table and then uses
+  only that array's own geometry — the shape of review finding R1 (an
+  implementation that placed every block with the first segment's geometry
+  passed every single-band rig, because a single-band LV has exactly one
+  segment and both geometries agree).
 
 ## Files
 
@@ -238,9 +271,11 @@ correctness on a rig:
 - `suite.py` — orchestrator: builds the RAID5 rig, runs the cases, tears
   down, builds the RAID6 rig (parity cases), tears down; the hardening round
   adds a 512 KiB-chunk RAID5 rig (parity case only — the F4 proof) and a
-  2-member RAID1 rig (case 6), each torn down in turn; then writes
-  `report.md`/`report.json` under `/root/gtsh/suite-out/` and prints the
-  `SUITE:` line.
+  2-member RAID1 rig (case 6); the two-band round adds the AHR-shape two-band
+  rig (`../gt/00-rig-twoband.sh`: two md bands as one VG's PVs, one LV,
+  different chunks — case 7 + its control); each rig is torn down in turn;
+  then writes `report.md`/`report.json` under `/root/gtsh/suite-out/` and
+  prints the `SUITE:` line.
 - `cases.py` — the six case functions and their negative controls.
 - `common.py` — node-side helpers: md geometry from sysfs, btrfs-tree
   mapping (logical → chunk hop → dm → md LBA → member offset), bounded

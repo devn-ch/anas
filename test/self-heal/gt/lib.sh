@@ -82,7 +82,7 @@ teardown_all() { # teardown everything the drill may have created; tolerates abs
     # this by hand (a plain -f match kills their own shell). This teardown
     # only ever runs against /root/gtsh loop rigs.
     pkill -TERM -f "^/usr/sbin/mdadm --monitor" 2>/dev/null || true
-    for md in /dev/md/gtsh1 /dev/md/gtsh5 /dev/md/gtsh6; do
+    for md in /dev/md/gtsh1 /dev/md/gtsh5 /dev/md/gtsh6 /dev/md/gtshA /dev/md/gtshB; do
         [ -e "$md" ] || continue
         # still retried, and its errors are kept in $GT/state/stop-errors.log
         # rather than swallowed silently (a busy stop left an array standing

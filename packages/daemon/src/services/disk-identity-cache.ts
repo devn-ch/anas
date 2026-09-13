@@ -23,10 +23,35 @@ export interface DiskIdentity {
   trimSupport: boolean
   /** SMART health: true=passed, false=failed, null=not supported/unknown */
   smartHealthy: boolean | null
+  /**
+   * The disk is asleep (STANDBY/SLEEP) and smartctl was told not to wake it —
+   * nothing was measured this pass. Absent on a reading taken from an awake
+   * disk.
+   */
+  standby?: boolean
+  /**
+   * The reported identity is the LAST MEASURED one, not fresh: the disk was
+   * asleep when read. Only meaningful with `standby: true`; a never-seen
+   * standby disk carries `standby` without `stale` (there is no prior reading
+   * to be stale relative to).
+   */
+  stale?: boolean
 }
 
 export class DiskIdentityCache {
-  private cache = new Map<string, DiskIdentity>()
+  /**
+   * The last MEASURED identity per disk (an awake reading, or a cached
+   * failure). A standby reading never touches it — the disk may sleep for
+   * days under the spindown policy and its measured identity stays the truth
+   * to report in the meantime.
+   */
+  private measured = new Map<string, DiskIdentity>()
+  /**
+   * The latest reading to REPORT per disk: the measured identity, the measured
+   * identity marked `standby` + `stale`, or (a disk never seen awake)
+   * placeholders marked `standby` with no health claim.
+   */
+  private reading = new Map<string, DiskIdentity>()
   private pending = new Map<string, Promise<DiskIdentity>>()
   private executor: CommandExecutor
 
@@ -34,16 +59,19 @@ export class DiskIdentityCache {
     this.executor = executor
   }
 
-  /** Get cached identity, or null if not yet loaded */
+  /** Get the latest reading (measured, or standby-marked), or null if never loaded */
   getCached(diskId: string): DiskIdentity | null {
-    return this.cache.get(diskId) ?? null
+    return this.reading.get(diskId) ?? null
   }
 
-  /** Get identity, loading from smartctl if not cached. */
+  /**
+   * Get the reading for a disk, re-reading smartctl when the last reading was
+   * a standby skip (the disk may have woken since).
+   */
   async get(diskId: string, devicePath: string): Promise<DiskIdentity> {
-    const cached = this.cache.get(diskId)
-    if (cached)
-      return cached
+    const reading = this.reading.get(diskId)
+    if (reading && !reading.standby)
+      return reading
 
     // Deduplicate concurrent requests for the same disk
     const existing = this.pending.get(diskId)
@@ -60,35 +88,54 @@ export class DiskIdentityCache {
     }
   }
 
-  /** Load identity for multiple disks in parallel. */
+  /**
+   * Load readings for multiple disks in parallel. Disks whose last reading was
+   * a standby skip are re-read (they may have woken); measured and failed
+   * disks are left alone.
+   */
   async loadMany(disks: Array<{ id: string, path: string }>): Promise<void> {
-    const uncached = disks.filter(d => !this.cache.has(d.id))
-    if (uncached.length === 0)
+    const due = disks.filter((d) => {
+      const reading = this.reading.get(d.id)
+      return !reading || reading.standby
+    })
+    if (due.length === 0)
       return
-    await Promise.all(uncached.map(d => this.get(d.id, d.path)))
+    await Promise.all(due.map(d => this.get(d.id, d.path)))
   }
 
   private async load(diskId: string, devicePath: string): Promise<DiskIdentity> {
-    const { identity, cacheable } = await this.fetchFromSmartctl(devicePath)
-    if (cacheable)
-      this.cache.set(diskId, identity)
-    return identity
+    const result = await this.fetchFromSmartctl(devicePath)
+    if (result.kind === 'standby') {
+      // The disk is asleep and we declined to wake it — nothing was measured.
+      // Report the last measured identity marked standby+stale, or a
+      // no-claim placeholder if the disk was never seen awake. The measured
+      // map is untouched, and this reading is NOT a cache hit: the disk may
+      // wake at any time, so the next pass retries.
+      const last = this.measured.get(diskId)
+      const identity = last
+        ? { ...last, standby: true, stale: true }
+        : { ...emptyIdentity(), standby: true }
+      this.reading.set(diskId, identity)
+      return identity
+    }
+    this.measured.set(diskId, result.identity)
+    this.reading.set(diskId, result.identity)
+    return result.identity
   }
 
-  private async fetchFromSmartctl(devicePath: string): Promise<{ identity: DiskIdentity, cacheable: boolean }> {
+  private async fetchFromSmartctl(
+    devicePath: string,
+  ): Promise<{ kind: 'standby' } | { kind: 'measured', identity: DiskIdentity }> {
     try {
       // -n standby: if the disk is asleep, smartctl checks the power mode and
       // exits without issuing anything that would spin it up. -iH is identity +
       // health check (no full scan), fast.
       const result = await this.executor.exec('/usr/sbin/smartctl', ['-n', 'standby', '-iH', '--json', devicePath])
-      if (isSmartctlStandby(result)) {
-        // The disk is spun down and we declined to wake it — nothing was read.
-        // Return the empty identity but do NOT cache it: the next inventory
-        // pass retries, and caches once the disk is awake.
-        return { identity: emptyIdentity(), cacheable: false }
-      }
+      if (isSmartctlStandby(result))
+        return { kind: 'standby' }
       const data = JSON.parse(result.stdout)
       return {
+        kind: 'measured',
         identity: {
           modelFamily: data.model_family ?? null,
           deviceModel: data.model_name ?? null,
@@ -98,12 +145,12 @@ export class DiskIdentityCache {
           trimSupport: !!data.trim?.supported,
           smartHealthy: data.smart_status?.passed ?? null,
         },
-        cacheable: true,
       }
     }
     catch {
-      // smartctl failed or returned invalid JSON — return empty identity
-      return { identity: emptyIdentity(), cacheable: true }
+      // smartctl failed or returned invalid JSON — cache the empty identity so
+      // a broken disk is not re-probed every pass (existing behaviour).
+      return { kind: 'measured', identity: emptyIdentity() }
     }
   }
 }

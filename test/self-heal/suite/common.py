@@ -158,6 +158,37 @@ def dm_start_sector(srcdev: str) -> int:
     raise RuntimeError(f"no linear target on {srcdev}: {r.stdout}")
 
 
+def dm_segments(srcdev: str) -> list[dict]:
+    """`dmsetup table <srcdev>` as its linear segments in LV order, one dict
+    each: {dev: source block device, start/length: LV byte offset/size of the
+    segment, ss: the source's start sector}. An AHR pool's LV is the linear
+    concatenation of its band arrays (PVs are the md devices in band order) —
+    one segment per band, each with its OWN geometry. A mapping must take the
+    segment that covers the byte from this table, never one array's geometry
+    for the whole LV (review finding R1)."""
+    r = run(["dmsetup", "table", srcdev])
+    segs = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[2] != "linear":
+            continue
+        dev = f"/dev/{os.path.basename(os.path.realpath(f'/sys/dev/block/{parts[3]}'))}"
+        segs.append({"dev": dev, "start": int(parts[0]) * 512,
+                     "length": int(parts[1]) * 512, "ss": int(parts[4])})
+    if not segs:
+        raise RuntimeError(f"no linear targets on {srcdev}: {r.stdout}")
+    return segs
+
+
+def segment_for(segs: list[dict], lv_byte: int) -> dict:
+    """The segment (from the dm table) covering LV byte `lv_byte`."""
+    for s in segs:
+        end = s["start"] + s["length"] if s["length"] is not None else None
+        if s["start"] <= lv_byte and (end is None or lv_byte < end):
+            return s
+    raise RuntimeError(f"no segment covers LV byte {lv_byte}: {segs}")
+
+
 def subvol_id(mountpoint: str) -> int:
     r = run(["btrfs", "subvolume", "show", mountpoint])
     return int(re.search(r"Subvolume ID:\s*(\d+)", r.stdout).group(1))
@@ -699,11 +730,62 @@ def sig_for(name: str, block: int = 300) -> bytes:
     return sig[:33].encode()
 
 
+def file_sector_digests(path: str) -> list[str]:
+    """sha256 of every 4 KiB sector of a (member loop) file, read in 1 MiB
+    windows. Case 7 proves band A got no DATA write from a segment-2 repair by
+    comparing these before/after and classifying every changed sector by its LV
+    location — a whole-file hash cannot separate the repair's writes from
+    btrfs's own metadata/superblock commits."""
+    import hashlib
+    digs = []
+    with open(path, "rb") as fh:
+        while True:
+            buf = fh.read(1 << 20)
+            if not buf:
+                break
+            for i in range(0, len(buf), BS):
+                digs.append(hashlib.sha256(buf[i:i + BS]).hexdigest())
+    return digs
+
+
+def btrfs_chunk_ranges(srcdev: str, kinds: str) -> list[tuple[int, int]]:
+    """LV byte ranges of every chunk whose type matches one of `kinds` (a
+    regex alternation, e.g. "DATA" or "SYSTEM|METADATA"). A DUP chunk has TWO
+    on-device stripes and both are returned — in the two-band rig the
+    metadata chunk and its DUP copy both sit in segment 1."""
+    ranges = []
+    for item in dump_tree(srcdev, 3).split("\n\titem "):
+        if "CHUNK_ITEM" not in item:
+            continue
+        if not re.search(rf"type [^ ]*\b(?:{kinds})\b", item):
+            continue
+        ln = int(re.search(r"length (\d+)", item).group(1))
+        for off in re.findall(r"stripe \d+ devid \d+ offset (\d+)", item):
+            off = int(off)
+            ranges.append((off, off + ln))
+    return ranges
+
+
+def btrfs_metadata_ranges(srcdev: str) -> list[tuple[int, int]]:
+    """LV byte ranges of every non-DATA chunk (SYSTEM/METADATA — a DUP chunk
+    has TWO on-device stripes, and in the two-band rig both the metadata
+    chunk and its DUP copy sit in segment 1). A repair's snapshot commits a
+    btrfs transaction, and its tree updates land in these ranges — so band-A
+    members DO change there, by btrfs housekeeping, on a perfectly correct
+    repair. The superblock mirrors are NOT here: their positions are not
+    stable across mkfs runs (measured: a live super at 64 KiB and 64 MiB, a
+    magic-less csum block at 1 MiB, an all-zero 320 KiB mirror a later
+    transaction fills), so case 7 measures them by running the repair's own
+    transaction first (tx-probe) instead of guessing."""
+    return btrfs_chunk_ranges(srcdev, "SYSTEM|METADATA")
+
+
 def make_marker(name: str, kind: str, size: int, seed: int | None = None,
                 blocks: list[int] | None = None) -> str:
     """Write a marker file into the mountpoint and stash regen + sha.
     kind: random (seeded), zeros, text. Every block in `blocks` (default
-    [300]) carries its own signature. Returns the path."""
+    [300]) carries its own signature; an EXPLICIT empty list writes a plain
+    data file with no signature (filler). Returns the path."""
     import hashlib
     work = open(f"{GT}/state/workdir.txt").read().strip()
     os.makedirs(KEEP, exist_ok=True)
@@ -714,7 +796,7 @@ def make_marker(name: str, kind: str, size: int, seed: int | None = None,
         buf = bytearray(rep)
     else:
         buf = bytearray(__import__("random").Random(seed).randbytes(size))
-    for b in (blocks or [300]):
+    for b in (blocks if blocks is not None else [300]):
         sig = sig_for(name, b)
         buf[b * BS: b * BS + len(sig)] = sig
     path = os.path.join(work, f"{name}.bin")
@@ -747,6 +829,32 @@ def mddev_workdir() -> tuple[str, str]:
     md = open(f"{GT}/state/mddev.txt").read().strip()
     work = open(f"{GT}/state/workdir.txt").read().strip()
     return md, work
+
+
+def build_two_band_rig() -> tuple[str, str, str, list[dict]]:
+    """The AHR pool shape: TWO md arrays (bands) as the PVs of one VG, one LV
+    spanning both in band order — the linear concatenation the single-array
+    rigs never had (review finding R1: the suite must catch a repair that
+    places every byte with the first segment's geometry). Band A is RAID5
+    6×200 MiB @ 64K, band B RAID5 4×200 MiB @ 512K (different chunks on
+    purpose). Verifies from the dm table that the LV has exactly two linear
+    segments in band order and records them. Returns (mda, mdb, workdir, segments)."""
+    sh(f"bash {GT}/00-rig-twoband.sh")
+    mda = open(f"{GT}/state/mda.txt").read().strip()
+    mdb = open(f"{GT}/state/mdb.txt").read().strip()
+    work = open(f"{GT}/state/workdir.txt").read().strip()
+    segs = dm_segments(find_btrfs_dev(work))
+    if len(segs) != 2 or [s["dev"] for s in segs] != [mda, mdb]:
+        raise RuntimeError(f"two-band rig: dm table is not two linear segments "
+                           f"in band order: {segs} (want {[mda, mdb]})")
+    return mda, mdb, work, segs
+
+
+def mddevs_workdir() -> tuple[list[str], str]:
+    mda = open(f"{GT}/state/mda.txt").read().strip()
+    mdb = open(f"{GT}/state/mdb.txt").read().strip()
+    work = open(f"{GT}/state/workdir.txt").read().strip()
+    return [mda, mdb], work
 
 
 # ---------------------------------------------------------------- repair cmd

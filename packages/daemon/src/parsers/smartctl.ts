@@ -29,8 +29,13 @@ interface SmartctlOutput {
   [key: string]: unknown
 }
 
-/** The power-mode line smartctl prints when `-n standby` made it skip a sleeping disk. */
-const STANDBY_MESSAGE_RE = /in (?:STANDBY|SLEEP) mode/i
+/**
+ * The power-mode line smartctl prints when `-n standby` made it skip a sleeping
+ * disk. The `(OS)` variant is smartctl 7.x's wording for a disk parked by the
+ * OS power management ("Device is in STANDBY (OS) mode, exit(2)") — it must
+ * match, or a standby disk reads as a failure.
+ */
+const STANDBY_MESSAGE_RE = /in (?:STANDBY|SLEEP)(?: \(OS\))? mode/i
 
 /**
  * Single source of truth for "smartctl declined to read the disk because it is
@@ -40,8 +45,12 @@ const STANDBY_MESSAGE_RE = /in (?:STANDBY|SLEEP) mode/i
  * platters up. With `--json` it still emits a document whose messages name the
  * power mode; a bare exit code alone is not enough (bit 1 also fires for other
  * failures), so the message is required to confirm it was the power mode.
+ *
+ * The message is looked for in the JSON document's messages first, then in the
+ * raw stdout/stderr text: older or non-`--json` invocations print it as plain
+ * text, and the message — not the transport — is the evidence.
  */
-export function isSmartctlStandby(result: { stdout: string, exitCode: number }): boolean {
+export function isSmartctlStandby(result: { stdout: string, stderr?: string, exitCode: number }): boolean {
   if ((result.exitCode & 2) === 0)
     return false
   try {
@@ -49,11 +58,17 @@ export function isSmartctlStandby(result: { stdout: string, exitCode: number }):
       smartctl?: { messages?: Array<{ string?: string }> }
     }
     const messages = data.smartctl?.messages ?? []
-    return messages.some(m => STANDBY_MESSAGE_RE.test(m.string ?? ''))
+    if (messages.some(m => STANDBY_MESSAGE_RE.test(m.string ?? '')))
+      return true
   }
   catch {
-    return false
+    // not a document — the raw text below is the only place to look
   }
+  if (STANDBY_MESSAGE_RE.test(result.stdout))
+    return true
+  if (result.stderr && STANDBY_MESSAGE_RE.test(result.stderr))
+    return true
+  return false
 }
 
 /** The SmartData payload for a disk we refused to wake: placeholders + the standby flag. */

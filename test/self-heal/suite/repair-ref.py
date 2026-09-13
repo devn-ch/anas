@@ -6,8 +6,11 @@ Usage: repair-ref.py <mountpoint> <file> <block>
 Implements the converged sequence exactly as the story lists it:
 
     pin              ro transient snapshot (pin-then-re-resolve)
-    resolve          file block -> btrfs logical -> chunk hop -> dm -> md LBA
-                     -> (member, offset) from md sysfs (never hardcoded)
+    resolve          file block -> btrfs logical -> chunk hop -> dm segment
+                     (from the dm table — an AHR LV is the linear
+                     concatenation of the band arrays, one segment each) ->
+                     (member, offset) from THAT array's md sysfs geometry
+                     (never hardcoded, never the first segment's)
     reverify         re-verify the crc32c AT THE COMPUTED MEMBER LOCATION
                      (uncompressed: the 4K block; compressed: every on-disk
                      sector of the extent's blob); content that still passes
@@ -60,10 +63,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import (BS, bounded_range_check, bounded_window_check,
-                    chunk_data_map, chunk_sectors, dm_start_sector, drop_caches,
+                    chunk_data_map, chunk_sectors, dm_segments, drop_caches,
                     dump_tree, extent_for_offset, file_extents, find_btrfs_dev,
                     md_geometry, predict, read_direct, restore_sync_knobs,
-                    snapshot_read, write_direct)
+                    segment_for, snapshot_read, write_direct)
 from crc32c import crc32c
 
 REPAIR_SNAP = ".anas-repair-snap"
@@ -122,7 +125,6 @@ class Repair:
         self.step("resolve")
         srcdev = find_btrfs_dev(self.mountpoint)
         self.srcdev = srcdev
-        self.geo = md_geometry(self.mddev)
         dump3 = dump_tree(srcdev, 3)
         self.dump3 = dump3
         self.dump7 = dump_tree(srcdev, 7)
@@ -145,9 +147,18 @@ class Repair:
             self.blob_md_byte = None
         clog, cdev, _ = chunk_data_map(dump3, self.target_logical)
         self.chunk_logical, self.chunk_device = clog, cdev
-        ss = dm_start_sector(srcdev)
+        lv = self.target_logical - clog + cdev
+        self.lv_byte = lv
+        # The array that OWNS the byte is the one whose dm segment covers the
+        # LV byte — on a two-band pool that segment's source is the band
+        # array for THAT byte, with its own chunk/n/offset (never the first
+        # segment's geometry; review finding R1).
+        seg = segment_for(self.segments, lv)
+        self.mddev = seg["dev"]
+        self.geo = md_geometry(self.mddev)
+        ss = seg["ss"]
         self.start_sector = ss
-        self.md_byte = self.target_logical - clog + cdev + ss * 512
+        self.md_byte = lv - seg["start"] + ss * 512
         self.blob_md_byte = self.md_byte
         p = predict(self.md_byte, self.geo)
         self.disk = p["disk"]
@@ -414,11 +425,20 @@ class Repair:
         self.report["cleanup_errors"] = errs
 
     def run(self) -> int:
+        from common import dm_start_sector
         self.mddev = os.environ.get("REPAIR_MDDEV")
-        if not self.mddev:
-            # discover the md array under the mountpoint's btrfs device
+        if self.mddev:
+            # escape hatch: one FORCED array — the single-segment assumption
+            # (LV start 0) of the single-band rigs
             srcdev = find_btrfs_dev(self.mountpoint)
-            self.mddev = resolve_mddev(srcdev)
+            self.segments = [{"dev": self.mddev, "start": 0, "length": None,
+                              "ss": dm_start_sector(srcdev)}]
+        else:
+            # discover the md arrays under the mountpoint's btrfs device:
+            # one per dm-table segment, in segment order (an AHR pool's LV
+            # is the linear concatenation of its band arrays)
+            srcdev = find_btrfs_dev(self.mountpoint)
+            self.segments = resolve_mddevs(srcdev)
         try:
             self.do_pin()
             self.do_resolve()
@@ -459,16 +479,19 @@ def subprocess_run(cmd: list[str]) -> None:
         raise RuntimeError(f"{' '.join(cmd)}: {r.stderr.strip()}")
 
 
-def resolve_mddev(srcdev: str) -> str:
-    """Follow dm -> md: dmsetup dependency -> /dev/mdX node."""
-    import subprocess
-    out = subprocess.run(["dmsetup", "deps", "-o", "blkdevname", srcdev],
-                         capture_output=True, text=True).stdout
+def resolve_mddevs(srcdev: str) -> list[dict]:
+    """The md arrays under the LV, one per dm-table segment, in segment
+    order. An AHR pool's LV is a LINEAR CONCATENATION of its band arrays
+    (PVs are the md devices in band order); each segment's source array
+    carries its own geometry, and the array that owns a byte is the one
+    whose segment covers it (do_resolve's job — never the first segment's,
+    review finding R1)."""
     import re
-    m = re.search(r"\((\w+)\)", out)
-    if not m:
-        raise RuntimeError(f"cannot resolve md under {srcdev}: {out}")
-    return f"/dev/{m.group(1)}"
+    segs = dm_segments(srcdev)
+    for s in segs:
+        if not re.fullmatch(r"md\d+", os.path.basename(s["dev"])):
+            raise RuntimeError(f"non-md segment source {s['dev']} under {srcdev}")
+    return segs
 
 
 def main() -> int:
