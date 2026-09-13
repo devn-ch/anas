@@ -15,7 +15,9 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { SelfhealOutcome } from '@anas/shared'
 import { crc32c } from '../selfheal-csum.js'
+import { geometryFromAttributes, parseMdDetailExport } from '../selfheal-map.js'
 import {
+  boundedWindowCheck,
   gfInv,
   gfMul,
   gfPow2,
@@ -115,6 +117,8 @@ class FakeNode implements CommandExecutor {
   wroteThroughMd: Buffer | null = null
   /** dmsetup's global table, so a pvmove can be staged. */
   dmTableAll = fixture('dmsetup-table-all.txt')
+  /** The LV's own table — overridden to stage a multi-band pool. */
+  dmTableLv = fixture('dmsetup-table-lv.txt')
   /** §12: paths findmnt should report as mounted (the top-level-mount gate). */
   readonly mounted = new Set<string>()
   /** §12: what `btrfs subvolume list` reports. */
@@ -149,6 +153,19 @@ class FakeNode implements CommandExecutor {
     }
     writeFileSync(join(this.sys, 'mismatch_cnt'), `${this.precheckMismatch}\n`)
     writeFileSync(join(this.sys, 'sync_completed'), '999999 / 407552\n')
+    // A SECOND band, so a multi-band pool can be staged: a different array with
+    // a different chunk size and a different data offset (captured rig).
+    const band2 = join(this.root, 'sys/block/md126/md')
+    mkdirSync(band2, { recursive: true })
+    for (const line of fixture('twoband-md-sysfs-band2.txt').split('\n')) {
+      const eq = line.indexOf('=')
+      if (eq <= 0 || line.slice(eq + 1) === '<absent>')
+        continue
+      const path = join(band2, line.slice(0, eq))
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(path, `${line.slice(eq + 1)}\n`)
+    }
+    writeFileSync(join(band2, 'sync_completed'), '999999 / 405504\n')
 
     const siblings = [1, 2, 3, 5].map(i => filler(i))
     this.members.set(MEMBERS[1], siblings[0])
@@ -181,7 +198,11 @@ class FakeNode implements CommandExecutor {
 
     if (command === '/usr/bin/readlink') {
       const target = args[1]
-      return ok(target.includes('9:127') ? '/sys/devices/virtual/block/md127\n' : `${target}\n`)
+      if (target.includes('9:127'))
+        return ok('/sys/devices/virtual/block/md127\n')
+      if (target.includes('9:126'))
+        return ok('/sys/devices/virtual/block/md126\n')
+      return ok(`${target}\n`)
     }
     if (command === '/usr/bin/findmnt') {
       if (args[0] === '--mountpoint') {
@@ -202,9 +223,12 @@ class FakeNode implements CommandExecutor {
       return ok('')
     }
     if (command === '/usr/sbin/dmsetup')
-      return ok(args.length > 1 ? fixture('dmsetup-table-lv.txt') : this.dmTableAll)
-    if (command === '/usr/sbin/mdadm')
-      return ok(fixture('mdadm-detail-export-raid5.txt'))
+      return ok(args.length > 1 ? this.dmTableLv : this.dmTableAll)
+    if (command === '/usr/sbin/mdadm') {
+      return ok(lastArg(args) === '/dev/md126'
+        ? fixture('twoband-mdadm-detail-export-band2.txt')
+        : fixture('mdadm-detail-export-raid5.txt'))
+    }
     if (command === '/usr/bin/stat')
       return ok('257\n')
     if (command === '/usr/bin/sync')
@@ -273,6 +297,159 @@ class FakeNode implements CommandExecutor {
     }
     void cmd2
     void args2
+    return { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: bytes.toString('base64') }
+  }
+
+  async execToStream(): Promise<ExecStreamResult> {
+    throw new Error('not used')
+  }
+}
+
+/**
+ * A fake RAID1 BAND, with the two legs at DIFFERENT data offsets.
+ *
+ * md does not require a mirror's legs to share `rd<n>/offset` (`--grow
+ * --data-offset` alone can end that), and a leg read at another leg's offset is
+ * 4 KiB of some other block — which passes no checksum and, on the write side,
+ * would be a repair aimed at the wrong place. The legs here are deliberately
+ * skewed so every mirror read has to use the leg's OWN offset to find anything.
+ *
+ * Reads are served from an (offset → bytes) map per device, so a read at the
+ * wrong offset returns zeros rather than quietly succeeding.
+ */
+class FakeMirror implements CommandExecutor {
+  readonly root: string
+  readonly mountpoint: string
+  readonly file: string
+  readonly sys: string
+  readonly legs = new Map<string, Map<number, Buffer>>()
+  readonly calls: { command: string, args: string[] }[] = []
+  readonly memberReads: { device: string, offset: number }[] = []
+  readonly deleted: string[] = []
+  /** What md itself serves at the mapped md byte — `read_balance` picks a leg. */
+  mdBytes: Buffer
+  wroteThroughMd: Buffer | null = null
+
+  /** Leg role → its data offset in bytes. */
+  static readonly OFFSETS = [1048576, 4194304]
+  static readonly LEGS = ['/dev/loop0', '/dev/loop1']
+
+  constructor(options?: { corruptLeg?: number, mdServes?: 'good' | 'bad' | 'neither' }) {
+    this.root = mkdtempSync(join(tmpdir(), 'anas-selfheal-r1-'))
+    this.mountpoint = join(this.root, 'mnt')
+    this.file = join(this.mountpoint, 'f1.bin')
+    this.sys = join(this.root, 'sys/block/md126/md')
+    mkdirSync(this.mountpoint, { recursive: true })
+    mkdirSync(this.sys, { recursive: true })
+    mkdirSync(join(this.root, 'proc/sys/vm'), { recursive: true })
+    writeFileSync(join(this.root, 'proc/sys/vm/drop_caches'), '0')
+
+    for (const line of fixture('md-sysfs-raid1.txt').split('\n')) {
+      const eq = line.indexOf('=')
+      if (eq <= 0 || line.slice(eq + 1) === '<absent>')
+        continue
+      const path = join(this.sys, line.slice(0, eq))
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(path, `${line.slice(eq + 1)}\n`)
+    }
+    // The skew: leg 1 four megabytes in, leg 0 one.
+    writeFileSync(join(this.sys, 'rd0/offset'), `${FakeMirror.OFFSETS[0] / 512}\n`)
+    writeFileSync(join(this.sys, 'rd1/offset'), `${FakeMirror.OFFSETS[1] / 512}\n`)
+    writeFileSync(join(this.sys, 'mismatch_cnt'), '8\n')
+    writeFileSync(join(this.sys, 'sync_completed'), '999999 / 129024\n')
+
+    const junk = Buffer.alloc(BS, 0xAB)
+    const bad = options?.corruptLeg ?? 0
+    for (const [role, device] of FakeMirror.LEGS.entries()) {
+      const content = role === bad ? junk : HEALTHY
+      this.legs.set(device, new Map([[FakeMirror.OFFSETS[role] + MD_BYTE, content]]))
+    }
+    this.mdBytes = options?.mdServes === 'bad'
+      ? junk
+      : options?.mdServes === 'neither'
+        ? Buffer.alloc(BS, 0x5A)
+        : HEALTHY // the default: md served the HEALTHY leg, as it may
+  }
+
+  cleanup(): void {
+    rmSync(this.root, { recursive: true, force: true })
+  }
+
+  knob(key: string): string {
+    return readFileSync(join(this.sys, key), 'utf-8').trim()
+  }
+
+  async exec(command: string, args: string[]): Promise<ExecResult> {
+    this.calls.push({ command, args })
+    const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
+    if (command === '/usr/bin/readlink') {
+      return ok(args[1].includes('9:126') ? '/sys/devices/virtual/block/md126\n' : `${args[1]}\n`)
+    }
+    if (command === '/usr/bin/findmnt') {
+      return args[0] === '--mountpoint' ? { stdout: '', stderr: '', exitCode: 1 } : ok('/dev/mapper/gtsh-data\n')
+    }
+    if (command === '/usr/sbin/dmsetup')
+      return ok(args.length > 1 ? '0 2031616 linear 9:126 2560\n' : 'gtsh-data: 0 2031616 linear 9:126 2560\n')
+    if (command === '/usr/sbin/mdadm')
+      return ok(fixture('mdadm-detail-export-raid1.txt'))
+    if (command === '/usr/bin/stat')
+      return ok('257\n')
+    if (command === '/usr/bin/sync')
+      return ok('')
+    if (command === '/usr/bin/btrfs') {
+      if (args[1] === 'dump-tree') {
+        if (args[2] === '-r')
+          return ok(TREE_ROOTS)
+        const leaf = TREE_LEAVES[Number(args[3])]
+        if (args[2] === '-b' && leaf)
+          return ok(fixture(leaf))
+        return { stdout: '', stderr: `no such block ${args[3]}`, exitCode: 1 }
+      }
+      if (args[1] === 'rootid')
+        return ok('256\n')
+      if (args[0] === 'subvolume' && args[1] === 'delete') {
+        this.deleted.push(args[2])
+        return ok('')
+      }
+      if (args[0] === 'subvolume' && args[1] === 'snapshot')
+        return ok('')
+    }
+    if (command === '/usr/bin/dd') {
+      const target = args.find(a => a.startsWith('of='))?.slice(3) ?? ''
+      const source = args.find(a => a.startsWith('if='))?.slice(3) ?? ''
+      if (target !== '' && target !== '/dev/null') {
+        this.wroteThroughMd = readFileSync(source)
+        this.mdBytes = this.wroteThroughMd
+        for (const [role, device] of FakeMirror.LEGS.entries())
+          this.legs.get(device)?.set(FakeMirror.OFFSETS[role] + MD_BYTE, this.wroteThroughMd)
+        writeFileSync(join(this.sys, 'mismatch_cnt'), '0\n')
+      }
+      return ok('')
+    }
+    return { stdout: '', stderr: `unexpected ${command}`, exitCode: 127 }
+  }
+
+  async pipeline(cmd1: string, args1: string[], cmd2: string, args2: string[]): Promise<PipelineResult> {
+    this.calls.push({ command: cmd1, args: args1 })
+    void cmd2
+    void args2
+    const device = args1.find(a => a.startsWith('if='))?.slice(3) ?? ''
+    const count = Number(args1.find(a => a.startsWith('count='))?.slice(6) ?? '1')
+    const offset = Number(args1.find(a => a.startsWith('skip='))?.slice(5) ?? '0') * BS
+    let bytes: Buffer
+    if (device === '/dev/mapper/gtsh-data') {
+      bytes = Buffer.alloc(count * BS)
+      for (let i = 0; i + 4 <= bytes.length; i += 4)
+        bytes.writeUInt32LE(STORED, i)
+    }
+    else if (device === '/dev/md126') {
+      assert.equal(offset, MD_BYTE, 'the engine read md somewhere the mapping did not point')
+      bytes = this.mdBytes
+    }
+    else {
+      this.memberReads.push({ device, offset })
+      bytes = this.legs.get(device)?.get(offset) ?? Buffer.alloc(BS)
+    }
     return { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: bytes.toString('base64') }
   }
 
@@ -435,6 +612,54 @@ describe('selfheal repair — a corrupt block on a RAID5 member', () => {
   })
 })
 
+/**
+ * R1 — a multi-band pool. The LV is a linear concatenation of one md array per
+ * band (AHR-DESIGN §2.6), and the block under repair is in the SECOND band.
+ * Before the fix the whole run took its geometry from the FIRST segment: the
+ * block was placed with the wrong array's chunk size and member list, and read,
+ * guarded and WRITTEN on the wrong disks.
+ */
+describe('selfheal repair — a block in the second band of the pool', () => {
+  useNode(() => {
+    const built = new FakeNode()
+    // Band 1 is a 2048-sector sliver on ANOTHER array (md126, 512 K chunk,
+    // 2 MiB data offset); band 2 is the rig's own array, and the segment's
+    // offset keeps every captured number (md byte, member offset) unchanged.
+    built.dmTableLv = '0 2048 linear 9:126 0\n2048 2029568 linear 9:127 4608\n'
+    built.dmTableAll = `gtsh-data: ${built.dmTableLv.split('\n')[0]}\n`
+    return built
+  })
+
+  it('resolves, reads and writes through the BAND\'s own array', async () => {
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.equal(outcome.array, '/dev/md127', 'the band the block is on')
+    assert.equal(outcome.diagnostics?.mapping?.memberDevice, MEMBERS[TARGET_ROLE])
+    assert.equal(outcome.diagnostics?.mapping?.mdByte, MD_BYTE)
+    assert.equal(outcome.diagnostics?.mapping?.chunkBytes, 65536, 'band 2\'s chunk, not band 1\'s 512 K')
+    assert.ok(node.wroteThroughMd?.equals(HEALTHY))
+  })
+
+  it('reads and writes NO block device but band 2\'s array and its members', async () => {
+    await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    const onBand1 = node.calls.filter(c => c.command === '/usr/bin/dd' && c.args.some(a => a.includes('/dev/md126')))
+    assert.deepEqual(onBand1, [], 'band 1\'s array was read or written')
+    // Its knobs are read (the gates check every band) but never turned: the
+    // engine's one rmw_level write goes to the band under repair.
+    assert.equal(readFileSync(join(node.root, 'sys/block/md126/md/rmw_level'), 'utf-8').trim(), '1')
+    assert.equal(node.knob('rmw_level'), '1')
+  })
+
+  it('REFUSES a pool whose segment is not on an md array at all', async () => {
+    node.dmTableLv = '0 2031616 linear 9:200 2560\n'
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'mapping-abort')
+    assert.match(outcome.reason, /is not an md array/)
+    assert.equal(node.wroteThroughMd, null)
+  })
+})
+
 describe('selfheal repair — the verdicts that write nothing', () => {
   useNode(() => new FakeNode())
 
@@ -500,6 +725,132 @@ describe('selfheal repair — the verdicts that write nothing', () => {
     assert.equal(outcome.outcome, 'unrepairable')
     assert.match(outcome.reason, /^refused: a pvmove is in flight \(pvmove0\)/)
     assert.equal(node.wroteThroughMd, null)
+  })
+})
+
+/**
+ * R3 — the eviction sweep's bound. `rd<n>/size` is in KIBIBYTES and is already
+ * net of the data offset; reading it as sectors and subtracting the offset a
+ * second time put the array's last stripe at roughly half its real one, so no
+ * stripe in the upper half was ever swept — and a check over a stale cached
+ * stripe reports `mismatch_cnt=0`, which the engine calls `above-md`.
+ */
+describe('selfheal repair — evicting the stripe cache near the end of the array', () => {
+  useNode(() => new FakeNode())
+
+  /** The rig's own geometry, pointed at the fake node's sysfs. */
+  function geometry() {
+    const attributes: Record<string, string | null> = {}
+    for (const line of fixture('md-sysfs-raid5.txt').split('\n')) {
+      const eq = line.indexOf('=')
+      if (eq > 0)
+        attributes[line.slice(0, eq)] = line.slice(eq + 1) === '<absent>' ? null : line.slice(eq + 1)
+    }
+    return geometryFromAttributes('/dev/md127', 'md127', node.sys, attributes, parseMdDetailExport(fixture('mdadm-detail-export-raid5.txt'), 6))
+  }
+
+  it('sweeps the stripes around a target near the END of the array', async () => {
+    const geo = geometry()
+    // 203776 KiB of data per member = 407552 sectors = 3184 stripes of 128.
+    const start = node.calls.length
+    await boundedWindowCheck(node, geo, 3180, { ...OPTIONS, evictSpan: 5 })
+    const swept = node.calls
+      .slice(start)
+      .filter(c => c.command === '/usr/bin/dd' && c.args.includes('of=/dev/null'))
+      .map(c => Number(c.args.find(a => a.startsWith('skip='))?.slice(5)) / 80)
+    assert.deepEqual(swept, [3175, 3176, 3177, 3178, 3179, 3181, 3182, 3183])
+  })
+
+  it('stops at the last stripe rather than reading past the end of the array', async () => {
+    const geo = geometry()
+    const start = node.calls.length
+    await boundedWindowCheck(node, geo, 3183, { ...OPTIONS, evictSpan: 5 })
+    const swept = node.calls
+      .slice(start)
+      .filter(c => c.command === '/usr/bin/dd' && c.args.includes('of=/dev/null'))
+      .map(c => Number(c.args.find(a => a.startsWith('skip='))?.slice(5)) / 80)
+    assert.deepEqual(swept, [3178, 3179, 3180, 3181, 3182])
+  })
+})
+
+/**
+ * R4 + R5 — the mirror path. Both findings are invisible on a rig whose legs
+ * share a data offset and whose md happens to serve the failing leg, which is
+ * every rig the suite builds; they live or die here.
+ */
+describe('selfheal repair — a RAID1 band', () => {
+  let mirror: FakeMirror
+
+  function use(build: () => FakeMirror): void {
+    beforeEach(() => {
+      mirror = build()
+      process.env.ANAS_SELFHEAL_KERNEL_ROOT = mirror.root
+      process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(mirror.root, 'run')
+    })
+    afterEach(() => {
+      delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+      delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+      mirror.cleanup()
+    })
+  }
+
+  describe('with the legs at different data offsets', () => {
+    use(() => new FakeMirror())
+
+    it('reads every leg at ITS OWN offset and repairs from the good one', async () => {
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+
+      assert.equal(outcome.outcome, 'repaired', outcome.reason)
+      assert.equal(outcome.diagnostics?.reconstruction, 'mirror')
+      assert.ok(mirror.wroteThroughMd?.equals(HEALTHY))
+      // Leg 0 at 1 MiB + md byte, leg 1 at 4 MiB + md byte — never one offset
+      // for both, which is what returned zeros before R4.
+      const perLeg = new Map(mirror.memberReads.map(r => [r.device, new Set<number>()]))
+      for (const read of mirror.memberReads)
+        perLeg.get(read.device)?.add(read.offset)
+      assert.deepEqual([...(perLeg.get(FakeMirror.LEGS[0]) ?? [])], [FakeMirror.OFFSETS[0] + MD_BYTE])
+      assert.deepEqual([...(perLeg.get(FakeMirror.LEGS[1]) ?? [])], [FakeMirror.OFFSETS[1] + MD_BYTE])
+    })
+
+    it('reports the FAILING leg as the member, at that leg\'s own offset', async () => {
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.diagnostics?.mapping?.memberDevice, FakeMirror.LEGS[0])
+      assert.equal(outcome.diagnostics?.mapping?.memberOffset, FakeMirror.OFFSETS[0] + MD_BYTE)
+    })
+  })
+
+  describe('and the read-back guard', () => {
+    // md's read_balance may serve EITHER leg. Both are legitimate, and the
+    // repair must not depend on which one it got.
+    use(() => new FakeMirror({ mdServes: 'good' }))
+
+    it('passes when md served the HEALTHY leg (R5: not a failed mapping)', async () => {
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'repaired', outcome.reason)
+      const guard = outcome.steps.find(s => s.name === 'guard')
+      assert.match(guard?.detail ?? '', /md serves a mirror read from either leg/)
+    })
+  })
+
+  describe('and the read-back guard when md serves the failing leg', () => {
+    use(() => new FakeMirror({ mdServes: 'bad' }))
+
+    it('passes too — either leg proves the md offset is this mirror\'s', async () => {
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'repaired', outcome.reason)
+      assert.ok(mirror.wroteThroughMd?.equals(HEALTHY))
+    })
+  })
+
+  describe('and the read-back guard when md matches NEITHER leg', () => {
+    use(() => new FakeMirror({ mdServes: 'neither' }))
+
+    it('REFUSES: the md offset is not where these member bytes live', async () => {
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'unrepairable')
+      assert.match(outcome.reason, /matches NO leg of this mirror/)
+      assert.equal(mirror.wroteThroughMd, null)
+    })
   })
 })
 

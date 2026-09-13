@@ -36,6 +36,7 @@ import {
   writeMdAttr,
 } from './selfheal-io.js'
 import {
+  memberOffsetOn,
   parseDmTable,
   resolveBlock,
   resolveContext,
@@ -71,6 +72,7 @@ import {
  *  reconstruct XOR (RAID5) / P-XOR then Q syndrome (RAID6) / the other legs (RAID1)
  *  arbitrate   crc32c(candidate) vs the stored csum — the whole claim of the epic
  *  guard       the md block at the computed offset must equal the member bytes
+ *              (RAID1: ANY leg's — md serves a mirror read from either)
  *  write       the winner through md, O_DIRECT + fsync
  *  postcheck   bounded check again; anything but 0 is a failure, not a success
  *  coldread    the block through the FRESH SNAPSHOT, O_DIRECT
@@ -258,9 +260,8 @@ async function evictStripeCache(
   await writeMdAttr(geo.sys, 'stripe_cache_size', STRIPE_CACHE_FLOOR)
   try {
     const dataDisks = geo.raidDisks - (geo.raid6 ? 2 : 1)
-    const memberSectors = Number(await readMdAttr(geo.sys, 'rd0/size'))
-    const dataSectors = memberSectors - geo.dataOffsets[0] / 512
-    const lastStripe = Math.floor(dataSectors / windowSectors(geo))
+    const dataSectors = await memberDataSectors(geo)
+    const lastStripe = dataSectors === null ? stripe + span + 1 : Math.floor(dataSectors / windowSectors(geo))
     for (let s = Math.max(0, stripe - span); s < Math.min(stripe + span + 1, lastStripe); s++) {
       if (s === stripe)
         continue
@@ -270,6 +271,34 @@ async function evictStripeCache(
   finally {
     await writeMdAttr(geo.sys, 'stripe_cache_size', original)
   }
+}
+
+/**
+ * How many 512-byte sectors of DATA each member of the array holds.
+ *
+ * `rd<n>/size` is in KIBIBYTES, and it is already the usable component size —
+ * net of the data offset (the raid5 rig's `203776` is the 200 MiB member minus
+ * its 1 MiB offset, and md's own `sync_completed` counts out of exactly
+ * 407,552 sectors). Reading it as sectors AND subtracting the offset again put
+ * the last stripe at half the array, so the sweep never reached a stripe in the
+ * upper half and a stale cache was read back as `mismatch_cnt=0` — an
+ * `above-md` verdict on rot that was below md all along.
+ *
+ * Read from the first SURVIVING role: the kernel removes a faulty member's
+ * `rd<n>` from sysfs immediately, so `rd0` is not guaranteed to exist on an
+ * array that is otherwise fine. Null when no role reports a size — the caller
+ * then bounds the sweep by the span alone rather than inventing a number.
+ */
+async function memberDataSectors(geo: MdGeometry): Promise<number | null> {
+  for (let role = 0; role < geo.raidDisks; role++) {
+    const kib = await readMdAttrOrNull(geo.sys, `rd${role}/size`)
+    if (kib === null)
+      continue
+    const sectors = Number(kib) * 2
+    if (Number.isFinite(sectors) && sectors > 0)
+      return sectors
+  }
+  return null
 }
 
 /**
@@ -456,6 +485,7 @@ export async function repairBlock(
     throw new SelfhealRunError(`${file} is not under ${mountpoint}`, steps, diagnostics)
 
   let pin: Pin | null = null
+  /** The BAND under repair — set once the block is resolved, and the only array touched. */
   let geometry: MdGeometry | null = null
   let savedRmwLevel: string | null = null
   let savedStripeCache: string | null = null
@@ -485,10 +515,12 @@ export async function repairBlock(
 
   try {
     // ---- gates ----------------------------------------------------------
+    // Every band is gated, not just the one the block turns out to be on: which
+    // band that is is only known after the pin (the pool could be rewritten
+    // between the two), and a pool with any band degraded or busy is one the
+    // route already refuses as a whole.
     await step('gates')
     const context = await resolveContext(executor, mountpoint)
-    geometry = context.geometry
-    savedStripeCache = await readMdAttrOrNull(geometry.sys, 'stripe_cache_size')
     const refusal = await gateRefusal(executor, context, request.pool ?? null, options)
     if (refusal)
       fail('unrepairable', `refused: ${refusal}`)
@@ -506,10 +538,14 @@ export async function repairBlock(
     // ---- resolve (AFTER the pin, so the mapping describes the pinned state)
     await step('resolve')
     const pinned = await resolveContext(executor, mountpoint)
-    geometry = pinned.geometry
     const resolved = await resolveBlock(executor, pinned, file, request.block)
-    diagnostics.mapping = mappingOf(resolved, pinned.geometry)
-    note(`m${resolved.sectors[0].memberIndex}@${resolved.sectors[0].memberOffset} `
+    // The band the block is on — its own array, its own geometry, its own
+    // sysfs. Everything below reads and writes through THIS and nothing else.
+    const band = resolved.sectors[0].geometry
+    geometry = band
+    savedStripeCache = await readMdAttrOrNull(band.sys, 'stripe_cache_size')
+    diagnostics.mapping = mappingOf(resolved)
+    note(`${band.device} m${resolved.sectors[0].memberIndex}@${resolved.sectors[0].memberOffset} `
       + `md@${resolved.sectors[0].mdByte} stripe ${resolved.sectors[0].stripe ?? 'n/a'}`)
 
     // ---- reverify -------------------------------------------------------
@@ -519,18 +555,20 @@ export async function repairBlock(
     if (verdict.abort)
       fail(verdict.abort.kind, verdict.abort.reason)
     const target = resolved.sectors[verdict.badSectors[0]]
+    const geo = target.geometry
     const corruptBytes = verdict.corruptBytes
     const storedCsum = verdict.storedCsum
     diagnostics.storedCsum = csumHex(storedCsum)
     if (verdict.badMirror !== null && diagnostics.mapping) {
       diagnostics.mapping.memberIndex = verdict.badMirror
-      diagnostics.mapping.memberDevice = pinned.geometry.members[verdict.badMirror] as string
+      diagnostics.mapping.memberDevice = geo.members[verdict.badMirror] as string
+      diagnostics.mapping.memberOffset = memberOffsetOn(geo, target, verdict.badMirror)
     }
 
     // ---- precheck -------------------------------------------------------
     await step('precheck')
-    const stripe = target.stripe ?? Math.floor(target.mdByte / (windowSectors(pinned.geometry) * 512))
-    const before = await boundedWindowCheck(executor, pinned.geometry, stripe, options)
+    const stripe = target.stripe ?? Math.floor(target.mdByte / (windowSectors(geo) * 512))
+    const before = await boundedWindowCheck(executor, geo, stripe, options)
     diagnostics.precheckMismatch = before
     note(`mismatch_cnt=${before}`)
     if (before === 0) {
@@ -539,13 +577,13 @@ export async function repairBlock(
 
     // ---- rmw ------------------------------------------------------------
     await step('rmw')
-    savedRmwLevel = await readMdAttrOrNull(pinned.geometry.sys, 'rmw_level')
+    savedRmwLevel = await readMdAttrOrNull(geo.sys, 'rmw_level')
     if (savedRmwLevel !== null)
-      await writeMdAttr(pinned.geometry.sys, 'rmw_level', '0')
+      await writeMdAttr(geo.sys, 'rmw_level', '0')
 
     // ---- reconstruct ----------------------------------------------------
     await step('reconstruct')
-    const candidates = await reconstruct(executor, pinned.geometry, target, verdict.goodMirrors)
+    const candidates = await reconstruct(executor, geo, target, verdict.goodMirrors)
     if (candidates.length === 0)
       fail('unrepairable', `no candidate could be reconstructed for ${file} block ${request.block}`)
     note(candidates.map(c => c.how).join(', '))
@@ -571,18 +609,18 @@ export async function repairBlock(
 
     // ---- guard ----------------------------------------------------------
     await step('guard')
-    const throughMd = await readDirect(executor, pinned.geometry.device, target.mdByte, BLOCK_BYTES)
-    if (!throughMd.equals(corruptBytes)) {
-      fail('unrepairable', `read-back guard failed: the md block at ${target.mdByte} does not match the bytes read from ${target.memberDevice} at ${target.memberOffset}. The mapping and the array disagree; nothing was written.`)
-    }
+    const guard = await readBackGuard(executor, geo, target, corruptBytes)
+    note(guard.detail)
+    if (!guard.ok)
+      fail('unrepairable', guard.detail)
 
     // ---- write ----------------------------------------------------------
     await step('write')
-    await writeDirect(executor, pinned.geometry.device, target.mdByte, winner.bytes)
+    await writeDirect(executor, geo.device, target.mdByte, winner.bytes)
 
     // ---- postcheck ------------------------------------------------------
     await step('postcheck')
-    const after = await boundedWindowCheck(executor, pinned.geometry, stripe, options)
+    const after = await boundedWindowCheck(executor, geo, stripe, options)
     diagnostics.postcheckMismatch = after
     note(`mismatch_cnt=${after}`)
     if (after !== 0) {
@@ -671,32 +709,25 @@ export async function repairBlock(
 //  Steps
 // ---------------------------------------------------------------------------
 
-/** Why this repair must not run right now, or null when it may. */
+/**
+ * Why this repair must not run right now, or null when it may.
+ *
+ * EVERY band of the pool is checked. Which band the block is on is not known
+ * until it has been pinned and resolved, and an AHR pool with any band
+ * degraded, resyncing or reshaping is one the operator is told to leave alone
+ * as a whole — the route refuses it by pool state for the same reason.
+ */
 async function gateRefusal(
   executor: CommandExecutor,
   ctx: SelfhealContext,
   pool: AhrPool | null,
   options?: SelfhealRepairOptions,
 ): Promise<string | null> {
-  const geo = ctx.geometry
-  const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
-  if (degraded !== null && degraded !== '0') {
-    return `${geo.device} is degraded (${degraded} member${degraded === '1' ? '' : 's'} missing) — a reconstruction needs every other member of the stripe`
+  for (const band of ctx.bands) {
+    const refusal = await arrayRefusal(band.geometry)
+    if (refusal)
+      return refusal
   }
-  if (geo.members.includes(null))
-    return `${geo.device} is missing a member — a reconstruction needs every other member of the stripe`
-
-  const action = await readMdAttr(geo.sys, 'sync_action')
-  if (action !== 'idle')
-    return `${geo.device} is busy (sync_action=${action}) — resync, recovery, reshape and check all move or re-read the bytes this repair depends on`
-
-  const reshape = await readMdAttrOrNull(geo.sys, 'reshape_position')
-  if (reshape !== null && reshape !== 'none')
-    return `${geo.device} is mid-reshape (reshape_position=${reshape}) — the layout under this block is changing`
-
-  const state = await readMdAttr(geo.sys, 'array_state')
-  if (REFUSED_ARRAY_STATES[state])
-    return `${geo.device}: ${REFUSED_ARRAY_STATES[state]} (array_state=${state})`
 
   // An in-flight pvmove replaces the LV's linear target with a mirror and moves
   // extents underneath it: every byte offset this chain computes would be stale.
@@ -730,6 +761,29 @@ async function gateRefusal(
     if ((await executor.exec(FINDMNT, ['--mountpoint', mnt])).exitCode === 0)
       return `the top-level mount for pool '${pool.name}' is already held at ${mnt} — a backup or snapshot job is in flight. Repair needs that mount to itself; retry when the other job has finished`
   }
+  return null
+}
+
+/** Why ONE band's array cannot be repaired on right now, or null when it can. */
+async function arrayRefusal(geo: MdGeometry): Promise<string | null> {
+  const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
+  if (degraded !== null && degraded !== '0') {
+    return `${geo.device} is degraded (${degraded} member${degraded === '1' ? '' : 's'} missing) — a reconstruction needs every other member of the stripe`
+  }
+  if (geo.members.includes(null))
+    return `${geo.device} is missing a member — a reconstruction needs every other member of the stripe`
+
+  const action = await readMdAttr(geo.sys, 'sync_action')
+  if (action !== 'idle')
+    return `${geo.device} is busy (sync_action=${action}) — resync, recovery, reshape and check all move or re-read the bytes this repair depends on`
+
+  const reshape = await readMdAttrOrNull(geo.sys, 'reshape_position')
+  if (reshape !== null && reshape !== 'none')
+    return `${geo.device} is mid-reshape (reshape_position=${reshape}) — the layout under this block is changing`
+
+  const state = await readMdAttr(geo.sys, 'array_state')
+  if (REFUSED_ARRAY_STATES[state])
+    return `${geo.device}: ${REFUSED_ARRAY_STATES[state]} (array_state=${state})`
   return null
 }
 
@@ -923,7 +977,7 @@ async function reverify(
   ctx: SelfhealContext,
   resolved: ResolvedBlock,
 ): Promise<Reverified> {
-  const geo = ctx.geometry
+  const geo = resolved.sectors[0].geometry
   const badSectors: number[] = []
   let corruptBytes: Buffer = Buffer.alloc(0)
   let storedCsum = 0
@@ -951,7 +1005,8 @@ async function reverify(
       let bad: number | null = null
       for (const leg of location.mirrors) {
         const device = geo.members[leg] as string
-        const bytes = await readMemberWithRetry(executor, device, location.memberOffset, stored)
+        // Each leg at ITS OWN data offset — they are allowed to differ.
+        const bytes = await readMemberWithRetry(executor, device, memberOffsetOn(geo, location, leg), stored)
         if (crc32c(bytes.value) === stored) {
           good.push(leg)
         }
@@ -1022,6 +1077,50 @@ async function reverify(
 }
 
 /**
+ * The read-back guard: prove the md offset about to be WRITTEN is the one the
+ * member bytes were READ from.
+ *
+ * On a parity level the block lives on exactly one member, so the through-md
+ * read must equal the bytes read directly off that member — anything else says
+ * the mapping and the array disagree, and nothing is written.
+ *
+ * On RAID1 md serves a read from whichever leg its `read_balance` picks, so the
+ * through-md bytes are as likely to be the HEALTHY leg's as the failing one's.
+ * Demanding the failing leg's bytes there fails a repair that is perfectly
+ * sound, roughly half the time. What the guard can still prove — and what it
+ * has to prove — is that the md offset maps onto THIS mirror set: the
+ * through-md bytes must equal what one of the legs holds at its own offset.
+ */
+async function readBackGuard(
+  executor: CommandExecutor,
+  geo: MdGeometry,
+  target: MemberLocation,
+  corruptBytes: Buffer,
+): Promise<{ ok: boolean, detail: string }> {
+  const throughMd = await readDirect(executor, geo.device, target.mdByte, BLOCK_BYTES)
+  if (!geo.raid1) {
+    return throughMd.equals(corruptBytes)
+      ? { ok: true, detail: `the md block at ${target.mdByte} is the bytes read from ${target.memberDevice}` }
+      : {
+          ok: false,
+          detail: `read-back guard failed: the md block at ${target.mdByte} does not match the bytes read from ${target.memberDevice} at ${target.memberOffset}. The mapping and the array disagree; nothing was written.`,
+        }
+  }
+  for (const leg of target.mirrors) {
+    const device = geo.members[leg]
+    if (!device)
+      continue
+    const bytes = await readDirect(executor, device, memberOffsetOn(geo, target, leg), BLOCK_BYTES)
+    if (throughMd.equals(bytes))
+      return { ok: true, detail: `the md block at ${target.mdByte} is the copy on ${device} (md serves a mirror read from either leg)` }
+  }
+  return {
+    ok: false,
+    detail: `read-back guard failed: the md block at ${target.mdByte} matches NO leg of this mirror at its own offset. The mapping and the array disagree; nothing was written.`,
+  }
+}
+
+/**
  * Read one member block, retrying a read whose content does not pass the csum.
  *
  * A mirror leg can hand back a TORN read (a write that landed on one leg while
@@ -1062,7 +1161,7 @@ async function reconstruct(
     for (const leg of goodMirrors) {
       const device = geo.members[leg] as string
       out.push({
-        bytes: await readDirect(executor, device, target.memberOffset, BLOCK_BYTES),
+        bytes: await readDirect(executor, device, memberOffsetOn(geo, target, leg), BLOCK_BYTES),
         how: 'mirror',
         detail: `the copy on ${device}`,
       })
@@ -1073,8 +1172,7 @@ async function reconstruct(
   const stripe = target.stripe as number
   const row = async (member: number): Promise<Buffer> => {
     const device = geo.members[member] as string
-    const offset = geo.dataOffsets[member] + stripe * geo.chunkBytes + (target.mdByte % geo.chunkBytes)
-    return readDirect(executor, device, offset, BLOCK_BYTES)
+    return readDirect(executor, device, memberOffsetOn(geo, target, member), BLOCK_BYTES)
   }
 
   if (!geo.raid6) {
@@ -1147,8 +1245,9 @@ async function coldRead(
 }
 
 /** The resolved chain, flattened for the outcome's audit trail. */
-function mappingOf(resolved: ResolvedBlock, geo: MdGeometry): SelfhealMapping {
+function mappingOf(resolved: ResolvedBlock): SelfhealMapping {
   const first = resolved.sectors[0]
+  const geo = first.geometry
   return {
     level: geo.level,
     raidDisks: geo.raidDisks,

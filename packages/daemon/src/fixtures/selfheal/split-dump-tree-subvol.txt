@@ -1,0 +1,52 @@
+btrfs-progs v6.14
+file tree key (256 ROOT_ITEM 0) 
+leaf 30785536 items 9 free space 15479 generation 10 owner 256
+leaf 30785536 flags 0x1(WRITTEN) backref revision 1
+fs uuid 6e165758-e990-4501-acff-9683ebc93868
+chunk uuid e64c4bb4-0ca2-477e-891b-913cff5d8216
+	item 0 key (256 INODE_ITEM 0) itemoff 16123 itemsize 160
+		generation 9 transid 9 size 12 nbytes 0
+		block group 0 mode 40755 links 1 uid 0 gid 0 rdev 0
+		sequence 5 flags 0x0(none)
+		atime 1789313177.201625474 (2026-09-13 15:26:17)
+		ctime 1789313177.203625541 (2026-09-13 15:26:17)
+		mtime 1789313177.203625541 (2026-09-13 15:26:17)
+		otime 1789313177.201625474 (2026-09-13 15:26:17)
+	item 1 key (256 INODE_REF 256) itemoff 16111 itemsize 12
+		index 0 namelen 2 name: ..
+	item 2 key (256 DIR_ITEM 1175033797) itemoff 16075 itemsize 36
+		location key (257 INODE_ITEM 0) type FILE
+		transid 9 data_len 0 name_len 6
+		name: f1.bin
+	item 3 key (256 DIR_INDEX 2) itemoff 16039 itemsize 36
+		location key (257 INODE_ITEM 0) type FILE
+		transid 9 data_len 0 name_len 6
+		name: f1.bin
+	item 4 key (257 INODE_ITEM 0) itemoff 15879 itemsize 160
+		generation 9 transid 10 size 8388608 nbytes 8388608
+		block group 0 mode 100644 links 1 uid 0 gid 0 rdev 0
+		sequence 68 flags 0x0(none)
+		atime 1789313177.203625541 (2026-09-13 15:26:17)
+		ctime 1789313177.263627569 (2026-09-13 15:26:17)
+		mtime 1789313177.263627569 (2026-09-13 15:26:17)
+		otime 1789313177.203625541 (2026-09-13 15:26:17)
+	item 5 key (257 INODE_REF 256) itemoff 15863 itemsize 16
+		index 2 namelen 6 name: f1.bin
+	item 6 key (257 EXTENT_DATA 0) itemoff 15810 itemsize 53
+		generation 9 type 1 (regular)
+		extent data disk byte 13631488 nr 8388608
+		extent data offset 0 nr 1048576 ram 8388608
+		extent compression 0 (none)
+	item 7 key (257 EXTENT_DATA 1048576) itemoff 15757 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 84082688 nr 4096
+		extent data offset 0 nr 4096 ram 4096
+		extent compression 0 (none)
+	item 8 key (257 EXTENT_DATA 1052672) itemoff 15704 itemsize 53
+		generation 9 type 1 (regular)
+		extent data disk byte 13631488 nr 8388608
+		extent data offset 1052672 nr 7335936 ram 8388608
+		extent compression 0 (none)
+total bytes 1073741824
+bytes used 8556544
+uuid 6e165758-e990-4501-acff-9683ebc93868

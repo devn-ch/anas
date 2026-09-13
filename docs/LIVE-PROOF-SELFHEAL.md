@@ -810,7 +810,81 @@ Nothing. Specifically:
   scripts) and the poll helpers were removed. `/root/aq.sh` — which predates this round — stays.
 - The node is running the build with the F1 and F2 fixes.
 
+---
+
 ## Review remediation 2026-09-13
+
+The code review of `v0.3.1..HEAD` (2026-09-12) against this arc, remediated in three lanes: the
+engine and scrub findings (R1–R7) below, the schedule/UI/packaging findings (R8–R10) at the end of
+this section, and the suite's own two-band rig (case 7).
+
+### Engine and scrub lane (R1–R7)
+
+Seven findings, all fixed at the source, each with a regression test that fails on the old code
+and passes on the new one. Two new fixture captures were taken on the same stunt node and torn
+down after (`PROVENANCE.md`: "Split-extent fixtures", "Multi-band fixtures").
+
+| id | the finding | the fix | the test |
+|---|---|---|---|
+| R1 | `resolveContext` derived ONE `MdGeometry` from `segments[0]`, so a block in a later band of a multi-band pool was placed with band 1's geometry and read — and WRITTEN — on band 1's md device. | The context now carries BANDS: every dm segment resolved to its own md array and geometry, the band picked by the LV byte, and that band's device, members and sysfs used for the placement, the reads, the guard and the write. A segment whose device is not an md array is refused by name. | `selfheal-map.test.ts` — a live two-band capture (64 K and 512 K chunks, 1 MiB and 2 MiB data offsets): a byte in band 2 resolves to band 2's array, member and offset, and to a DIFFERENT member than band 1's geometry would have said. `selfheal-repair.test.ts` — a whole repair whose block is in band 2 reads and writes only band 2's array, and a segment on a non-md device is refused. |
+| R2 | `EXTENT_SPAN_RE` dropped the EXTENT_DATA `extent data offset`, so after any CoW split `repairUnitFor` computed a logical bytenr a megabyte short; and `extentsForStripe` read an EXTENT_DATA_REF `offset` as a file offset, which it is not (btrfs stores `file_offset − extent_data_offset`). | The field is parsed and carried; `logicalByte = disk byte + extent data offset + (file offset − the item's file offset)`, bound-checked against the item's own `nr`. Backrefs are resolved by finding every EXTENT_DATA item of the inode that references THAT extent, forward from the backref offset. | `selfheal-map.test.ts` + `selfheal-csum.test.ts` against a live split capture (8 MiB file, 4 KiB overwritten 1 MiB in): block 300 maps to logical 14,860,288, whose STORED csum (`0x8b9126a3`, read off the rig's own csum leaf) equals crc32c of the file's block — while the pre-fix byte (13,807,616) carries a different block's csum. The backref with `count 2` resolves to BOTH owning items. |
+| R3 | `evictStripeCache` read `rd0/size` as 512-byte sectors and subtracted the data offset again — it is KiB and already net of it — putting the last stripe at half the array, so a stripe in the upper half was never swept and a stale cache read back as `mismatch_cnt=0` (`above-md` on rot that was below md). | The size is read in KiB from the first SURVIVING role and doubled; nothing is subtracted twice. | `selfheal-repair.test.ts` — on the captured raid5 rig (203776 KiB + a 1 MiB offset = the 200 MiB member) the sweep around stripe 3180 covers 3175–3183 and stops at the real last stripe; pre-fix it swept nothing at all there. |
+| R4 | Every RAID1 leg was read at the FIRST leg's data offset, though `geometryFromAttributes` already reads each member's own `rd<n>/offset`. | One helper, `memberOffsetOn`, computes a member's offset from ITS own data offset — used by the mirror re-verify, the mirror candidates, the guard and the parity row reads alike. | `selfheal-map.test.ts` for the helper; `selfheal-repair.test.ts` drives a whole repair on a mirror whose legs sit at 1 MiB and 4 MiB, and asserts each leg was read at its own offset. |
+| R5 | The read-back guard compared the through-md read against ONE failing leg's bytes; md's `read_balance` may serve the healthy leg, so a sound repair failed as `unrepairable` about half the time. | On RAID1 the guard passes when the through-md bytes equal ANY leg's bytes read directly — which is what proves the md offset maps onto this mirror set. RAID5/6 keep the strict single-member comparison. | `selfheal-repair.test.ts` — md serving the healthy leg, md serving the failing leg (both repair), and md matching NEITHER leg (refused, nothing written). |
+| R6 | The phase-1 wait loop could break on its first mdstat read before md had started the check: a stale `mismatch_cnt` was read as this scrub's verdict and phase 2 ran concurrently with the check. | After issuing the check the band is polled until md says it is running (`sync_action`, or mdstat), with a bounded start-wait; a band md never started is recorded as not checked and its counter is NOT read. The finish-wait consults sysfs alongside mdstat, and `mismatch_cnt` is read only after idle plus the settle. | `ahr-scrub.test.ts` — the "idle on the first read, then check, then idle" sequence (the counter is read only after both), and a band md never starts (no counter read, no rot claimed, progress says so). |
+| R7 | `conflictingAhrJob` used `findByOperation`, which returns the LATEST job per (operation, pool) with no status filter, so a newer terminal job hid an older running one; and the scrub route refused only on `ahr.repair`, accepting a second concurrent scrub of the same pool. | `JobQueue.findActive(operations, target)` returns a job that is actually queued or running; both routes use it, and a scrub now refuses a running scrub or repair, as a repair already did. | `jobs/__tests__/queue.test.ts` for the query; `ahr-mutate.test.ts` for both directions of the hidden-running-job case and for the second-scrub refusal. |
+
+Four adjacent items, cut but verified, rode along:
+
+- **The compressed fallback.** When the extents cannot be resolved, a stripe is reported
+  `unidentified` with the reason instead of probing at the kernel's printed offset — for a
+  compressed extent that offset is extent-relative (selfheal.8) and names blocks from a window
+  that is not the finding. Blocks an operator can hand to a repair have to come from a window
+  that was verified. The cost is named: with the mapping out, a finding names its file and not
+  its blocks.
+- **The journal read is bounded.** `journalctl -k -o json` for the scrub window now carries
+  `-n 5000` and `-g 'error at logical'` (both error shapes contain it; a journalctl without
+  pattern matching is retried without `-g`). Unbounded, a node with tens of thousands of errors
+  did not truncate — the 10 MB executor buffer failed the call and the whole attribution was
+  lost. A read that hits the cap sets `truncated`.
+- **`drop_caches` is declared.** The repair drops the node's page cache once per block so the
+  verification read is genuinely cold; the confirm gate now says so ("a busy node will feel it")
+  rather than doing it silently.
+- **Two duplicates collapsed.** The self-heal mapper's private `mdadm --detail --export` parser
+  (which silently dropped `ROLE=spare`) now projects the ONE parser in `parsers/mdadm-detail.ts`
+  onto role slots, spares excluded by name; and `ahr-scrub`'s `probeBlock` is the engine's own
+  `probeFileBlock` (selfheal-io), so "read this block and see" has one definition.
+- **The engine's harness sidecar names the array it used.** `REPAIR_REPORT` now carries `level`,
+  `n` and `chunk` beside the member and stripe — the reference implementation has always written
+  them, and they are the numbers that say WHICH band answered. Case 7's first engine run failed on
+  exactly that: `7-bandA-untouched` passed (`data=0` — the mapping was right and band A was not
+  written), while `7-repair` read `n=None` where band B's 4 was expected.
+
+**The R1 proof, on a live two-band rig.** The suite's case 7 (added this round by the harness lane)
+builds the AHR pool shape — band A RAID5 6 × 200 MiB @ 64 K and band B RAID5 4 × 200 MiB @ 512 K as
+the two PVs of one VG, one LV across both — corrupts a marker block that lives in SEGMENT 2 below
+md, and repairs it. Against the deployed engine:
+
+```
+[PASS] 7-txprobe          18 band-A blocks measured, 0 in a data chunk
+[PASS] 7-scan             hit m2 of band B (loop8); verification-side map: m2 of /dev/md126, stripe 74, member offset 41197568
+[PASS] 7-bandA-untouched  changed sectors: 130 — housekeeping=130 data=0
+[PASS] 7-repair           rc=0 postcheck=0 n=4 (band B n=4) disk=m2 stripe=74 — the XOR of the other 3 members of stripe 74
+[PASS] 7-member           loop8@41197568 match=True
+[PASS] 7-bcheck           stripe 74 of md126: mismatch_cnt=0
+[PASS] 7-cold             eio=[] content_match=True
+[PASS] 7-neg              segment-1 (band A) marker repairs normally — disk=m2 stripe=2168, the XOR of the other 5 members
+[PASS] 7-neg2             eio=[] content_match=True
+
+SUITE: PASS (41/41 cases, 14/14 negative controls)
+```
+
+`n=4` with `disk=m2 stripe=74` is R1 in one line: the block was placed, read and written with band
+B's own geometry (4 members, 512 K chunk), not band A's (6 members, 64 K) — and `7-neg` shows band
+A still repairs normally through the same code. `data=0` on band A is the assertion that runs
+whatever the repair returns.
+
+### Schedule, UI and packaging lane (R8–R10, GLM)
 
 R8 — mdcheck adoption on upgrade: on daemon start, a node with no `anas-scrub` units, mdcheck enabled and ≥1 AHR pool is adopted onto the timer (all pools, monthly, mdcheck disabled, one audit line); the note distinguishes the legacy mdcheck-only state from a true double; uninstall removes the schedule units and re-enables mdcheck's timers.
 

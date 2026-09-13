@@ -1,6 +1,7 @@
 import type { CommandExecutor } from '../executor/types.js'
 import type { TreeRoots } from './selfheal-btree.js'
 import type { CsumItem } from './selfheal-csum.js'
+import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { chunkItemKey, extentDataKey, extentItemKey, findLeaf, readTreeRoots } from './selfheal-btree.js'
 import { BLOCK_BYTES, kernelName, mdSysPath, readMdAttrOrNull } from './selfheal-io.js'
 
@@ -20,8 +21,19 @@ import { BLOCK_BYTES, kernelName, mdSysPath, readMdAttrOrNull } from './selfheal
  *   file + 4 KiB block
  *     → btrfs LOGICAL bytenr            EXTENT_DATA in the subvolume tree
  *     → LV byte                         chunk-tree hop, per-chunk delta
- *     → md byte                         dm linear segment
- *     → (member, member offset)         md layout, read live from sysfs
+ *     → md byte                         dm linear segment — WHICH segment also
+ *                                       says which md ARRAY the byte is on
+ *     → (member, member offset)         that array's layout, read live from sysfs
+ *
+ * ## One geometry per BAND, never one per pool
+ *
+ * An AHR pool's LV is a LINEAR CONCATENATION of one md array per band
+ * (AHR-DESIGN §2.6) — different member counts, different levels, different
+ * chunk sizes, in band order. So the dm segment covering the LV byte is what
+ * names the array, and every later step (placement, the member device, the
+ * sysfs knobs a repair turns) comes from THAT segment's array. A geometry taken
+ * from the first segment would place a band-3 block with band-1's arithmetic
+ * and then read — and write — it on band 1's disks.
  *
  * `filefrag`'s "physical_offset" is the btrfs LOGICAL bytenr, not a device
  * offset (GT-2), and it LIES outright on compressed extents (`physical_hi` is
@@ -84,16 +96,21 @@ const EXTENT_KEY_RE = /item \d+ key \((\d+) EXTENT_DATA (\d+)\)/
 const EXTENT_KIND_RE = /generation \d+ type \d+ \((\w+)\)/
 /** `extent data disk byte <logical> nr <on-disk length>`. */
 const EXTENT_DISK_RE = /extent data disk byte (\d+) nr (\d+)/
-/** `extent data offset <n> nr <length> ram <uncompressed length>`. */
-const EXTENT_SPAN_RE = /extent data offset \d+ nr (\d+) ram (\d+)/
+/**
+ * `extent data offset <n> nr <length> ram <uncompressed length>`.
+ *
+ * The FIRST field is load-bearing and was dropped by an earlier cut: it is how
+ * far into the on-disk extent this item's bytes start. A btrfs CoW split leaves
+ * the tail of the original extent described by an item with a non-zero one
+ * (captured live: a 4 KiB overwrite 1 MiB into an 8 MiB file leaves
+ * `offset 1052672 nr 7335936 ram 8388608`), and a mapping that ignores it lands
+ * a whole megabyte short of the block it was asked for.
+ */
+const EXTENT_SPAN_RE = /extent data offset (\d+) nr (\d+) ram (\d+)/
 /** `extent compression <n> (<name>)`. */
 const EXTENT_COMPRESSION_RE = /extent compression \d+ \((\w+)\)/
 /** `inline extent data size <n> ram_bytes <n> compression <n> (<name>)` — no on-disk extent. */
 const EXTENT_INLINE_RE = /inline extent data size \d+ ram_bytes (\d+) compression \d+ \((\w+)\)/
-/** `MD_DEVICE_<name>_ROLE=<n>` from `mdadm --detail --export`. */
-const MD_DEVICE_ROLE_RE = /^MD_DEVICE_(\S+)_ROLE=(\d+)$/
-/** `MD_DEVICE_<name>_DEV=<path>` from `mdadm --detail --export`. */
-const MD_DEVICE_DEV_RE = /^MD_DEVICE_(\S+)_DEV=(\S+)$/
 /** `Subvolume ID: <n>` from `btrfs subvolume show`. */
 const SUBVOLUME_ID_RE = /Subvolume ID:\s*(\d+)/
 
@@ -166,13 +183,19 @@ export interface ChunkItem {
  * mapping onto logical byte 0.
  */
 export interface ExtentItem {
-  /** Offset of the extent within the file. */
+  /** Offset of the extent within the file (the item's own key). */
   fileOffset: number
   /** btrfs logical bytenr of the on-disk data; 0 means a hole. */
   diskByte?: number
   /** On-disk length (the compressed blob's length when compressed). */
   diskLength?: number
-  /** Length within the file this item covers. */
+  /**
+   * How far INTO the on-disk extent this item's bytes start (`extent data
+   * offset`). Zero on a freshly written extent; non-zero on the pieces a CoW
+   * split leaves behind, and then `fileOffset` alone does not locate the bytes.
+   */
+  extentDataOffset: number
+  /** Length within the file this item covers (`nr` on the span line). */
   length?: number
   /** Uncompressed length of the extent. */
   ram?: number
@@ -188,7 +211,14 @@ export interface MemberLocation {
   logical: number
   /** Byte offset within the btrfs device (the LV). */
   lvByte: number
-  /** Byte offset within the md array. */
+  /**
+   * The BAND this byte is on: the md array the covering dm segment maps onto,
+   * with the geometry read from that array. Every read, every write and every
+   * sysfs knob for this byte goes through it — carrying it here is what makes
+   * a band mix-up impossible on a multi-band pool.
+   */
+  geometry: MdGeometry
+  /** Byte offset within that md array. */
   mdByte: number
   /** Role index of the member carrying it (RAID1: the first leg — see `mirrors`). */
   memberIndex: number
@@ -227,9 +257,12 @@ export interface SelfhealContext {
   mountpoint: string
   /** The btrfs device — the LV. Every tree read runs against THIS, never md. */
   srcDevice: string
-  /** The dm table's linear segments; a btrfs straight on md gets one synthetic identity segment. */
-  segments: DmSegment[]
-  geometry: MdGeometry
+  /**
+   * The pool's bands, in dm-table order: one linear segment and the md array it
+   * maps onto, each with its OWN geometry. A btrfs straight on md gets one
+   * synthetic identity segment, which keeps one code path.
+   */
+  bands: SelfhealBand[]
   /** Where each btrfs tree's root block is (`dump-tree -r`, one bounded exec). */
   roots: TreeRoots
   /** CHUNK_ITEMs learned so far, leaf at a time. */
@@ -303,6 +336,29 @@ export function segmentForLvByte(segments: DmSegment[], lvByte: number): DmSegme
 }
 
 /**
+ * One BAND of the pool: a linear dm segment and the md array underneath it.
+ *
+ * The LV of an AHR pool is the concatenation of one md array per band in band
+ * order (AHR-DESIGN §2.6), and the bands differ — member count, level, chunk
+ * size, per-member data offsets. Pairing the segment with its own geometry in
+ * ONE value is what keeps a block's placement, its member reads and the sysfs
+ * knobs a repair turns all pointed at the same array.
+ */
+export interface SelfhealBand {
+  segment: DmSegment
+  geometry: MdGeometry
+}
+
+/** The band covering an LV byte — the segment, and the array it maps onto. */
+export function bandForLvByte(bands: SelfhealBand[], lvByte: number): SelfhealBand {
+  const segment = segmentForLvByte(bands.map(b => b.segment), lvByte)
+  const band = bands.find(b => b.segment === segment)
+  if (!band)
+    throw new SelfhealMapError(`no md array is resolved for the dm segment covering LV byte ${lvByte}`)
+  return band
+}
+
+/**
  * Parse the CHUNK_ITEMs of `btrfs inspect-internal dump-tree -t 3`.
  *
  * Only `stripe 0` is read: on `DUP` metadata both stripes hold the same bytes
@@ -373,7 +429,7 @@ export function parseExtentItems(dump: string, inode: number): ExtentItem[] {
       inBody = true
       current = null
       if (Number(key[1]) === inode) {
-        current = { fileOffset: Number(key[2]), compression: 'none', type: 'regular' }
+        current = { fileOffset: Number(key[2]), extentDataOffset: 0, compression: 'none', type: 'regular' }
         items.push(current as ExtentItem)
       }
       continue
@@ -398,8 +454,9 @@ export function parseExtentItems(dump: string, inode: number): ExtentItem[] {
     }
     const span = EXTENT_SPAN_RE.exec(line)
     if (span) {
-      current.length = Number(span[1])
-      current.ram = Number(span[2])
+      current.extentDataOffset = Number(span[1])
+      current.length = Number(span[2])
+      current.ram = Number(span[3])
       continue
     }
     const comp = EXTENT_COMPRESSION_RE.exec(line)
@@ -498,15 +555,76 @@ export function parseExtentTreeItems(dump: string): ExtentTreeItem[] {
 }
 
 /**
+ * How many fs-tree leaves one backref's forward scan may read.
+ *
+ * The EXTENT_DATA items that reference one extent all sit in the file range
+ * `[ref.offset, ref.offset + ram_bytes)`, so they are adjacent in key order and
+ * a couple of leaves cover them. The cap is what keeps a walk bounded when the
+ * tree says something this code did not expect.
+ */
+const MAX_OWNER_LEAVES = 4
+
+/**
+ * The EXTENT_DATA items of one file that reference ONE on-disk extent.
+ *
+ * An `extent data backref`'s `offset` is NOT the owning item's file offset:
+ * btrfs stores `file_offset − extent_data_offset` there, so every item carved
+ * out of the same extent by a CoW split hashes to the SAME backref (captured
+ * live: an 8 MiB extent overwritten 1 MiB in has one backref `offset 0
+ * count 2`, owning the items at file offsets 0 and 1,052,672). Reading the
+ * backref as a file offset therefore finds the first piece and silently misses
+ * every later one.
+ *
+ * The items are found by descending to `ref.offset` and collecting, forward,
+ * every item of this inode that points AT this extent — the relation the
+ * backref actually encodes.
+ */
+async function extentsReferencing(
+  executor: CommandExecutor,
+  ctx: SelfhealContext,
+  fsRoot: number,
+  inode: number,
+  extentLogical: number,
+  refOffset: number,
+): Promise<ExtentItem[]> {
+  const found: ExtentItem[] = []
+  let cursor = refOffset
+  // Learned from the first match: no owning item starts past ref.offset + ram.
+  let limit: number | null = null
+  for (let leaves = 0; leaves < MAX_OWNER_LEAVES; leaves++) {
+    const leaf = await findLeaf(executor, ctx.srcDevice, fsRoot, extentDataKey(inode, cursor))
+    const items = parseExtentItems(leaf, inode)
+    if (items.length === 0)
+      break
+    let last = cursor
+    for (const item of items) {
+      last = Math.max(last, item.fileOffset)
+      if (item.fileOffset < refOffset || item.diskByte !== extentLogical)
+        continue
+      if (!found.some(e => e.fileOffset === item.fileOffset))
+        found.push(item)
+      limit = Math.max(limit ?? 0, refOffset + (item.ram ?? item.length ?? 0))
+    }
+    if (limit !== null && last >= limit)
+      break
+    if (last <= cursor)
+      break
+    cursor = last + 1
+  }
+  return found
+}
+
+/**
  * The file's extents whose ON-DISK bytes intersect the 64 KiB stripe the
  * kernel named (selfheal.8).
  *
  * The route is the kernel's own: the extent tree at the named logical (two
- * bounded walks — the stripe may straddle a leaf boundary), whose EXTENT_ITEM
- * data backrefs carry the real FILE offset of every owning extent, then one
- * fs-tree walk per owner for its full EXTENT_DATA item. Backrefs are filtered
- * to the (subvolume, inode) the kernel printed — a blob shared with a snapshot
- * or another file contributes only this file's extents.
+ * bounded walks — the stripe may straddle a leaf boundary), whose EXTENT_ITEMs
+ * name the on-disk extents living in the stripe, then the fs tree for the
+ * EXTENT_DATA items of THIS file that reference each of them
+ * ({@link extentsReferencing} — a backref is not a file offset). Backrefs are
+ * filtered to the (subvolume, inode) the kernel printed, so a blob shared with
+ * a snapshot or another file contributes only this file's extents.
  *
  * An empty result means nothing of THIS file lives in the named stripe; a
  * thrown {@link SelfhealMapError} means the chain could not be followed at
@@ -530,29 +648,29 @@ export async function extentsForStripe(
   // contiguous and ordered in device space.
   const stripeStart = Math.floor(logical / BTRFS_STRIPE_BYTES) * BTRFS_STRIPE_BYTES
   const stripeEnd = stripeStart + BTRFS_STRIPE_BYTES
-  const seen = new Set<number>()
-  const owners: { fileOffset: number }[] = []
+  const seen = new Set<string>()
+  const owners: { extentLogical: number, refOffset: number }[] = []
   for (const target of [stripeStart, stripeEnd - 1]) {
     const leaf = await findLeaf(executor, ctx.srcDevice, ctx.roots.extent, extentItemKey(target))
     for (const item of parseExtentTreeItems(leaf)) {
       if (item.logical >= stripeEnd || item.logical + item.length <= stripeStart)
         continue
       for (const ref of item.backrefs) {
-        if (ref.root !== root || ref.objectid !== inode || seen.has(ref.offset))
+        const key = `${item.logical}:${ref.offset}`
+        if (ref.root !== root || ref.objectid !== inode || seen.has(key))
           continue
-        seen.add(ref.offset)
-        owners.push({ fileOffset: ref.offset })
+        seen.add(key)
+        owners.push({ extentLogical: item.logical, refOffset: ref.offset })
       }
     }
   }
 
-  // One fs-tree walk per owning file offset, reusing the extent resolver the
-  // repair engine uses — the EXTENT_DATA item is the single source of truth
-  // for the extent's file range and its compression.
   const extents: ExtentItem[] = []
   for (const owner of owners) {
-    const leaf = await findLeaf(executor, ctx.srcDevice, fsRoot, extentDataKey(inode, owner.fileOffset))
-    extents.push(extentForFileOffset(parseExtentItems(leaf, inode), owner.fileOffset))
+    for (const extent of await extentsReferencing(executor, ctx, fsRoot, inode, owner.extentLogical, owner.refOffset)) {
+      if (!extents.some(e => e.fileOffset === extent.fileOffset))
+        extents.push(extent)
+    }
   }
   return extents
 }
@@ -569,7 +687,7 @@ export async function extentsForStripe(
  * RAID1 has no stripe: the md byte is at the same offset on every leg, past
  * that leg's own data offset.
  */
-export function placeMdByte(mdByte: number, geo: MdGeometry): Omit<MemberLocation, 'logical' | 'lvByte' | 'startSector' | 'chunkLogical' | 'chunkDevice'> {
+export function placeMdByte(mdByte: number, geo: MdGeometry): Omit<MemberLocation, 'logical' | 'lvByte' | 'geometry' | 'startSector' | 'chunkLogical' | 'chunkDevice'> {
   if (geo.raid1) {
     const mirrors = geo.members.map((m, i) => (m ? i : -1)).filter(i => i >= 0)
     if (mirrors.length === 0)
@@ -622,6 +740,26 @@ export function placeMdByte(mdByte: number, geo: MdGeometry): Omit<MemberLocatio
   }
 }
 
+/**
+ * Where the SAME bytes sit on another role of the same array.
+ *
+ * Every member has its OWN data offset (`rd<n>/offset`) — `mdadm --grow
+ * --data-offset` can leave them differing, and md does not require them equal —
+ * so the payload offset is computed once and added to THAT member's own offset.
+ * RAID1's payload offset is the md byte itself (every leg carries the whole
+ * array); on a parity level it is the stripe row the block sits in.
+ *
+ * One helper for all three callers — the mirror re-verify, the mirror
+ * candidates and the parity row reads — so a member offset cannot be computed
+ * two ways.
+ */
+export function memberOffsetOn(geo: MdGeometry, location: MemberLocation, member: number): number {
+  const payload = geo.raid1
+    ? location.mdByte
+    : (location.stripe as number) * geo.chunkBytes + (location.mdByte % geo.chunkBytes)
+  return geo.dataOffsets[member] + payload
+}
+
 /** The data-disk roles of one stripe, in md's stripe order (index = Q exponent). */
 export function stripeDataOrder(geo: MdGeometry, stripe: number): number[] {
   const n = geo.raidDisks
@@ -657,7 +795,7 @@ export async function readMdGeometry(executor: CommandExecutor, mdDevice: string
   for (let i = 0; i < raidDisks; i++)
     attributes[`rd${i}/offset`] = await readMdAttrOrNull(sys, `rd${i}/offset`)
 
-  const detail = await executor.exec(MDADM, ['--detail', '--export', mdDevice])
+  const detail = await executor.exec(MDADM, mdadmDetailExportArgs(mdDevice))
   if (detail.exitCode !== 0)
     throw new SelfhealMapError(`mdadm --detail --export ${mdDevice} failed: ${detail.stderr.trim()}`)
 
@@ -667,27 +805,25 @@ export async function readMdGeometry(executor: CommandExecutor, mdDevice: string
 /**
  * Role index → member device, from `mdadm --detail --export`.
  *
+ * The KEY=VALUE text is parsed by the ONE parser this codebase has for it
+ * (`parsers/mdadm-detail.ts`, the topology layer's); this is only the
+ * projection onto role slots the placement formula indexes by.
+ *
  * A role with no device is a HOLE (a failed or removed member), left null so
  * the caller can refuse rather than silently shifting every later role down by
  * one — which is what building the list from the present devices alone would do.
+ * A SPARE reports `MD_DEVICE_<x>_ROLE=spare`: it holds no role slot and none of
+ * the array's data, so it is left out of the list by name rather than dropped
+ * by a regex that happened not to match it.
  */
 export function parseMdDetailExport(text: string, raidDisks: number): (string | null)[] {
   const members: (string | null)[] = Array.from<string | null>({ length: raidDisks }).fill(null)
-  const roles = new Map<string, number>()
-  const devices = new Map<string, string>()
-  for (const raw of text.split('\n')) {
-    const line = raw.trim()
-    const role = MD_DEVICE_ROLE_RE.exec(line)
-    if (role)
-      roles.set(role[1], Number(role[2]))
-    const device = MD_DEVICE_DEV_RE.exec(line)
-    if (device)
-      devices.set(device[1], device[2])
-  }
-  for (const [name, role] of roles) {
-    const device = devices.get(name)
-    if (device && role < raidDisks)
-      members[role] = device
+  for (const member of parseMdadmDetailExport(text).members) {
+    if (!INTEGER_RE.test(member.role))
+      continue // 'spare' (or an unreported role) — not a slot in the layout
+    const role = Number(member.role)
+    if (role < raidDisks)
+      members[role] = member.dev
   }
   return members
 }
@@ -743,31 +879,60 @@ export async function btrfsDeviceFor(executor: CommandExecutor, mountpoint: stri
 /**
  * Everything about the pool that is the same for every block of one run.
  *
- * Resolving the md array from the dm table's own `major:minor` — rather than a
+ * Resolving each md array from the dm table's own `major:minor` — rather than a
  * second `dmsetup deps` call — keeps the device and the offset coming from ONE
  * reading of one table: a pool whose table changed between the two calls could
  * otherwise be mapped with one segment's offset onto another segment's array.
+ *
+ * EVERY segment is resolved, not just the first: an AHR pool's LV is the linear
+ * concatenation of one md array per band, and a block in band 3 is placed with
+ * band 3's geometry or not at all. A segment whose device is NOT an md array is
+ * refused by name — the placement formula below describes md arrays and nothing
+ * else, so mapping through anything else would be a guess with a write at the
+ * end of it.
  */
 export async function resolveContext(executor: CommandExecutor, mountpoint: string): Promise<SelfhealContext> {
   const srcDevice = await btrfsDeviceFor(executor, mountpoint)
 
-  let segments: DmSegment[]
-  let mdDevice: string
+  const bands: SelfhealBand[] = []
   const table = await executor.exec(DMSETUP, ['table', srcDevice])
   if (table.exitCode === 0 && table.stdout.trim()) {
-    segments = parseDmTable(table.stdout)
-    const majmin = `${segments[0].major}:${segments[0].minor}`
-    mdDevice = `/dev/${await kernelName(executor, `/sys/dev/block/${majmin}`)}`
+    for (const segment of parseDmTable(table.stdout)) {
+      const majmin = `${segment.major}:${segment.minor}`
+      const device = `/dev/${await kernelName(executor, `/sys/dev/block/${majmin}`)}`
+      bands.push({ segment, geometry: await readBandGeometry(executor, device, segment) })
+    }
   }
   else {
     // btrfs straight on md (no LVM): the identity segment keeps one code path.
-    segments = [{ startSector: 0, lengthSectors: Number.MAX_SAFE_INTEGER, major: 0, minor: 0, offsetSector: 0 }]
-    mdDevice = srcDevice
+    const segment: DmSegment = { startSector: 0, lengthSectors: Number.MAX_SAFE_INTEGER, major: 0, minor: 0, offsetSector: 0 }
+    bands.push({ segment, geometry: await readBandGeometry(executor, srcDevice, segment) })
   }
 
-  const geometry = await readMdGeometry(executor, mdDevice)
   const roots = await readTreeRoots(executor, srcDevice)
-  return { mountpoint, srcDevice, segments, geometry, roots, chunks: [], csums: [] }
+  return { mountpoint, srcDevice, bands, roots, chunks: [], csums: [] }
+}
+
+/**
+ * One band's geometry, refusing a segment that is not on an md array at all.
+ *
+ * `readMdGeometry` would fail on such a device anyway — with a message about a
+ * level it could not read, which describes the symptom and not the cause. The
+ * cause is worth saying: this pool's bytes are not under md, so nothing here
+ * knows where they are.
+ */
+async function readBandGeometry(
+  executor: CommandExecutor,
+  device: string,
+  segment: DmSegment,
+): Promise<MdGeometry> {
+  const kernel = await kernelName(executor, device)
+  if ((await readMdAttrOrNull(mdSysPath(kernel), 'level')) === null) {
+    throw new SelfhealMapError(
+      `the dm segment at sector ${segment.startSector} maps onto ${device}, which is not an md array (no /sys/block/${kernel}/md) — this engine maps AHR bands, and refuses rather than guessing where the bytes are`,
+    )
+  }
+  return readMdGeometry(executor, device)
 }
 
 /**
@@ -804,21 +969,26 @@ function mergeChunks(ctx: SelfhealContext, items: ChunkItem[]): void {
  * Place ONE btrfs logical byte all the way down to a member — the pure half,
  * given the chunk that covers it. Kept separate from the fetching so the whole
  * chain can be asserted against captured rig output with no executor at all.
+ *
+ * The band is picked by the LV byte, and the geometry used from that point down
+ * is the band's own — which is the whole point of passing bands rather than one
+ * geometry.
  */
 export function locateLogicalIn(
   logical: number,
   chunk: ChunkItem,
-  segments: DmSegment[],
-  geometry: MdGeometry,
+  bands: SelfhealBand[],
 ): MemberLocation {
   const lvByte = logical - chunk.logical + chunk.deviceOffset
-  const seg = segmentForLvByte(segments, lvByte)
+  const band = bandForLvByte(bands, lvByte)
+  const seg = band.segment
   const mdByte = lvByte - seg.startSector * 512 + seg.offsetSector * 512
-  const placed = placeMdByte(mdByte, geometry)
+  const placed = placeMdByte(mdByte, band.geometry)
   return {
     ...placed,
     logical,
     lvByte,
+    geometry: band.geometry,
     startSector: seg.offsetSector,
     chunkLogical: chunk.logical,
     chunkDevice: chunk.deviceOffset,
@@ -832,7 +1002,7 @@ export async function locateLogical(
   logical: number,
 ): Promise<MemberLocation> {
   const chunk = await coveringChunk(executor, ctx, logical, true)
-  return locateLogicalIn(logical, chunk, ctx.segments, ctx.geometry)
+  return locateLogicalIn(logical, chunk, ctx.bands)
 }
 
 /** The inode number of a path. */
@@ -863,6 +1033,19 @@ export async function subvolumeIdOf(executor: CommandExecutor, path: string): Pr
  * the extent is not the unit. Compressed: the whole on-disk blob, because
  * btrfs stores one csum entry per on-disk sector of it and a single corrupt
  * sector takes out the entire (up to 128 KiB) logical extent.
+ *
+ * The block's logical bytenr is `disk byte + extent data offset + (file offset
+ * − the item's file offset)`. The middle term is the one a CoW split makes
+ * non-zero, and it is not optional: on a live capture (an 8 MiB file with
+ * 4 KiB overwritten 1 MiB in) the tail item reads `disk byte 13631488 …
+ * offset 1052672`, so block 300 sits at logical 14,860,288 — dropping the term
+ * lands on 13,807,616, a megabyte away, where a DIFFERENT block's stored csum
+ * lives (0x286f6be8 against the block's real 0xaceb29bc) and where a repair
+ * would have written.
+ *
+ * Everything is bound-checked against the item's own `nr` fields: a block the
+ * item does not cover, or a logical byte past the on-disk extent, is refused
+ * rather than mapped.
  */
 export function repairUnitFor(extent: ExtentItem, block: number): {
   compressed: boolean
@@ -871,14 +1054,25 @@ export function repairUnitFor(extent: ExtentItem, block: number): {
   logicalByte: number
 } {
   const diskByte = extent.diskByte ?? 0
+  const diskLength = extent.diskLength ?? BLOCK_BYTES
   const fileOffset = block * BLOCK_BYTES
   const compressed = extent.compression !== 'none'
   const within = fileOffset - extent.fileOffset
+  const length = extent.length ?? 0
+  if (within < 0 || within >= length)
+    throw new SelfhealMapError(`block ${block} (file byte ${fileOffset}) is outside the extent at file offset ${extent.fileOffset}, which covers ${length} bytes`)
+
+  const intoExtent = extent.extentDataOffset + within
+  if (!compressed && intoExtent + BLOCK_BYTES > diskLength)
+    throw new SelfhealMapError(`block ${block} maps ${intoExtent} bytes into an on-disk extent of ${diskLength} bytes — the EXTENT_DATA item does not describe where this block is`)
+  if (compressed && intoExtent >= (extent.ram ?? length))
+    throw new SelfhealMapError(`block ${block} maps ${intoExtent} bytes into a compressed extent that decompresses to ${extent.ram ?? length} bytes`)
+
   return {
     compressed,
-    blobLogical: compressed ? diskByte : diskByte + within,
-    blobSectors: compressed ? Math.ceil((extent.diskLength ?? BLOCK_BYTES) / BLOCK_BYTES) : 1,
-    logicalByte: diskByte + within,
+    blobLogical: compressed ? diskByte : diskByte + intoExtent,
+    blobSectors: compressed ? Math.ceil(diskLength / BLOCK_BYTES) : 1,
+    logicalByte: diskByte + intoExtent,
   }
 }
 

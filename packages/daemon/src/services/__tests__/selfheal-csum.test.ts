@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
+import { parseTreeRoots } from '../selfheal-btree.js'
 import {
   crc32c,
   csumFromLeafBytes,
@@ -112,21 +113,23 @@ describe('selfheal csum — reading it off the LV', () => {
   const context = {
     mountpoint: '/mnt/gtsh/@data',
     srcDevice: '/dev/mapper/gtsh-data',
-    segments: parseDmTable(fixture('dmsetup-table-lv.txt')),
+    bands: parseDmTable(fixture('dmsetup-table-lv.txt')).map(segment => ({
+      segment,
+      geometry: {
+        device: '/dev/md127',
+        kernel: 'md127',
+        sys: '/sys/block/md127/md',
+        level: 'raid5',
+        raid6: false,
+        raid1: false,
+        raidDisks: 6,
+        chunkBytes: 65536,
+        layout: 'left-symmetric',
+        members: ['/dev/loop0'],
+        dataOffsets: [1048576],
+      },
+    })),
     roots: { chunk: 22052864, csum: 30834688, extent: 32505856, bySubvolume: new Map([[256, 30851072]]) },
-    geometry: {
-      device: '/dev/md127',
-      kernel: 'md127',
-      sys: '/sys/block/md127/md',
-      level: 'raid5',
-      raid6: false,
-      raid1: false,
-      raidDisks: 6,
-      chunkBytes: 65536,
-      layout: 'left-symmetric',
-      members: ['/dev/loop0'],
-      dataOffsets: [1048576],
-    },
     chunks: parseChunkItems(fixture('dump-tree-chunk.txt')),
     csums: ITEMS.slice(),
   }
@@ -168,6 +171,59 @@ describe('selfheal csum — reading it off the LV', () => {
 
     assert.equal(await readStoredCsum(executor, context, 14860288), STORED_CSUM)
     assert.equal(executor.pipelineCalls.length, 1)
+  })
+
+  /**
+   * R2 end to end, on the split rig (PROVENANCE.md, "Split-extent fixtures"):
+   * the logical byte the mapping computes for block 300 is the one whose STORED
+   * csum equals crc32c of the file's own block — and the byte the pre-R2
+   * arithmetic computed is a different entry with a different value. The leaf is
+   * the rig's real csum leaf, read off the image at the offset the chunk hop
+   * gives.
+   */
+  it('answers the split file\'s block 300 with the csum that matches its content', async () => {
+    const expected = JSON.parse(fixture('split-expected.json')) as {
+      logical_byte: number
+      logical_byte_without_extent_data_offset: number
+      stored_csum: string
+      stored_csum_at_wrong_logical: string
+    }
+    const roots = parseTreeRoots(fixture('split-dump-tree-roots.txt'))
+    const leaf = Buffer.from(fixture('split-csum-leaf.b64').trim(), 'base64')
+    const block = Buffer.from(fixture('split-block-300.b64').trim(), 'base64')
+
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: '/usr/bin/btrfs',
+      args: ['inspect-internal', 'dump-tree', '-b', String(roots.csum), '/dev/loop0'],
+      result: { stdout: fixture('split-dump-tree-csum.txt'), stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({
+      command: '/usr/bin/btrfs',
+      args: ['inspect-internal', 'dump-tree', '-b', String(roots.chunk), '/dev/loop0'],
+      result: { stdout: fixture('split-dump-tree-chunk.txt'), stderr: '', exitCode: 0 },
+    })
+    executor.addPipelineFixture({
+      cmd1: '/usr/bin/dd',
+      cmd2: '/usr/bin/base64',
+      result: { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: leaf.toString('base64') },
+    })
+
+    const ctx = {
+      mountpoint: '/mnt/split',
+      srcDevice: '/dev/loop0',
+      bands: [],
+      roots,
+      chunks: [],
+      csums: [],
+    }
+    const stored = await readStoredCsum(executor, ctx, expected.logical_byte)
+    assert.equal(csumHex(stored as number), expected.stored_csum)
+    assert.equal(stored, crc32c(block), 'the stored csum IS this block\'s crc32c')
+
+    const wrong = await readStoredCsum(executor, ctx, expected.logical_byte_without_extent_data_offset)
+    assert.equal(csumHex(wrong as number), expected.stored_csum_at_wrong_logical)
+    assert.notEqual(wrong, crc32c(block), 'the pre-R2 byte belongs to another block')
   })
 
   it('walks once, then reports NO stored csum rather than "not fetched yet"', async () => {

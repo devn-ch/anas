@@ -1,0 +1,63 @@
+btrfs-progs v6.14
+extent tree key (EXTENT_TREE ROOT_ITEM 0) 
+leaf 30736384 items 16 free space 15351 generation 10 owner EXTENT_TREE
+leaf 30736384 flags 0x1(WRITTEN) backref revision 1
+fs uuid 6e165758-e990-4501-acff-9683ebc93868
+chunk uuid e64c4bb4-0ca2-477e-891b-913cff5d8216
+	item 0 key (13631488 EXTENT_ITEM 8388608) itemoff 16230 itemsize 53
+		refs 2 gen 9 flags DATA
+		(178 0xdea30dea80d95ea) extent data backref root 256 objectid 257 offset 0 count 2
+	item 1 key (13631488 BLOCK_GROUP_ITEM 8388608) itemoff 16206 itemsize 24
+		block group used 8388608 chunk_objectid 256 flags DATA|single
+	item 2 key (22020096 BLOCK_GROUP_ITEM 8388608) itemoff 16182 itemsize 24
+		block group used 16384 chunk_objectid 256 flags SYSTEM|DUP
+	item 3 key (22052864 METADATA_ITEM 0) itemoff 16149 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x3) tree block backref root CHUNK_TREE
+	item 4 key (30408704 BLOCK_GROUP_ITEM 53673984) itemoff 16125 itemsize 24
+		block group used 147456 chunk_objectid 256 flags METADATA|DUP
+	item 5 key (30523392 METADATA_ITEM 0) itemoff 16092 itemsize 33
+		refs 1 gen 5 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0xfffffffffffffff7) tree block backref root DATA_RELOC_TREE
+	item 6 key (30588928 METADATA_ITEM 0) itemoff 16059 itemsize 33
+		refs 1 gen 9 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x9) tree block backref root UUID_TREE
+	item 7 key (30687232 METADATA_ITEM 0) itemoff 16026 itemsize 33
+		refs 1 gen 9 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x5) tree block backref root FS_TREE
+	item 8 key (30736384 METADATA_ITEM 0) itemoff 15993 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x2) tree block backref root EXTENT_TREE
+	item 9 key (30752768 METADATA_ITEM 0) itemoff 15960 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x4) tree block backref root DEV_TREE
+	item 10 key (30769152 METADATA_ITEM 0) itemoff 15927 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0xa) tree block backref root FREE_SPACE_TREE
+	item 11 key (30785536 METADATA_ITEM 0) itemoff 15894 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x100) tree block backref root 256
+	item 12 key (30801920 METADATA_ITEM 0) itemoff 15861 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x7) tree block backref root CSUM_TREE
+	item 13 key (30851072 METADATA_ITEM 0) itemoff 15828 itemsize 33
+		refs 1 gen 10 flags TREE_BLOCK
+		tree block skinny level 0
+		(176 0x1) tree block backref root ROOT_TREE
+	item 14 key (84082688 EXTENT_ITEM 4096) itemoff 15775 itemsize 53
+		refs 1 gen 10 flags DATA
+		(178 0xdea30de6801a5d4) extent data backref root 256 objectid 257 offset 1048576 count 1
+	item 15 key (84082688 BLOCK_GROUP_ITEM 117440512) itemoff 15751 itemsize 24
+		block group used 4096 chunk_objectid 256 flags DATA|single
+total bytes 1073741824
+bytes used 8556544
+uuid 6e165758-e990-4501-acff-9683ebc93868

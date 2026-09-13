@@ -416,6 +416,118 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
 })
 
 /**
+ * The scrub/repair exclusion (selfheal.6, review R7). Both verbs are full-array
+ * operations on ONE pool and must never overlap — the repair turns md's
+ * `rmw_level`, `sync_min`/`sync_max` and `stripe_cache_size` aside for the
+ * duration of each block, and a check re-reads every stripe underneath it.
+ *
+ * The exclusion is a job-queue query, and the query has to filter by STATUS: a
+ * newer TERMINAL job for the same pool must not hide an older running one.
+ */
+describe('POST /v1/ahr/:name/{scrub,repair} — the in-flight exclusion', () => {
+  let server: TestServer
+  let jobQueue: JobQueue
+  let dir: string
+
+  /** A job that never finishes — an operation still in flight on the pool. */
+  function inFlight(operation: string, name: string): string {
+    return jobQueue.submit(operation, { user: 'u', uid: 0, params: { name } }, async () => new Promise(() => {})).id
+  }
+
+  /** A job that is already over — the kind that used to HIDE a running one. */
+  async function finished(operation: string, name: string): Promise<void> {
+    jobQueue.submit(operation, { user: 'u', uid: 0, params: { name } }, async () => ({ done: true }))
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-exclusion-'))
+    await writeFile(join(dir, 'fstab'), '# empty\n')
+
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+
+    const app = Fastify({ logger: false })
+    jobQueue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+    })
+    server = app as unknown as TestServer
+  })
+  afterEach(async () => {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const repairBody = { files: [{ path: '/mnt/anas-ahr/ahr0/f1.bin', blocks: [300] }] }
+
+  it('a scrub is refused while a repair runs — even behind a newer finished repair', async () => {
+    const running = inFlight('ahr.repair', 'ahr0')
+    await finished('ahr.repair', 'ahr0')
+
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    const { message } = res.json().error
+    assert.ok(message.includes(running), `the RUNNING job is named: ${message}`)
+    assert.ok(message.includes('a repair job is in flight'), message)
+  })
+
+  it('a repair is refused while a scrub runs — even behind a newer finished scrub', async () => {
+    const running = inFlight('ahr.scrub', 'ahr0')
+    await finished('ahr.scrub', 'ahr0')
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/ahr/ahr0/repair',
+      headers: JSON_HEADERS,
+      payload: repairBody,
+    })
+    assert.equal(res.statusCode, 409)
+    const { message } = res.json().error
+    assert.ok(message.includes(running), `the RUNNING job is named: ${message}`)
+    assert.ok(message.includes('a scrub is in flight'), message)
+    // Refused BEFORE a confirm code is minted: "unsafe now" has no bypass.
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+  })
+
+  it('a SECOND scrub of the same pool is refused while the first runs', async () => {
+    const running = inFlight('ahr.scrub', 'ahr0')
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    assert.ok(res.json().error.message.includes(running))
+  })
+
+  it('a finished job on its own blocks nothing', async () => {
+    await finished('ahr.repair', 'ahr0')
+    await finished('ahr.scrub', 'ahr0')
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202)
+  })
+
+  it('a job in flight on ANOTHER pool blocks nothing', async () => {
+    inFlight('ahr.repair', 'other')
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202)
+  })
+})
+
+/**
  * The scrub gate against an OFFLINE pool (issue #18 follow-up). The stock dev
  * mock's `ahr0` is healthy, so this builds the same read layer from the same
  * shipped fixtures with ONE byte changed: the LV's attr state field, 'a' →

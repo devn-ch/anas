@@ -82,7 +82,7 @@ reference implementation and checked when present.
 | REPAIR_CMD | report | result |
 |---|---|---|
 | `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 41/41 cases, 14/14 controls |
-| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 34/34 cases, 12/12 controls (2026-09-12 — before case 7 existed; not yet re-run against the two-band rig) |
+| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 41/41 cases, 14/14 controls (2026-09-13, with case 7 on the two-band rig) |
 
 The engine covers everything the reference does and adds the RAID6 Q-syndrome
 reconstruction as a fallback when the P-based XOR fails arbitration (a stripe
@@ -94,8 +94,12 @@ also repairs a RAID1 block whose mirror legs DISAGREE from the second leg (the
 reference exits 2 — its RAID1 candidates are the surviving legs, and it
 refuses when they disagree), a shape the suite does not build. Since the
 two-band round (2026-09-13, review finding R1) the suite has case 7 on the
-AHR-shape rig, which the reference passes and the engine has not yet been
-re-run against — its 34/34 record above predates the two-band rig.
+AHR-shape rig, which both implementations pass. Case 7's first engine run
+failed on `7-repair` alone — the engine's sidecar carried no `n`, which the
+case cross-checks against band B's member count — while `7-bandA-untouched`
+already passed (`data=0`): the mapping was right and the REPORT was short a
+field the reference has always written. The engine's sidecar now carries
+`level`, `n` and `chunk` (the array it actually used), and the case passes.
 
 Two differences the suite cannot see, both about scale and layout rather than
 correctness on a rig:

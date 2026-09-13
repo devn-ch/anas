@@ -66,6 +66,13 @@ function sidecar(
     disk: map?.memberIndex ?? null,
     moff: map?.memberOffset ?? null,
     md_byte: map?.mdByte ?? null,
+    // The ARRAY the repair actually used — the two numbers that say WHICH band
+    // of a multi-band pool answered (the suite's case 7 cross-checks them
+    // against its own reading of the dm table), and the reference
+    // implementation has reported them since it was written.
+    level: map?.level ?? null,
+    n: map?.raidDisks ?? null,
+    chunk: map?.chunkBytes ?? null,
     stripe: map?.stripe ?? null,
     parity_disk: map?.parityIndex ?? null,
     q_disk: map?.qIndex ?? null,

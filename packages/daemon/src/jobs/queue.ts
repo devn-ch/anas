@@ -111,6 +111,28 @@ export class JobQueue {
   }
 
   /**
+   * The OLDEST job still in flight (queued or running) for any of `operations`
+   * that named `target` — "is one of these running on this pool right now?".
+   *
+   * {@link findByOperation} cannot answer that: it returns the LATEST job per
+   * operation whatever its status, so a completed job submitted after a running
+   * one HIDES the running one, and a mutual-exclusion check built on it lets
+   * the second job through (a scrub starting on top of a repair that has md's
+   * `rmw_level` and `sync_min`/`sync_max` turned aside). Status is the filter
+   * here, and the answer is a job that is actually in flight or nothing.
+   */
+  findActive(operations: string | readonly string[], target: string, paramKey: string = 'name'): Job | undefined {
+    const wanted = new Set(typeof operations === 'string' ? [operations] : operations)
+    for (const record of this.jobs.values()) {
+      if (!wanted.has(record.job.operation) || record.submitter.params?.[paramKey] !== target)
+        continue
+      if (record.job.status === 'queued' || record.job.status === 'running')
+        return record.job
+    }
+    return undefined
+  }
+
+  /**
    * Every distinct `params.name` target seen for `operation`, in first-submitted
    * order. Pairs with {@link findByOperation} for "what has this operation been
    * asked to do, and how did the latest attempt on each end up?" — the question

@@ -9,6 +9,7 @@ import { ahrLvPath } from './ahr-paths.js'
 import { SUBVOL_DATA, subvolFromMountOptions } from './ahr-snapshots.js'
 import { pveNotify } from './pve-notify.js'
 import { mismatchCntArgs } from './scrub-schedules.js'
+import { probeFileBlock } from './selfheal-io.js'
 import { BTRFS_STRIPE_BYTES, extentsForStripe, resolveContext } from './selfheal-map.js'
 
 /**
@@ -17,11 +18,15 @@ import { BTRFS_STRIPE_BYTES, extentsForStripe, resolveContext } from './selfheal
  * never severable (story selfheal.4) — both are full-device reads and would
  * thrash each other concurrently (§4):
  *
- *   1. per-array `mdadm --action=check`, one band at a time, waiting on
- *      /proc/mdstat between arrays — verifies parity/mirror consistency
- *      underneath the filesystem. A band whose check counted parity mismatches
- *      (`/sys/block/<md>/md/mismatch_cnt` > 0, read once the check goes idle)
- *      warns immediately: rot exists, and phase 2 is what names the files.
+ *   1. per-array `mdadm --action=check`, one band at a time — verifies
+ *      parity/mirror consistency underneath the filesystem. Each band is waited
+ *      through TWICE: first until md has actually STARTED the check
+ *      (`sync_action`, or /proc/mdstat), then until it is idle again. A band
+ *      whose check counted parity mismatches (`/sys/block/<md>/md/mismatch_cnt`
+ *      > 0, read once the check has run AND gone idle) warns immediately: rot
+ *      exists, and phase 2 is what names the files. A band md never started is
+ *      said so and its counter — which belongs to an earlier check — is not
+ *      read at all.
  *   2. btrfs scrub (start + poll `btrfs scrub status`) — checksums the
  *      filesystem's view of the data — then the ATTRIBUTION pass (story
  *      selfheal.3) names the corrupt files and their failing 4 KiB blocks.
@@ -46,7 +51,6 @@ const CAT = '/usr/bin/cat'
 const REALPATH = '/usr/bin/realpath'
 const JOURNALCTL = '/usr/bin/journalctl'
 const STAT = '/usr/bin/stat'
-const DD = '/usr/bin/dd'
 const FINDMNT = '/usr/bin/findmnt'
 
 /** `findmnt --json --real <mountpoint>` — the one mount, with its options. */
@@ -62,11 +66,27 @@ export const AHR_SCRUB_POLL_MS = 5000
  */
 export const AHR_SCRUB_MISMATCH_DELAY_MS = 1000
 
+/**
+ * How long a band's check is given to actually START before the band is
+ * recorded as not checked.
+ *
+ * Writing `check` to `sync_action` sets the recovery flags synchronously, so
+ * the attribute reads `check` essentially as soon as mdadm returns; this window
+ * exists for the case where md never takes it at all (frozen, already syncing,
+ * an array that refuses). Without it the wait loop could look once, see an
+ * array that had not started yet, call the check finished, and then read a
+ * `mismatch_cnt` belonging to some EARLIER check — while phase 2 ran on top of
+ * the check md was about to start.
+ */
+export const AHR_SCRUB_CHECK_START_TIMEOUT_MS = 30000
+
 export interface AhrScrubOptions {
   /** Poll interval override (tests use 1). */
   pollIntervalMs?: number
   /** Delay before the mismatch_cnt read (tests use 1). */
   mismatchDelayMs?: number
+  /** How long to wait for a band's check to start (tests use a few ms). */
+  checkStartTimeoutMs?: number
 }
 
 /** Minimal structured view of `btrfs scrub status`. */
@@ -118,6 +138,36 @@ export async function mismatchCount(
       return null
     const n = Number.parseInt(r.stdout.trim(), 10)
     return Number.isFinite(n) && n >= 0 ? n : null
+  }
+  catch {
+    return null
+  }
+}
+
+/** `/sys/block/<md>/md/sync_action` — what md says it is doing right now. */
+export function syncActionArgs(kernelName: string): string[] {
+  return [`/sys/block/${kernelName}/md/sync_action`]
+}
+
+/** Everything md prints in `sync_action`. Anything else is not an answer. */
+const MD_SYNC_ACTIONS = new Set(['idle', 'none', 'frozen', 'resync', 'recover', 'check', 'repair', 'reshape'])
+
+/**
+ * md's own word for this array's current sync operation, or null when it cannot
+ * be read.
+ *
+ * Null is a real answer — a value md does not use is treated as unreadable
+ * rather than as a state to wait on, which is what keeps the wait loops from
+ * hanging on anything but md itself.
+ */
+export async function syncAction(
+  executor: CommandExecutor,
+  kernelName: string,
+): Promise<string | null> {
+  try {
+    const r = await executor.exec(CAT, syncActionArgs(kernelName))
+    const value = r.exitCode === 0 ? r.stdout.trim() : ''
+    return MD_SYNC_ACTIONS.has(value) ? value : null
   }
   catch {
     return null
@@ -447,6 +497,34 @@ async function mountedSubvolume(executor: CommandExecutor, pool: AhrPool): Promi
 }
 
 /**
+ * How many kernel journal entries one scrub's attribution read may take.
+ *
+ * The executor hands stdout over as a string through a 10 MB buffer, and a
+ * journal envelope is ~800 bytes — so an unbounded read on a node with tens of
+ * thousands of scrub errors does not truncate, it FAILS (execFile kills the
+ * child with ENOBUFS) and the whole attribution is lost, which is the opposite
+ * of what a best-effort pass should do when there is more to say than fits.
+ * Bounded, the last {@link AHR_SCRUB_JOURNAL_LINE_CAP} matching entries come
+ * back and the result says the listing is incomplete.
+ */
+export const AHR_SCRUB_JOURNAL_LINE_CAP = 5000
+
+/**
+ * The MESSAGE pattern both error shapes carry (`journalctl -g`).
+ *
+ * A path-carrying scrub warning and a nameless `unable to fixup … error at
+ * logical N` both contain it, so the filter keeps everything the attribution
+ * can use and drops every unrelated kernel line before it reaches the buffer.
+ */
+const SCRUB_JOURNAL_GREP = 'error at logical'
+
+/** The bounded journalctl argv for one scrub's window. */
+export function scrubJournalArgs(since: string, options?: { grep?: boolean, cap?: number }): string[] {
+  const args = ['-k', '-o', 'json', '-S', since, '--no-pager', '-n', String(options?.cap ?? AHR_SCRUB_JOURNAL_LINE_CAP)]
+  return options?.grep === false ? args : [...args, '-g', SCRUB_JOURNAL_GREP]
+}
+
+/**
  * journalctl's `-S` takes LOCAL wall-clock time in `YYYY-MM-DD HH:MM:SS`.
  * Seconds are floored, which only ever widens the window by under a second —
  * the safe direction: a scrub's own errors can never be older than its start.
@@ -493,21 +571,16 @@ async function resolveSubvolume(
 }
 
 /**
- * Read ONE 4 KiB file block with O_DIRECT and report whether it errored.
+ * Did ONE 4 KiB file block fail to read?
  *
- * O_DIRECT is what makes this a real read: a cached page would answer from
- * memory and every block would look fine (GT-9a).
+ * The read itself is the engine's — `probeFileBlock` (selfheal-io), the same
+ * O_DIRECT read the repair's cold-read uses, so there is one definition of
+ * "read this block and see" on this filesystem and not two that can drift.
+ * O_DIRECT is what makes it a real read: a cached page would answer from memory
+ * and every block would look fine (GT-9a).
  */
 async function probeBlock(executor: CommandExecutor, path: string, block: number): Promise<boolean> {
-  const r = await executor.exec(DD, [
-    `if=${path}`,
-    'iflag=direct',
-    `bs=${BLOCK_BYTES}`,
-    `skip=${block}`,
-    'count=1',
-    'of=/dev/null',
-  ])
-  return r.exitCode !== 0
+  return !(await probeFileBlock(executor, path, block))
 }
 
 /**
@@ -620,11 +693,16 @@ export async function pathExists(executor: CommandExecutor, path: string): Promi
  * the extents owning the stripe are resolved from the filesystem's trees, and
  * a COMPRESSED one is probed over its real file range (selfheal.8: the
  * kernel's `offset` is extent-relative there, so the printed offset points at
- * the wrong 64 KiB). The mapping is built once per pass and a failure is
- * permanent for the pass: such a stripe falls back to the plain probe at the
- * kernel's offset — exact for an uncompressed extent (GT-3) — and when that
- * names no block either, the finding says so (`unidentified`) instead of
- * leaving an empty `badBlocks` that reads as "nothing found".
+ * the wrong 64 KiB). Where every extent in the stripe is uncompressed the
+ * kernel's offset IS the file offset (GT-3) and the plain 16-block probe is
+ * exact.
+ *
+ * When the extents CANNOT be resolved — the mapping is built once per pass and
+ * a failure is permanent for it — the stripe is reported `unidentified` with
+ * the reason. It is not probed at the kernel's offset as a consolation: without
+ * the extents there is no way to know whether that offset means what it says,
+ * and blocks named from the wrong window are worse than blocks not named (the
+ * operator can hand them to a repair).
  */
 async function buildFindings(
   executor: CommandExecutor,
@@ -682,7 +760,19 @@ async function buildFindings(
       else {
         unidentifiedReason ??= `extent could not be resolved (${mappingError})`
       }
-      if (candidates !== null && candidates.some(e => e.compression !== 'none')) {
+      if (candidates === null) {
+        // The extents could not be resolved, so it is not known whether this
+        // stripe belongs to a COMPRESSED extent — and for a compressed one the
+        // kernel's `offset` is extent-relative (selfheal.8), so probing at it
+        // reads a window that is not the corrupt extent. Say the block was not
+        // identified, and why, rather than name blocks from the wrong place.
+        continue
+      }
+      if (candidates.length === 0) {
+        unidentifiedReason ??= 'no extent of this file covers the reported stripe'
+        continue
+      }
+      if (candidates.some(e => e.compression !== 'none')) {
         const probed = await probeStripeExtents(executor, where.path, candidates, stripe.logical)
         if (probed.badBlocks.length > 0) {
           badBlocks.push(...probed.badBlocks)
@@ -693,11 +783,8 @@ async function buildFindings(
         }
       }
       else {
-        if (candidates !== null && candidates.length === 0)
-          unidentifiedReason ??= 'no extent of this file covers the reported stripe'
-        // No compressed extent in the named stripe — or the mapping is out:
-        // the plain probe, at the offset the kernel printed (the file offset
-        // of the stripe for an uncompressed extent, GT-3).
+        // Every extent in the named stripe is uncompressed, so the kernel's
+        // offset IS the file offset of the stripe (GT-3): probe it.
         badBlocks.push(...await probeStripe(executor, where.path, stripe.offset))
       }
     }
@@ -728,16 +815,27 @@ async function attributeScrub(
   updateProgress: (message: string) => void,
 ): Promise<Pick<AhrScrubResult, 'findings' | 'errorsAttributed' | 'unattributed' | 'truncated'>> {
   updateProgress('Reading the kernel journal for the scrub\'s errors')
-  const r = await executor.exec(JOURNALCTL, ['-k', '-o', 'json', '-S', journalSince(startedAt), '--no-pager'])
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `journalctl exited ${r.exitCode}`)
-  const attribution = attributeScrubErrors(kernelJournalMessages(r.stdout), await poolDmName(executor, pool))
+  const since = journalSince(startedAt)
+  let r = await executor.exec(JOURNALCTL, scrubJournalArgs(since))
+  if (r.exitCode !== 0) {
+    // `-g` needs a journalctl built with PCRE2; without it the whole window is
+    // read (still line-capped) rather than nothing being read at all.
+    const plain = await executor.exec(JOURNALCTL, scrubJournalArgs(since, { grep: false }))
+    if (plain.exitCode !== 0)
+      throw new Error(r.stderr.trim() || `journalctl exited ${r.exitCode}`)
+    r = plain
+  }
+  const messages = kernelJournalMessages(r.stdout)
+  // The cap reached means OLDER entries of this window were not read (`-n`
+  // keeps the most recent) — the listing is incomplete and says so.
+  const capped = messages.length >= AHR_SCRUB_JOURNAL_LINE_CAP
+  const attribution = attributeScrubErrors(messages, await poolDmName(executor, pool))
   const findings = await buildFindings(executor, pool, attribution.files, updateProgress)
   return {
     findings,
     errorsAttributed: attribution.errorsAttributed,
     unattributed: attribution.unattributed,
-    truncated: attribution.truncated,
+    truncated: attribution.truncated || capped,
   }
 }
 
@@ -770,7 +868,7 @@ function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult
   const counts = [
     `${result.errorsAttributed ?? 0} of ${result.errorsReported ?? 0} reported error(s) attributed`,
     ...(result.unattributed ? [`${result.unattributed} naming no file`] : []),
-    ...(result.truncated ? [`only the first ${AHR_SCRUB_FINDINGS_CAP} files are listed`] : []),
+    ...(result.truncated ? [`the list is incomplete — the ${AHR_SCRUB_FINDINGS_CAP}-file cap or the kernel-journal read cap was reached`] : []),
   ].join(', ')
   return `${head}\n\nAffected files (${counts}):\n${lines.join('\n')}`
 }
@@ -816,24 +914,69 @@ export async function scrubAhrPool(
       updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
       continue
     }
+    // WAIT FOR IT TO START before waiting for it to finish. md takes the write
+    // to `sync_action` asynchronously; a first mdstat read that lands before
+    // the sync thread is running shows no check, which the finish-wait below
+    // would read as "already done" — and then the mismatch_cnt read belongs to
+    // an earlier check and phase 2 runs while md's check is under it.
+    let started = false
+    let observable = true
+    const startDeadline = Date.now() + (opts?.checkStartTimeoutMs ?? AHR_SCRUB_CHECK_START_TIMEOUT_MS)
     for (;;) {
       const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
         .find(a => a.kernelName === kernelName)
+      if (md && (md.sync?.action === 'check' || md.syncDelayed || md.syncPending)) {
+        started = true
+        break
+      }
+      const action = await syncAction(executor, kernelName)
+      if (action === null) {
+        // No `sync_action` to watch — there is no signal here to wait on, so
+        // this band keeps the plain mdstat wait rather than burning the window.
+        observable = false
+        break
+      }
+      if (action !== 'idle' && action !== 'none') {
+        started = true
+        break
+      }
+      if (Date.now() >= startDeadline)
+        break
+      updateProgress(`md check on ${label} (waiting for md to start it)`)
+      await sleep(interval)
+    }
+    if (!started && observable) {
+      // Say it, and read NO counter: `mismatch_cnt` still holds whatever the
+      // last check that DID run left there, and reporting it as this scrub's
+      // verdict would invent rot (or, worse, clear a real finding).
+      updateProgress(`md never started the check on ${label} — this band was not checked (its mismatch_cnt belongs to an earlier check)`)
+      continue
+    }
+
+    for (;;) {
+      const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
+        .find(a => a.kernelName === kernelName)
+      const action = await syncAction(executor, kernelName)
       // Array gone from mdstat, or its check finished (and is not queued/parked
       // behind another sync): move to the next band. A `resync=PENDING` check
       // (syncPending, sync still null — e.g. an auto-read-only array parks its
       // check until first write, GT-9) is IN-FLIGHT, not finished: treating it
       // as done lets the next band's check start and the pending one later
       // fires concurrently, breaking the strictly-sequential guarantee (§4).
-      if (!md || (md.sync?.action !== 'check' && !md.syncDelayed && !md.syncPending))
+      // sysfs is consulted alongside mdstat: an op that has left mdstat's
+      // progress line but not yet gone idle is still running.
+      const mdstatIdle = !md || (md.sync?.action !== 'check' && !md.syncDelayed && !md.syncPending)
+      const sysfsIdle = action === null || action === 'idle' || action === 'none'
+      if (mdstatIdle && sysfsIdle)
         break
-      updateProgress(`md check on ${label}${md.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
+      updateProgress(`md check on ${label}${md?.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
       await sleep(interval)
     }
 
     // The check's verdict: md counted parity mismatches ⇒ rot EXISTS in this
     // band. Phase 2 is what names the files, and it starts right now — say so
     // in one warning rather than leaving the operator staring at a number (§e).
+    // Read only now: idle, plus the settle the counter needs (selfheal.4).
     await sleep(mismatchDelay)
     const mismatches = await mismatchCount(executor, kernelName)
     if (mismatches !== null && mismatches > 0) {

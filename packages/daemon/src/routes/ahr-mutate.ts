@@ -138,24 +138,26 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    *
    * There is no per-pool AHR mutation lock in the daemon — the one piece of
    * serialization AHR has is `withTopLevelMount`, which covers the §12 snapshot
-   * mount and nothing else. So the two full-array verbs refuse each other at
-   * SUBMIT through the job queue's own record (`findByOperation`, the same
-   * in-process correlation the create-status read uses): a scrub started
+   * mount and nothing else. So the two full-array verbs refuse each other AND
+   * themselves at SUBMIT through the job queue's own record: a scrub started
    * mid-repair would re-read every stripe while the engine has md's
-   * `rmw_level`, `sync_min`/`sync_max` and `stripe_cache_size` turned aside,
-   * and a repair started mid-scrub would fight the check for the same knobs.
+   * `rmw_level`, `sync_min`/`sync_max` and `stripe_cache_size` turned aside; a
+   * repair started mid-scrub would fight the check for the same knobs; and two
+   * scrubs of one pool would run `mdadm --action=check` over each other's
+   * bands, which §4 exists to prevent.
+   *
+   * The query is `findActive` — non-terminal jobs only. `findByOperation`
+   * answers with the LATEST job of an operation whatever its status, so one
+   * finished scrub submitted after a running one made the running one invisible
+   * and the exclusion silently stopped holding.
    *
    * The queue is in memory, so after a daemon restart this honestly answers
    * "nothing in flight" — the engine's own gates (`sync_action` not idle) are
    * the backstop, and no shadow state is introduced to paper over it.
    */
   function conflictingAhrJob(name: string): { operation: string, id: string } | null {
-    for (const operation of REPAIR_EXCLUSIVE_OPERATIONS) {
-      const job = jobQueue.findByOperation(operation, name)
-      if (job && (job.status === 'queued' || job.status === 'running'))
-        return { operation, id: job.id }
-    }
-    return null
+    const job = jobQueue.findActive(REPAIR_EXCLUSIVE_OPERATIONS, name)
+    return job ? { operation: job.operation, id: job.id } : null
   }
 
   /** Parse + validate a pool-name param, or 400 and return null. */
@@ -483,13 +485,22 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is not mounted — btrfs scrub needs the filesystem online` } }
     }
-    // The other half of the selfheal.6 pair: a scrub cannot start mid-repair.
-    // The engine has md's knobs turned aside for the duration of each block and
-    // a check would re-read every stripe underneath it.
+    // The other half of the selfheal.6 pair: a scrub cannot start mid-repair —
+    // the engine has md's knobs turned aside for the duration of each block and
+    // a check would re-read every stripe underneath it — and it cannot start on
+    // top of another scrub either, which would run a second `--action=check`
+    // over the same bands (§4: never concurrent).
     const scrubBlocker = conflictingAhrJob(name)
-    if (scrubBlocker && scrubBlocker.operation === 'ahr.repair') {
+    if (scrubBlocker) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `a repair job is in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — a check would re-read the stripes the repair is writing; wait for it to finish` } }
+      return {
+        error: {
+          code: 'CONFLICT',
+          message: scrubBlocker.operation === 'ahr.repair'
+            ? `a repair job is in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — a check would re-read the stripes the repair is writing; wait for it to finish`
+            : `a scrub is already in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — one scrub reads every byte of the pool and checks every band array; wait for it to finish`,
+        },
+      }
     }
 
     const job = jobQueue.submit(
@@ -592,6 +603,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         'A read-only snapshot of the file\'s subvolume is taken for the duration and removed afterwards',
         `md's rmw_level, sync_min, sync_max and stripe_cache_size on the pool's array(s) are changed for the duration and restored afterwards`,
         'One 4 KiB block per finding is written THROUGH md — and only after the reconstruction from the other members matches the checksum btrfs stored for it',
+        'The node\'s page cache is dropped (drop_caches) once per repaired block, so the verification read afterwards genuinely reaches the disks — a busy node will feel it',
         'Nothing else on the array is touched: no other file, no other block, no parity rewrite beyond the stripes these blocks live in',
         'A block that cannot be proven is left exactly as it is — reported unrepairable, or as corruption that arrived above md, never "fixed"',
       ],

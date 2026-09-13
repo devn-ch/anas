@@ -86,4 +86,40 @@ scrubbed a compressed file on its rig):
   reads the wrong 64 KiB — the F3 trap.
 - The route from a named logical to the corrupt extent is the kernel's own:
   the extent tree at that logical, whose data backrefs name the owning
-  (subvolume, inode, FILE OFFSET).
+  (subvolume, inode, offset). **The backref's `offset` is `file_offset −
+  extent_data_offset`, not the file offset** — on this rig every extent was
+  freshly written, so the two coincided and the difference did not show. The
+  split-extent capture below is where it does.
+
+## Split-extent fixtures (review remediation R2, 2026-09-13)
+
+A 1 GiB single-device loop rig on the stunt node (`anas-pve`, kernel
+`7.0.14-12-pve`, btrfs-progs `v6.14`; `mkfs.btrfs -m dup -d single
+--sectorsize 4096`, subvolume `@data`, no compression). `f1.bin` = 8 MiB of
+random bytes, synced; then 4 KiB overwritten at file offset 1 MiB and synced
+again — the CoW split. The rig was torn down afterwards (`capture-split.sh`,
+run once; the numbers below are its output, recomputed on the node).
+
+| file | what it is |
+|------|------------|
+| `split-dump-tree-subvol.txt` | `dump-tree -t <subvolid>` (one leaf). Inode 257 now has THREE EXTENT_DATA items: `(0, offset 0, nr 1048576)`, the new 4 KiB block at 1 MiB, and `(1052672, offset 1052672, nr 7335936)` — the tail of the ORIGINAL extent, same `disk byte 13631488`, starting a megabyte into it. |
+| `split-dump-tree-extent.txt` | `dump-tree -t 2`. The 8 MiB extent carries ONE data backref, `offset 0 count 2`: both owning items hash to the same backref, which is what proves a backref offset is not a file offset. |
+| `split-dump-tree-chunk.txt` / `split-dump-tree-roots.txt` | The chunk tree and the tree roots of that filesystem — the hop the csum leaf read needs. |
+| `split-dump-tree-csum.txt` | `dump-tree -t 7` (one leaf, bytenr 30801920). |
+| `split-csum-leaf.b64` | That csum leaf read RAW off the image (20 KiB from the chunk-hopped device offset 39190528) — the stored values, which a tree dump does not print. |
+| `split-block-300.b64` | File block 300 read through the filesystem with O_DIRECT. |
+| `split-expected.json` | What the node computed: `logical_byte 14860288` (with the extent data offset) vs `13807616` (without), the stored csum at each (`0x8b9126a3` / `0xa36a7021`), and `crc32c` of the block (`0x8b9126a3`). The csum tree is the arbiter of which arithmetic is right. |
+
+## Multi-band fixtures (review remediation R1, 2026-09-13)
+
+Six 200 MiB loop files on the same node: two 3-member RAID5 arrays with
+DIFFERENT geometry (`--chunk=64` and `--chunk=512`, data offsets 2048 and 4096
+sectors), both `pvcreate`d into one VG with one LV across them — the AHR
+multi-band shape (AHR-DESIGN §2.6: the LV is a linear concatenation of one md
+array per band, in band order). Torn down afterwards.
+
+| file | what it is |
+|------|------------|
+| `twoband-dmsetup-table-lv.txt` | `dmsetup table` of the LV: `0 811008 linear 9:127 2048` then `811008 802816 linear 9:126 2048` — two segments, two arrays, in band order. |
+| `twoband-md-sysfs-band1.txt` / `twoband-md-sysfs-band2.txt` | The same sysfs `key=value` capture as the rigs above, one per array (`chunk_size` 65536 vs 524288, `rd<n>/offset` 2048 vs 4096). |
+| `twoband-mdadm-detail-export-band1.txt` / `…-band2.txt` | `mdadm --detail --export` for each — the role → device map, disjoint member sets. |

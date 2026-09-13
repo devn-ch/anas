@@ -1,9 +1,9 @@
 # AHR self-heal loop-device suite — report
 
-- date: 2026-09-12 01:12:51  node: anas-pve  kernel: 7.0.14-12-pve
+- date: 2026-09-13 17:33:18  node: anas-pve  kernel: 7.0.14-12-pve
 - mdadm: 4.4  btrfs-progs: 6.14
 - REPAIR_CMD: `node /opt/anas/packages/daemon/dist/bin/selfheal-repair.js`
-- rigs: RAID5 (6 × 200 MiB loops), RAID6 (7 × 200 MiB loops), RAID5 at md's 512 KiB chunk (6 × 200 MiB loops, parity case only), and RAID1 (2 × 200 MiB loops) — built fresh per run, torn down after (see test/self-heal/gt/00-rig.sh)
+- rigs: RAID5 (6 × 200 MiB loops), RAID6 (7 × 200 MiB loops), RAID5 at md's 512 KiB chunk (6 × 200 MiB loops, parity case only), RAID1 (2 × 200 MiB loops), and the two-band AHR shape (RAID5 6 × 200 MiB @ 64K + RAID5 4 × 200 MiB @ 512K in one VG/LV, case 7) — built fresh per run, torn down after (see test/self-heal/gt/00-rig.sh and 00-rig-twoband.sh)
 
 ## Cases
 
@@ -28,7 +28,7 @@
 | 4-postcheck | REPAIR_FAIL_AT=postcheck: exit 70, knobs restored, no transient snapshot | PASS | rc=70 (expected 70) knobs={'rmw_level': '1', 'sync_min': '0', 'sync_max': 'max', 'sync_action': 'idle'} snapshots=absent |
 | 4-coldread | REPAIR_FAIL_AT=coldread: exit 70, knobs restored, no transient snapshot | PASS | rc=70 (expected 70) knobs={'rmw_level': '1', 'sync_min': '0', 'sync_max': 'max', 'sync_action': 'idle'} snapshots=absent |
 | 4-endcheck | bounded check suspends one stripe short of the array end (coverage 0..end-1 stripe proven) | PASS | suspended=True completed=201600/201728 (stripe=128 sectors) mismatch_cnt=8 |
-| 4-fullcheck | full md check (sync_max=max) reaches idle — the whole array is covered again | PASS | final=idle sampled_completed=382200/407552 mismatch_cnt=8 |
+| 4-fullcheck | full md check (sync_max=max) reaches idle — the whole array is covered again | PASS | final=idle sampled_completed=407552/407552 mismatch_cnt=8 |
 | 5-scan | md-device scan located the through-md rot | PASS | scan md@153665536 vs mapped 153665536 (cross-check only) |
 | 5-sanity | bounded check over the stripe sees mismatch_cnt==0 (rot arrived through md) | PASS | mismatch_cnt=0 (expected 0) |
 | 5-diag | repair diagnoses above-md corruption (exit 3, mismatch_cnt==0 in pre-check, nothing written) | PASS | rc=3 precheck_mismatch=0 outcome=above-md steps=4 reason=the bounded md check over stripe 468 reports mismatch_cnt=0 while the block fails its stored csum — parity agrees with the bad data, which i |
@@ -43,6 +43,13 @@
 | 6-repair | repair of a one-leg corruption (RAID1, block 300) | PASS | rc=0 postcheck=0 disk=m0 good_legs=None reason=/mnt/gtsh/@data/l1.bin block 300 reconstructed from the copy on /dev/loop1 and verified against the stored csum 0x2835f5 |
 | 6-legs | block reads back correct on BOTH legs after repair (md wrote every leg) | PASS | rot was on m0; now: m0=ok m1=ok |
 | 6-cold | post-repair cold snapshot read of the block matches the original | PASS | eio=[] content_match=True |
+| 7-txprobe | the tx-probe transaction touched no DATA chunk (the measured housekeeping set has no blind spot for the R1 assertion) | PASS | 18 band-A blocks measured, 0 in a data chunk |
+| 7-scan | oracle scan (members of both arrays) located the segment-2 block on a band-B member | PASS | hit m2 of band B (loop8); verification-side map: m2 of /dev/md126, stripe 74, member offset 41197568 |
+| 7-bandA-untouched | no DATA write on band A: every changed band-A sector is btrfs superblock/metadata housekeeping (the R1 assertion) | PASS | changed sectors: 130 — housekeeping=130 data=0 |
+| 7-repair | two-band: REPAIR_CMD of the segment-2 (band B) marker block exits 0 using band B's geometry | PASS | rc=0 postcheck=0 n=4 (band B n=4) disk=m2 stripe=74 reason=/mnt/gtsh/@data/b1.bin block 120000 reconstructed from the XOR of the other 3 members of stripe 74 and verified against  |
+| 7-member | band-B member block equals the original after repair | PASS | loop8@41197568 match=True |
+| 7-bcheck | evicted bounded check over band B's stripe reads 0 | PASS | stripe 74 of md126: mismatch_cnt=0 |
+| 7-cold | post-repair cold snapshot read of the segment-2 block matches the original | PASS | eio=[] content_match=True |
 
 ## Negative controls
 
@@ -60,9 +67,11 @@
 | 1r5x-n1 | naive repair at default rmw_level poisons parity (RAID5) | PASS | bounded check stripe 6: mismatch_cnt=8 (expected >0) |
 | 1r5x-n2 | sibling blocks BROKEN with m1 failed (RAID5, default rmw) | PASS | stripe 6: 1 wrong of 512 4K blocks (expected >0) |
 | 6-neg | cold read through md with leg m0 rotten: md served the corrupt leg (btrfs read EIOs) | PASS | rot_on_m0=True eio=[300] (either leg is a legitimate serving; recorded, not asserted) |
+| 7-neg | segment-1 (band A) marker repairs normally (both segments reachable) | PASS | rc=0 postcheck=0 scan hit band A m2 (band A expected), disk=m2 stripe=2168 reason=/mnt/gtsh/@data/b1.bin block 300 reconstructed from the XOR of the other 5 members of stripe 2168 and verified against t |
+| 7-neg2 | post-repair cold snapshot read of the segment-1 block matches the original | PASS | eio=[] content_match=True |
 
 ## Notes
 
-- none — every stage behaved as expected
+- two-band rig: LV is 2 linear segments from the dm table — band A /dev/md127 (RAID5 6×200 MiB, 64K) LV [0, 992 MiB), band B /dev/md126 (RAID5 4×200 MiB, 512K) LV [992, 1584 MiB)
 
-**SUITE: PASS (34/34 cases, 12/12 negative controls)**
+**SUITE: PASS (41/41 cases, 14/14 negative controls)**

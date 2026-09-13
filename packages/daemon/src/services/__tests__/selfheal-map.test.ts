@@ -5,6 +5,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import { parseTreeRoots } from '../selfheal-btree.js'
+import { crc32c, csumHex } from '../selfheal-csum.js'
 import {
   chunkForLogical,
   extentForFileOffset,
@@ -12,6 +13,7 @@ import {
   geometryFromAttributes,
   locateLogicalIn,
   logicalToLvByte,
+  memberOffsetOn,
   parseChunkItems,
   parseDmTable,
   parseExtentItems,
@@ -94,6 +96,8 @@ const RAID1 = geometryFromAttributes(
 )
 
 const SEGMENTS = parseDmTable(DM_TABLE)
+/** The rig's single band: its one linear segment on the RAID5 array. */
+const BANDS = SEGMENTS.map(segment => ({ segment, geometry: RAID5 }))
 const CHUNKS = parseChunkItems(CHUNK_TREE)
 
 /**
@@ -180,6 +184,79 @@ describe('selfheal mapping — dm table', () => {
   })
 })
 
+/**
+ * R1 — a pool whose LV is a LINEAR CONCATENATION of several md arrays, one per
+ * AHR band (AHR-DESIGN §2.6). Fixtures captured from a live two-band rig: two
+ * 3-member RAID5 arrays with DIFFERENT chunk sizes (64 K and 512 K) and
+ * DIFFERENT data offsets (1 MiB and 2 MiB), one VG, one LV across both.
+ */
+describe('selfheal mapping — a multi-band pool', () => {
+  const TWO_BAND = parseDmTable(fixture('twoband-dmsetup-table-lv.txt'))
+  const BAND1 = geometryFromAttributes(
+    '/dev/md127',
+    'md127',
+    '/sys/block/md127/md',
+    sysfsAttributes('twoband-md-sysfs-band1.txt'),
+    parseMdDetailExport(fixture('twoband-mdadm-detail-export-band1.txt'), 3),
+  )
+  const BAND2 = geometryFromAttributes(
+    '/dev/md126',
+    'md126',
+    '/sys/block/md126/md',
+    sysfsAttributes('twoband-md-sysfs-band2.txt'),
+    parseMdDetailExport(fixture('twoband-mdadm-detail-export-band2.txt'), 3),
+  )
+  const BANDS_2 = [
+    { segment: TWO_BAND[0], geometry: BAND1 },
+    { segment: TWO_BAND[1], geometry: BAND2 },
+  ]
+  /** Identity chunk: this is about the band hop, not the GT-2 chunk delta. */
+  const FLAT_CHUNK = { logical: 0, length: 2 ** 40, deviceOffset: 0, type: 'DATA|single' }
+
+  it('reads the LV as two linear segments on two different arrays', () => {
+    assert.equal(TWO_BAND.length, 2)
+    assert.deepEqual(TWO_BAND[0], { startSector: 0, lengthSectors: 811008, major: 9, minor: 127, offsetSector: 2048 })
+    assert.deepEqual(TWO_BAND[1], { startSector: 811008, lengthSectors: 802816, major: 9, minor: 126, offsetSector: 2048 })
+    // The two bands really do differ — which is why one geometry cannot serve both.
+    assert.equal(BAND1.chunkBytes, 65536)
+    assert.equal(BAND2.chunkBytes, 524288)
+    assert.deepEqual(BAND1.dataOffsets, [1048576, 1048576, 1048576])
+    assert.deepEqual(BAND2.dataOffsets, [2097152, 2097152, 2097152])
+    assert.notDeepEqual(BAND1.members, BAND2.members)
+  })
+
+  it('places a byte in the SECOND band with the second band\'s geometry, array and members', () => {
+    const lvByte = 811008 * 512 + 1048576
+    const located = locateLogicalIn(lvByte, FLAT_CHUNK, BANDS_2)
+    assert.equal(located.geometry.device, '/dev/md126', 'the block is on band 2\'s array')
+    assert.equal(located.mdByte, 2097152)
+    assert.equal(located.stripe, 2)
+    assert.equal(located.memberIndex, 1)
+    assert.equal(located.memberDevice, BAND2.members[1])
+    assert.equal(located.memberOffset, 2097152 + 2 * 524288)
+  })
+
+  it('is a DIFFERENT member and a different disk than band 1\'s geometry would have said', () => {
+    const lvByte = 811008 * 512 + 1048576
+    const right = locateLogicalIn(lvByte, FLAT_CHUNK, BANDS_2)
+    // What the pre-R1 engine did: the first segment's geometry for every byte.
+    const wrong = locateLogicalIn(lvByte, FLAT_CHUNK, [{ segment: TWO_BAND[1], geometry: BAND1 }])
+    assert.notEqual(right.memberDevice, wrong.memberDevice)
+    assert.notEqual(right.memberOffset, wrong.memberOffset)
+    assert.notEqual(right.geometry.device, wrong.geometry.device)
+  })
+
+  it('keeps a byte in the first band on the first band', () => {
+    const located = locateLogicalIn(65536, FLAT_CHUNK, BANDS_2)
+    assert.equal(located.geometry.device, '/dev/md127')
+    assert.equal(located.memberDevice, BAND1.members[located.memberIndex])
+  })
+
+  it('refuses an LV byte past the last segment rather than extrapolating', () => {
+    assert.throws(() => locateLogicalIn((811008 + 802816) * 512, FLAT_CHUNK, BANDS_2), /no dm linear segment/)
+  })
+})
+
 describe('selfheal mapping — chunk tree (GT-2)', () => {
   const chunks = parseChunkItems(CHUNK_TREE)
 
@@ -215,6 +292,7 @@ describe('selfheal mapping — extent items', () => {
       fileOffset: 0,
       diskByte: 13631488,
       diskLength: 8388608,
+      extentDataOffset: 0,
       length: 8388608,
       ram: 8388608,
       compression: 'none',
@@ -251,6 +329,61 @@ describe('selfheal mapping — extent items', () => {
   })
 })
 
+/**
+ * R2 — the `extent data offset` field, and the CoW split that makes it
+ * non-zero. Fixtures captured from a live rig (see PROVENANCE.md, "Split-extent
+ * fixtures"): an 8 MiB file with 4 KiB overwritten 1 MiB in. `split-expected
+ * .json` carries what the NODE computed — the stored csum read off the device
+ * and the crc32c of the file's own block 300.
+ */
+describe('selfheal mapping — a CoW-split extent', () => {
+  const SPLIT_TREE = fixture('split-dump-tree-subvol.txt')
+  const EXPECTED_SPLIT = JSON.parse(fixture('split-expected.json')) as {
+    inode: number
+    block: number
+    logical_byte: number
+    logical_byte_without_extent_data_offset: number
+    stored_csum: string
+    stored_csum_at_wrong_logical: string
+    crc32c_of_block: string
+    extent_data_offset: number
+  }
+  const SPLIT_BLOCK = Buffer.from(fixture('split-block-300.b64').trim(), 'base64')
+
+  it('parses the three items the split left, with their extent data offsets', () => {
+    const items = parseExtentItems(SPLIT_TREE, EXPECTED_SPLIT.inode)
+    assert.equal(items.length, 3)
+    assert.deepEqual(items.map(e => [e.fileOffset, e.extentDataOffset, e.length]), [
+      [0, 0, 1048576],
+      [1048576, 0, 4096],
+      // The tail of the ORIGINAL extent: same disk byte as the first item,
+      // starting a megabyte into it.
+      [1052672, 1052672, 7335936],
+    ])
+    assert.equal(items[0].diskByte, items[2].diskByte)
+  })
+
+  it('maps block 300 through the extent data offset — the csum tree says which answer is right', () => {
+    const extent = extentForFileOffset(parseExtentItems(SPLIT_TREE, EXPECTED_SPLIT.inode), EXPECTED_SPLIT.block * 4096)
+    assert.equal(extent.extentDataOffset, EXPECTED_SPLIT.extent_data_offset)
+    const unit = repairUnitFor(extent, EXPECTED_SPLIT.block)
+    assert.equal(unit.logicalByte, EXPECTED_SPLIT.logical_byte)
+    assert.equal(unit.blobLogical, EXPECTED_SPLIT.logical_byte)
+    // The pre-R2 arithmetic — disk byte + (file offset − item offset) — lands a
+    // megabyte short, on a logical byte whose stored csum belongs to a
+    // different block entirely.
+    assert.notEqual(unit.logicalByte, EXPECTED_SPLIT.logical_byte_without_extent_data_offset)
+    assert.notEqual(EXPECTED_SPLIT.stored_csum, EXPECTED_SPLIT.stored_csum_at_wrong_logical)
+    assert.equal(csumHex(crc32c(SPLIT_BLOCK)), EXPECTED_SPLIT.stored_csum)
+  })
+
+  it('refuses a block the item does not cover instead of mapping it anyway', () => {
+    const [first] = parseExtentItems(SPLIT_TREE, EXPECTED_SPLIT.inode)
+    // Block 300 is past the first item's 1 MiB — the item stops at block 256.
+    assert.throws(() => repairUnitFor(first, 300), /outside the extent at file offset 0/)
+  })
+})
+
 describe('selfheal mapping — md placement', () => {
   it('places a RAID5 md byte on the left-symmetric data disk of its stripe', () => {
     const placed = placeMdByte(16171008, RAID5)
@@ -284,6 +417,25 @@ describe('selfheal mapping — md placement', () => {
     assert.deepEqual(placed.mirrors, [0, 1])
   })
 
+  /**
+   * R4 — every member has its own `rd<n>/offset`, and md does not require them
+   * equal. The mirror paths used to read every leg at the FIRST leg's offset.
+   */
+  it('puts the same bytes at each member\'s OWN data offset, on both level kinds', () => {
+    const skewed = { ...RAID1, dataOffsets: [1048576, 4194304] }
+    const placed = placeMdByte(65536, skewed)
+    const location = { ...placed, logical: 0, lvByte: 0, geometry: skewed, startSector: 0, chunkLogical: 0, chunkDevice: 0 }
+    assert.equal(memberOffsetOn(skewed, location, 0), 1048576 + 65536)
+    assert.equal(memberOffsetOn(skewed, location, 1), 4194304 + 65536, 'leg 1 reads at ITS offset')
+
+    // The parity path already did this; it now goes through the same helper.
+    const parity = { ...RAID5, dataOffsets: [1048576, 1048576, 1048576, 1048576, 1048576, 2097152] }
+    const target = placeMdByte(16171008, parity)
+    const row = { ...target, logical: 0, lvByte: 0, geometry: parity, startSector: 0, chunkLogical: 0, chunkDevice: 0 }
+    assert.equal(memberOffsetOn(parity, row, 0), 4308992)
+    assert.equal(memberOffsetOn(parity, row, 5), 4308992 + 1048576)
+  })
+
   it('REFUSES a layout it does not map rather than guessing', () => {
     const asymmetric = { ...RAID5, layout: 'left-asymmetric' }
     assert.throws(() => placeMdByte(16171008, asymmetric), SelfhealMapError)
@@ -300,7 +452,7 @@ describe('selfheal mapping — the whole chain', () => {
   for (const expected of EXPECTED) {
     it(`resolves ${expected.file} block ${expected.block} exactly as the suite's own mapper does`, () => {
       const chunk = chunkForLogical(CHUNKS, expected.target_logical, true)
-      const located = locateLogicalIn(expected.target_logical, chunk, SEGMENTS, RAID5)
+      const located = locateLogicalIn(expected.target_logical, chunk, BANDS)
       assert.equal(located.chunkLogical, expected.chunk_logical)
       assert.equal(located.chunkDevice, expected.chunk_device)
       assert.equal(located.lvByte, expected.lv_byte)
@@ -358,8 +510,7 @@ describe('selfheal mapping — the extent tree (selfheal.8)', () => {
     return {
       mountpoint: '/mnt/sh8',
       srcDevice: '/dev/loop0',
-      segments: [],
-      geometry: {} as never,
+      bands: [],
       roots,
       chunks: [],
       csums: [],
@@ -397,6 +548,34 @@ describe('selfheal mapping — the extent tree (selfheal.8)', () => {
     // Two walks for the extent tree (stripe start and stripe end land in the
     // same leaf) plus one per owning file offset.
     assert.equal(executor.calls.length, 2 + 16)
+  })
+
+  /**
+   * R2's other half: an `extent data backref` offset is `file_offset −
+   * extent_data_offset`, not a file offset. On the split rig the 8 MiB extent
+   * has ONE backref (`offset 0 count 2`) and TWO owning items — file offsets 0
+   * and 1,052,672. Reading the backref as a file offset finds the first and
+   * misses the second, which is the half of the file a repair would be told
+   * nothing about.
+   */
+  it('resolves EVERY item that references an extent, not just the one at the backref offset', async () => {
+    const roots = parseTreeRoots(fixture('split-dump-tree-roots.txt'))
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: '/usr/bin/btrfs',
+      args: ['inspect-internal', 'dump-tree', '-b', String(roots.extent), '/dev/loop0'],
+      result: { stdout: fixture('split-dump-tree-extent.txt'), stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({
+      command: '/usr/bin/btrfs',
+      args: ['inspect-internal', 'dump-tree', '-b', String(roots.bySubvolume.get(256)), '/dev/loop0'],
+      result: { stdout: fixture('split-dump-tree-subvol.txt'), stderr: '', exitCode: 0 },
+    })
+    const ctx = { mountpoint: '/mnt/split', srcDevice: '/dev/loop0', bands: [], roots, chunks: [], csums: [] }
+    const extents = await extentsForStripe(executor, ctx, 256, 257, 13631488)
+    assert.deepEqual(extents.map(e => e.fileOffset), [0, 1052672])
+    assert.deepEqual(extents.map(e => e.extentDataOffset), [0, 1052672])
+    assert.ok(extents.every(e => e.diskByte === 13631488))
   })
 
   it('names no extent where this file owns none — and refuses a foreign subvolume', async () => {

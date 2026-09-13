@@ -1,0 +1,12 @@
+MD_LEVEL=raid5
+MD_DEVICES=3
+MD_METADATA=1.2
+MD_UUID=fb7011eb:32aa5bc3:101f1e44:4c7bc50f
+MD_DEVNAME=gtsh2a
+MD_NAME=anas-pve:gtsh2a
+MD_DEVICE_dev_loop2_ROLE=2
+MD_DEVICE_dev_loop2_DEV=/dev/loop2
+MD_DEVICE_dev_loop0_ROLE=0
+MD_DEVICE_dev_loop0_DEV=/dev/loop0
+MD_DEVICE_dev_loop1_ROLE=1
+MD_DEVICE_dev_loop1_DEV=/dev/loop1
