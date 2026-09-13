@@ -223,6 +223,27 @@ describe('scrub-task runner (selfheal.4 — timer entrypoint)', () => {
     assert.equal(job.status, 'completed', 'a lone 404 never abandons the wait')
   })
 
+  it('a non-404 between 404s resets the vanish count — only CONSECUTIVE 404s confirm it (third pass)', async () => {
+    // 404, 503, 404, 404 — two real 404s split by an outage. The old counter
+    // was never reset by non-404s, so this sequence declared the job vanished
+    // on the FOURTH poll after only two consecutive 404s.
+    const sequence: RunnerResponse[] = [
+      { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } },
+      { statusCode: 503, body: { error: { code: 'UNAVAILABLE', message: 'overloaded' } } },
+      { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } },
+      { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } },
+      { statusCode: 200, body: { job: { id: 'j1', status: 'completed', result: { scrubbed: 'p1' } } } },
+    ]
+    let pollIdx = 0
+    const requester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+      return sequence[Math.min(pollIdx++, sequence.length - 1)]
+    }
+    const job = await scrubPool(requester, 'p1', { sleep: noSleep, maxAttempts: 10 })
+    assert.equal(job.status, 'completed', '404, 503, 404, 404 is not three consecutive 404s')
+  })
+
   it('a non-404 failure (500) is an outage, not a vanish — bounded by the outage cap, not 3 polls', async () => {
     const lines: string[] = []
     const origErr = process.stderr.write.bind(process.stderr)

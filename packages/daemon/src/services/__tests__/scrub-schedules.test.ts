@@ -4,6 +4,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import { readScrubSchedule, renderScrubTimerUnit, SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME, writeScrubUnits } from '../scrub-schedule-units.js'
 import {
@@ -328,16 +329,88 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
 // mdcheck's timers are enabled by default on a stock node, so "mdcheck is on"
 // is not an opt-in, and a daemon that armed a monthly multi-hour scrub — and
 // switched the OS parity check off — on its own was overreach. The per-pool
-// toggle is the only thing that writes units. This guard keeps the start path
-// clean: index.ts must never reach back into the scrub store.
-describe('no mdcheck adoption at daemon start (review F1/F4)', () => {
-  it('index.ts carries no adoption — no unit writes, no systemctl calls for scrub', async () => {
-    // The invariant is the import graph: the daemon start path does not touch
-    // the scrub store at all, so it can write no unit and call no systemctl.
-    const src = await readFile(new URL('../../index.ts', import.meta.url), 'utf-8')
-    assert.doesNotMatch(src, /scrub-schedules/, 'the start path does not import the scrub store')
-    assert.doesNotMatch(src, /scrub-schedule-units/, 'the start path does not import the scrub units')
-    // And the module no longer even exports an adoption to call.
+// toggle is the only thing that writes units. This guard is STRUCTURAL (third
+// pass): it resolves the daemon's transitive static import graph from index.ts
+// (a string scan over relative specifiers — no bundler) and asserts the scrub
+// store never leaves the toggle route + store layer: no startup path outside
+// routes/ imports it, and the unit-WRITE surface is named nowhere else. No
+// startup path can write a unit or arm a timer, whatever a future edit adds;
+// grepping index.ts's own text alone would miss the import arriving one hop
+// away.
+describe('no mdcheck adoption at daemon start (review F1/F4) — structural guard', () => {
+  const SRC_ROOT = new URL('../../', import.meta.url)
+  const INDEX_URL = new URL('../../index.ts', import.meta.url)
+  const STORE_RE = /scrub-schedule-units|scrub-schedules/
+
+  /** Relative './x.js' specifiers of a module's static imports (string scan). */
+  function importSpecifiers(src: string): string[] {
+    return Array.from(src.matchAll(/(?:\bfrom\s+|\bimport\s+)['"](\.[^'"]+)['"]/g), m => m[1])
+  }
+
+  /**
+   * Modules reachable from `entry` over relative imports that stay inside
+   * packages/daemon/src. Modules under routes/ are expanded only when asked:
+   * the start-path walk treats them as leaves (their subtrees ARE the routes
+   * trees), the per-route walk follows them all the way down.
+   */
+  async function reachableFrom(entry: URL, expandRoutes: boolean): Promise<Set<string>> {
+    const seen = new Set<string>()
+    const queue = [entry]
+    while (queue.length > 0) {
+      const url = queue.shift()!
+      if (seen.has(url.href) || !url.href.startsWith(SRC_ROOT.href))
+        continue
+      seen.add(url.href)
+      if (!expandRoutes && url.href.includes('/src/routes/'))
+        continue
+      const src = await readFile(fileURLToPath(url), 'utf-8')
+      for (const spec of importSpecifiers(src)) {
+        // Source imports name the COMPILED '.js'; the tree here is the '.ts'.
+        const tsHref = new URL(spec, url).href.replace(/\.js$/, '.ts')
+        queue.push(new URL(tsHref))
+      }
+    }
+    return seen
+  }
+
+  it('nothing outside the routes tree on the start path reaches the scrub store', async () => {
+    const offenders: string[] = []
+    for (const href of await reachableFrom(INDEX_URL, false)) {
+      if (href.includes('/src/routes/'))
+        continue // the routes tree is the sanctioned door
+      const src = await readFile(fileURLToPath(new URL(href)), 'utf-8')
+      if (STORE_RE.test(src))
+        offenders.push(href.slice(SRC_ROOT.href.length))
+    }
+    assert.deepEqual(offenders, [], 'the daemon start path imports the scrub store outside routes/')
+  })
+
+  it('the unit-WRITE surface is reachable only through the store layer and the toggle route', async () => {
+    // ahr-scrub.ts borrows mismatchCntArgs from scrub-schedules (an argv
+    // helper), so bare module reachability cannot read "only via routes/scrub.ts"
+    // — the invariant that matters is the WRITE surface: writeScrubUnits /
+    // removeScrubUnits are named only by the store layer itself, and the store
+    // is wired only through routes/scrub.ts.
+    const full = await reachableFrom(INDEX_URL, true)
+    assert.ok(
+      [...full].some(href => href.endsWith('/scrub-schedule-units.ts')),
+      'the toggle wiring reaches the unit store — the guard watches a live path',
+    )
+    const offenders: string[] = []
+    for (const href of full) {
+      if (href.includes('/src/routes/'))
+        continue // the routes tree is the sanctioned door
+      const rel = href.slice(SRC_ROOT.href.length)
+      if (rel === 'services/scrub-schedules.ts' || rel === 'services/scrub-schedule-units.ts')
+        continue // the store layer itself
+      const src = await readFile(fileURLToPath(new URL(href)), 'utf-8')
+      if (/\bwriteScrubUnits\b|\bremoveScrubUnits\b|scrub-schedule-units/.test(src))
+        offenders.push(rel)
+    }
+    assert.deepEqual(offenders, [], 'the scrub unit write surface leaked outside the store layer + toggle route')
+  })
+
+  it('and the module no longer even exports an adoption to call', async () => {
     const mod = await import('../scrub-schedules.js')
     for (const key of Object.keys(mod))
       assert.doesNotMatch(key, /[Aa]dopt/, `scrub-schedules must not export ${key}`)

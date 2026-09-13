@@ -177,12 +177,22 @@ describe('scrub schedule units — CRUD lifecycle (temp dir + mocked systemctl)'
     await assert.rejects(() => writeScrubUnits(mock, dir, schedule()), ForeignUnitError)
   })
 
-  it('a foreign TIMER alongside an OURS service is still foreign (review F13)', async () => {
-    await writeScrubUnits(mock, dir, schedule())
-    await writeFile(join(dir, SCRUB_TIMER_NAME), '[Timer]\nOnCalendar=daily\n')
-    assert.equal(await scrubUnitsAreForeign(dir), true)
-    // removeScrubUnits refuses nothing — but the route's door check (this same
-    // predicate) stops the toggle before a foreign timer gets deleted.
+  it('a marker-less TIMER beside an OURS service is the LEGACY pre-F13 pair — adopted, not foreign (review F13, third pass)', async () => {
+    // The stunt node's on-disk pair: the intermediate build rendered the
+    // schedule marker into the service only, so the timer beside it carries
+    // none. Refusing it made every toggle PUT 409 foreign-unit in BOTH
+    // directions — the timer could never be turned off from the UI.
+    await writeFile(join(dir, SCRUB_SERVICE_NAME), renderScrubServiceUnit(schedule()))
+    await writeFile(
+      join(dir, SCRUB_TIMER_NAME),
+      '[Unit]\nDescription=ANAS periodic AHR scrub timer\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n',
+    )
+    assert.equal(await scrubUnitsAreForeign(dir), false, 'a marked service vouches for the timer beside it')
+    assert.equal(mock.calls.length, 0, 'the read alone touched nothing')
+    // Adoption: the next write re-renders BOTH files, the timer with its marker.
+    await writeScrubUnits(mock, dir, schedule({ pools: ['ahr0', 'ahr1'] }))
+    assert.match(await readFile(join(dir, SCRUB_TIMER_NAME), 'utf-8'), /X-ANAS-Schedule=/)
+    assert.deepEqual(await readScrubSchedule(dir), schedule({ pools: ['ahr0', 'ahr1'] }))
   })
 
   it('a failed enable ROLLS BACK both files (review F14) — the next attempt is clean', async () => {
@@ -199,6 +209,40 @@ describe('scrub schedule units — CRUD lifecycle (temp dir + mocked systemctl)'
     await assert.rejects(() => writeScrubUnits(mock, dir, schedule({ pools: ['ahr0'] })), /enable failed/)
     assert.deepEqual(await readScrubSchedule(dir), { kind: 'ahr-scrub', cadence: 'monthly', pools: ['ahr0', 'ahr1'] }, 'the previous schedule survived the failed rewrite')
     assert.deepEqual((await readdir(dir)).sort(), [SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME].sort())
+  })
+
+  it('a failed FIRST write also DISABLES the half-enabled timer (third pass) — no dangling wants symlink', async () => {
+    // `enable --now` enables BEFORE it starts: a failed start leaves the
+    // timers.target.wants symlink pointing at a file the rollback deletes —
+    // enablement must ride the files back down.
+    mock.addFixture({ command: SYSTEMCTL, args: ['enable', '--now', SCRUB_TIMER_NAME], result: { stdout: '', stderr: 'enable failed', exitCode: 1 } })
+    await assert.rejects(() => writeScrubUnits(mock, dir, schedule()), /enable failed/)
+    const cmds = mock.calls.map(c => c.args.join(' '))
+    assert.ok(cmds.includes(`disable --now ${SCRUB_TIMER_NAME}`), 'the rollback takes the half-enabled timer back down')
+    assert.deepEqual(await readdir(dir), [], 'both files and the enablement are gone')
+  })
+
+  it('a failed update RESTORES the previous pair AND its enablement (third pass)', async () => {
+    // is-enabled is read before every write: the setup write reads the catch-all
+    // ('' → not enabled), the failing rewrite reads the live 'enabled'.
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['is-enabled', SCRUB_TIMER_NAME],
+      results: [
+        { stdout: '', stderr: '', exitCode: 0 },
+        { stdout: 'enabled\n', stderr: '', exitCode: 0 },
+      ],
+    })
+    await writeScrubUnits(mock, dir, schedule({ pools: ['ahr0', 'ahr1'] }))
+    mock.addFixture({ command: SYSTEMCTL, args: ['enable', '--now', SCRUB_TIMER_NAME], result: { stdout: '', stderr: 'enable failed', exitCode: 1 } })
+    await assert.rejects(() => writeScrubUnits(mock, dir, schedule({ pools: ['ahr0'] })), /enable failed/)
+    assert.deepEqual(await readScrubSchedule(dir), { kind: 'ahr-scrub', cadence: 'monthly', pools: ['ahr0', 'ahr1'] }, 'the previous schedule survived')
+    const cmds = mock.calls.map(c => c.args.join(' '))
+    assert.ok(cmds.includes(`is-enabled ${SCRUB_TIMER_NAME}`), 'enablement is read before the write')
+    assert.ok(
+      cmds.lastIndexOf(`enable --now ${SCRUB_TIMER_NAME}`) > cmds.indexOf(`enable --now ${SCRUB_TIMER_NAME}`),
+      'the restored pair was re-enabled after the files came back (best-effort — the mock fails it too)',
+    )
   })
 
   it('removeScrubUnits clears the timer\'s Persistent stamp (review R10)', async () => {

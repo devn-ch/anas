@@ -1015,3 +1015,40 @@ F13 — the foreign-unit check covers BOTH files: the rendered timer carries the
 F2+F8 — uninstall removes ALL FOUR ANAS unit families (`anas-snap-*`, `anas-backup-*`, `anas-repl-*`, `anas-scrub.*`, one count line per family) and NEVER re-enables mdcheck: ANAS is stateless and cannot know whether mdcheck was on before ANAS, so the scrub removal prints an honest line saying what is off and the exact `systemctl enable --now mdcheck_start.timer mdcheck_continue.timer` to get it back.
 
 F9 — a vanished scrub job (404) ends the wait after 3 consecutive confirmations (~30 s: a job id is a randomUUID and cannot come back) with a "job vanished (daemon restarted?) — moving to the next pool" journald line, instead of blocking pools 2..n for the old 24 h backstop; the transport-outage handling keeps its own bounded retry, and other non-200s count as outage, not vanish.
+
+### Third pass
+
+Third review of the same schedule/packaging surface (`de17ed1..13cb6b3`, 2026-09-13), all fixed at the
+source with a regression test that fails on the old code and passes on the new one.
+
+- **T5 — the LEGACY pre-F13 pair is adopted, not refused.** The intermediate build wrote the
+  `X-ANAS-Schedule=` marker into the service but not yet the timer, so the stunt node's on-disk pair
+  (marked service, marker-less timer) read as foreign under F13's both-files check — every toggle PUT
+  409'd `foreign-unit` in both directions and the timer could never be turned off from the UI. The
+  marked .service now VOUCHES for the marker-less timer beside it (the next write re-renders the timer
+  with its marker); a marker-less service, or a marker-less timer with no marked service beside it
+  (timer-only), is still foreign. *(`scrub-schedule-units.test.ts`: the legacy pair is not foreign and
+  is rewritten with the marker on the next write; the timer-only and service-only refusals stand.)*
+- **T8 — the rollback takes the timer's enablement down (and puts it back).** `enable --now` enables
+  BEFORE it starts, so a failed start on a first write left a dangling `timers.target.wants` symlink
+  over a file the F14 rollback deletes; and a restored previous pair came back DISABLED. The rollback
+  now best-effort `disable --now`s the timer when the write was the pair's first, and re-enables the
+  restored pair when `is-enabled` (read before the write) said it was enabled before.
+  *(`scrub-schedule-units.test.ts`: first-write start failure → disable called, no files left; update
+  failure → previous pair restored AND its `enable --now` re-attempted after the files come back.)*
+- **T9 — the vanished-job counter counts CONSECUTIVE 404s.** The 404 counter was not reset by other
+  non-200s, so 404, 503, 404, 404 declared the job vanished after two real 404s. The non-404 branch
+  resets `missing`: only three 404s IN A ROW end the wait. *(`scrub-task.test.ts`: the 404/503/404/404
+  sequence completes; 404×3 still vanishes — covered by the existing F9 test.)*
+- **T11 — the no-adoption guard is STRUCTURAL.** The old guard grepped index.ts's own text, which
+  misses the import arriving one hop away. It now resolves the daemon's transitive static import graph
+  from index.ts (a string scan over relative specifiers, `.js`→`.ts`, no bundler) and asserts, first,
+  that no start-path module outside routes/ references the scrub store, and second — since
+  `ahr-scrub.ts` legitimately borrows `mismatchCntArgs` from `scrub-schedules.ts` — that the unit-WRITE
+  surface (`writeScrubUnits`/`removeScrubUnits`) is named nowhere outside the store layer and the
+  toggle route. *(`scrub-schedules.test.ts`: both walks, plus the live-path check that the toggle
+  wiring still reaches the store.)*
+- **T12 — replication-units uses the shared unit store.** The fourth store's last private leftovers
+  (`unlinkQuiet`, `runSystemctl`, the hand-rolled marker regex, the unit-dir listing/reads) now come
+  from `systemd-unit-store.ts` like the other three stores; the marker regex is byte-identical
+  (`markerRegex('X-ANAS-Task=')`), behaviour unchanged. *(`replication-units.test.ts` green unchanged.)*

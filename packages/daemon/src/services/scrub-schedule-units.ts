@@ -78,16 +78,24 @@ export class ForeignUnitError extends Error {
  * foreign file)? A file carrying the marker — even with corrupt JSON inside,
  * e.g. a write interrupted mid-flight — is OURS to rewrite; one without it is
  * someone else's and is neither overwritten nor deleted (review R10). BOTH
- * files are checked (review F13): the timer carries the marker too, and a
- * foreign `anas-scrub.timer` alone — no service on the name — would otherwise
- * sail past the check and be deleted by `removeScrubUnits`.
+ * files are checked (review F13), with one adoption exception (review F13's
+ * third pass): the .service is the pair's anchor, and a MARKED service vouches
+ * for a marker-less timer beside it — the pre-F13 pair an intermediate build
+ * wrote (the service carried the schedule marker, the timer did not yet) is
+ * OURS, adopted rather than refused forever: the next write re-renders the
+ * timer with its marker. Without the vouch, that pair read as foreign and
+ * every toggle PUT 409'd in both directions — the timer could never be turned
+ * off from the UI. A marker-less SERVICE, or a marker-less timer with no
+ * marked service beside it, is still foreign.
  */
 export async function scrubUnitsAreForeign(dir: string): Promise<boolean> {
-  for (const name of [SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME]) {
-    const content = await readUnitFile(dir, name)
-    if (content !== null && !SCHEDULE_MARKER_RE_LINE.test(content))
-      return true
-  }
+  const service = await readUnitFile(dir, SCRUB_SERVICE_NAME)
+  const timer = await readUnitFile(dir, SCRUB_TIMER_NAME)
+  const serviceOurs = service !== null && SCHEDULE_MARKER_RE_LINE.test(service)
+  if (service !== null && !serviceOurs)
+    return true
+  if (timer !== null && !SCHEDULE_MARKER_RE_LINE.test(timer) && !serviceOurs)
+    return true
   return false
 }
 
@@ -211,7 +219,12 @@ export async function readScrubTimerNext(executor: CommandExecutor): Promise<str
  * the reload, the enable — must not leave a HALF-WRITTEN pair for the next
  * attempt to trip over. Both previous files are restored byte-for-byte (or
  * removed, when this write was the pair's first), a best-effort reload drops the
- * half-registered units from systemd, and the original error rethrows. A
+ * half-registered units from systemd, and the original error rethrows. The
+ * timer's enablement is restored with the files (third pass): `enable --now`
+ * enables BEFORE it starts, so a failed start on a first write leaves the
+ * `timers.target.wants` symlink dangling over a file the rollback removes — the
+ * disable takes it back down; a restored previous pair is re-enabled when the
+ * timer was enabled before the write (`is-enabled` is read up front). A
  * ForeignUnitError passes through untouched — nothing was written, nothing to
  * roll back.
  */
@@ -226,6 +239,7 @@ export async function writeScrubUnits(
       + 'not an ANAS unit; ANAS will not overwrite it',
     )
   }
+  const timerWasEnabled = await readScrubTimerEnabled(executor)
   const previous = {
     [SCRUB_SERVICE_NAME]: await readUnitFile(dir, SCRUB_SERVICE_NAME),
     [SCRUB_TIMER_NAME]: await readUnitFile(dir, SCRUB_TIMER_NAME),
@@ -243,9 +257,39 @@ export async function writeScrubUnits(
       else
         await writeFile(join(dir, name), prev, 'utf-8')
     }
+    // Enablement rides the files (third pass). Best-effort both ways — the
+    // original failure below is what the operator sees; a rollback systemctl
+    // hiccup on top of it would only bury the cause.
+    if (previous[SCRUB_TIMER_NAME] === null) {
+      // A first write: enable --now may have linked the timer before its start
+      // failed — the file is gone now, so the wants symlink must go too.
+      await executor.exec(SYSTEMCTL, ['disable', '--now', SCRUB_TIMER_NAME]).catch(() => undefined)
+    }
+    else if (timerWasEnabled) {
+      // A rewrite: the restored pair was live before — put the enable back
+      // (--now also re-actives the timer; a start that fails again changes
+      // nothing the original error does not already report).
+      await executor.exec(SYSTEMCTL, ['enable', '--now', SCRUB_TIMER_NAME]).catch(() => undefined)
+    }
     // Best-effort: systemd may never have seen the half-written pair.
     await executor.exec(SYSTEMCTL, ['daemon-reload']).catch(() => undefined)
     throw err
+  }
+}
+
+/**
+ * Was the scrub timer enabled before a write (best-effort — an unreadable
+ * `is-enabled` reads as not enabled, so a rollback never re-enables on a
+ * guess)? `is-enabled` exits nonzero for `disabled`/`static` but still prints
+ * the word; `enabled`/`enabled-runtime` (exit 0) are the enabled states.
+ */
+async function readScrubTimerEnabled(executor: CommandExecutor): Promise<boolean> {
+  try {
+    const r = await executor.exec(SYSTEMCTL, ['is-enabled', SCRUB_TIMER_NAME])
+    return r.exitCode === 0 && r.stdout.trim().startsWith('enabled')
+  }
+  catch {
+    return false
   }
 }
 

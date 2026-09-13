@@ -170,7 +170,10 @@ export async function pollScrubJob(
     }
     else {
       // Any other non-200 is a daemon problem, not a missing job — the outage
-      // cap's territory, not the short vanish window's.
+      // cap's territory, not the short vanish window's. It also breaks the RUN
+      // of 404s: only CONSECUTIVE 404s confirm a vanish (third pass) — a daemon
+      // that answered 503 between two 404s was up, and its job list with it.
+      missing = 0
       outage += 1
       if (outage >= outageCap) {
         const message = `scrub job ${jobRef.id} poll kept failing — HTTP ${poll.statusCode} for `
