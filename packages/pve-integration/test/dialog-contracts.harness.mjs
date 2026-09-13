@@ -7604,6 +7604,48 @@ async function scrubTwoPhaseChecks() {
       && j.body.enabled === false && !('cadence' in j.body)), JSON.stringify(jobs))
 }
 
+// ============================================================================
+//  Disks (story 3.18) — the stale/standby marker on the Health cell
+// ============================================================================
+//
+//  The daemon reports a disk's LAST KNOWN SMART state as `smartStale` +
+//  `smartStaleReason` ('standby' | 'probe-failed') — the value shown is the
+//  last measured one, not current. The Health cell must render that as a muted
+//  "(last known — …)" suffix + tooltip, and render NOTHING extra on a fresh
+//  reading or on an older daemon that omits the fields (version skew).
+
+async function disksStaleHealthChecks() {
+  const ANAS = loadSource('40-disks.js', { 'GET /disks': { data: [] } })
+  ok('disks: the disks view registered', !!ANAS.views['disks'])
+  const gridCfg = ANAS.views['disks'].factory('n1').items[0]
+  const healthCol = gridCfg.columns.find(c => c.dataIndex === 'healthStatus')
+  ok('disks: the Health column exists', !!healthCol)
+  const render = (v, data) => healthCol.renderer(v, {}, makeRecord(data))
+
+  // A fresh reading: the icon + label, no marker.
+  const fresh = render('healthy', { healthStatus: 'healthy' })
+  ok('disks: a fresh reading renders no stale marker', !/last known/.test(fresh), fresh)
+
+  // Stale — standby: the last measured value, with the muted suffix + tooltip.
+  const standby = render('healthy', { healthStatus: 'healthy', smartStale: true, smartStaleReason: 'standby' })
+  ok('disks: a standby disk reads "last known — disk in standby"', /last known — disk in standby/.test(standby), standby)
+  ok('disks: the standby marker is muted and carries a tooltip',
+    /anas-health-stale/.test(standby) && /title=/.test(standby), standby)
+
+  // Stale — probe failed.
+  const failed = render('healthy', { healthStatus: 'healthy', smartStale: true, smartStaleReason: 'probe-failed' })
+  ok('disks: a failed probe reads "last known — probe failed"', /last known — probe failed/.test(failed), failed)
+
+  // The marker belongs to the cell, not the level: an unknown cell keeps it too.
+  const unknown = render('unknown', { healthStatus: 'unknown', smartStale: true, smartStaleReason: 'probe-failed' })
+  ok('disks: the marker renders on an unknown cell too', /last known — probe failed/.test(unknown), unknown)
+
+  // Version skew: an old daemon omits both fields — the cell is byte-identical
+  // to what it was before the marker existed.
+  const old = render('healthy', { healthStatus: 'healthy', smartStale: undefined, smartStaleReason: undefined })
+  ok('disks: an absent marker (old daemon) renders the cell exactly as before', old === fresh, old)
+}
+
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
@@ -7717,6 +7759,10 @@ created.windows.length = 0
 // Story selfheal.9 — Repair from parity on the Scrubs toolbar too, need-gated,
 // one enablement rule for both doors.
 await scrubToolbarRepairChecks()
+// Disks (story 3.18) — the stale/standby marker on the Health cell.
+warnings.length = 0
+created.windows.length = 0
+await disksStaleHealthChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

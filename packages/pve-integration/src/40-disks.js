@@ -235,6 +235,13 @@
 
     // Health: the leftmost, most prominent column. Colored icon + label from the
     // fused healthStatus. Adds tdCls 'anas-health-<level>' for styling/tests.
+    //
+    // The stale marker: when the daemon's reading is the disk's LAST KNOWN
+    // state, not a fresh probe (it is asleep, or its probe failed), the value
+    // is still shown — it is the best we have — but a muted "(last known — …)"
+    // suffix + tooltip says it is not current. Absent on a fresh reading and
+    // on an older daemon (version skew), where the cell renders exactly as
+    // before.
     function renderHealthStatus(v, meta, rec) {
         var level = v || 'unknown';
         var info = HEALTH[level] || HEALTH.unknown;
@@ -246,7 +253,23 @@
             // non-fatal — styling hook only
         }
         var icon = '<i class="fa fa-' + info.icon + '" style="color:' + info.color + ';"></i> ';
-        return icon + colored(t(info.label), info.color);
+        var html = icon + colored(t(info.label), info.color);
+        try {
+            var d = rec && rec.data;
+            if (d && d.smartStale === true) {
+                var failed = d.smartStaleReason === 'probe-failed';
+                var suffix = failed ? t('last known — probe failed')
+                    : t('last known — disk in standby');
+                var tip = failed
+                    ? t('The last SMART probe failed; the value shown is the last measured one. ANAS re-probes the disk.')
+                    : t('The disk is asleep and ANAS does not wake it to read SMART; the value shown is the last measured one.');
+                html += ' <span class="anas-health-stale" title="' + enc(tip)
+                    + '" style="color:' + COLOR_UNKNOWN + ';font-size:0.9em;">(' + enc(suffix) + ')</span>';
+            }
+        } catch (e) {
+            // non-fatal — the marker is a courtesy, never the health itself
+        }
+        return html;
     }
 
     // Disk identity: the STABLE by-id (emphasised) is the primary identifier —
@@ -632,6 +655,10 @@
                 // initiator. Auto fields — absent on old daemons leaves get()
                 // undefined and the badge simply does not appear (version skew).
                 'handsOff', 'handsOffReason',
+                // Stale SMART reading (last known, not current): auto fields —
+                // absent on old daemons and the Health cell's marker does not
+                // appear (version skew).
+                'smartStale', 'smartStaleReason',
                 { name: 'size', type: 'number' },
                 { name: 'rotational', type: 'boolean' },
                 { name: 'smartHealthy' },

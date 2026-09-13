@@ -232,6 +232,12 @@ export async function collectDisks(
   return disks.map((d) => {
     const identity = diskIdentityCache.getCached(d.id)
     const smartHealthy = identity ? identity.smartHealthy : null
+    // The reading is STALE when it is the disk's last known state, not a fresh
+    // probe (it was asleep, or its probe failed): surfaced so the UI can mark
+    // the health cell instead of presenting the value as current. Absent on a
+    // fresh reading (undefined keys drop out of the JSON).
+    const smartStale = identity?.stale === true ? true : undefined
+    const smartStaleReason = smartStale ? identity?.staleReason : undefined
     // Pool context joins on the kernel name (d.name), NOT the display by-id
     // (d.id) — the by-id ZFS reports and the by-id we display can differ.
     const info = poolInfo.get(d.name)
@@ -257,6 +263,8 @@ export async function collectDisks(
       formFactor: identity ? identity.formFactor : null,
       revision: identity?.firmwareVersion ?? d.revision,
       smartHealthy,
+      smartStale,
+      smartStaleReason,
       ...zfsContext,
       ...ahrContext,
       ...handsOffContext(d, servedSerials),

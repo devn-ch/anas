@@ -100,6 +100,16 @@ export const Disk = z.object({
   wwn: z.string().nullable(),
   /** SMART health: true=passed, false=failed, null=not supported or unknown */
   smartHealthy: z.boolean().nullable(),
+  /**
+   * The reported SMART reading is the disk's LAST KNOWN state, not a fresh
+   * probe: the disk was asleep and ANAS refused to wake it
+   * (`smartStaleReason: 'standby'`), or its probe failed
+   * (`smartStaleReason: 'probe-failed'`). Optional — absent on a fresh reading
+   * and on an older daemon (version-skew ruling), where the UI renders no
+   * marker.
+   */
+  smartStale: z.boolean().optional(),
+  smartStaleReason: z.enum(['standby', 'probe-failed']).optional(),
   /** Current usage status */
   status: DiskUsageStatus,
   /** If pool_member, the ZFS pool; if ahr_member, the AHR pool this disk is in */
