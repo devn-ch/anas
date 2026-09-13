@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# Tests for packaging/uninstall.sh remove_schedule_units (review R8): the
-# uninstaller removes the ANAS schedule units (anas-scrub.* AND the snapshot
-# schedules it never removed before) and RESTORES mdadm's mdcheck timers when
-# it removed the scrub timer — selfheal.4 disabled them when ANAS took md
-# checks over, so without this the node would be left with NO periodic parity
-# check at all.
+# Tests for packaging/uninstall.sh remove_schedule_units (review F2/F8): the
+# uninstaller removes ALL FOUR ANAS schedule unit families (anas-snap-*,
+# anas-backup-*, anas-repl-*, anas-scrub.*) — their runners are gone with
+# /opt/anas, and a timer firing a missing runner is worse than a lost schedule —
+# and NEVER re-enables mdadm's mdcheck timers: ANAS is stateless and cannot
+# know whether mdcheck was on before ANAS, so re-enabling it would arm a
+# monthly parity check the operator may never have had. The scrub removal
+# prints an honest line saying mdcheck is off and how to restore it.
 #
 # uninstall.sh is sourced in ANAS_UNINSTALL_LIB_ONLY mode (the install.sh
 # pattern) with a throwaway SYSTEMD_DIR/stamp dir and a faked systemctl that
@@ -53,8 +55,8 @@ source_uninstall() {
     ANAS_UNINSTALL_LIB_ONLY=1 bash -c "source '${UNINSTALL}'; remove_schedule_units"
 }
 
-# Fixture: the units a 0.3.1-upgraded node with periodic scrub + two snapshot
-# schedules would carry, including Persistent stamps.
+# Fixture: one unit pair from EVERY family a fully-scheduled node would carry,
+# including Persistent stamps.
 make_units() {
   : > "${WORK}/systemctl.log"
   rm -rf "${SYSTEMD_DIR}" "${STAMPS}"
@@ -63,13 +65,15 @@ make_units() {
   printf '[Timer]\n'   > "${SYSTEMD_DIR}/anas-scrub.timer"
   : > "${STAMPS}/stamp-anas-scrub.timer"
   for n in nightly hourly; do
-    printf '[Service]\n' > "${SYSTEMD_DIR}/anas-snap-${n}.service"
-    printf '[Timer]\n'   > "${SYSTEMD_DIR}/anas-snap-${n}.timer"
-    : > "${STAMPS}/stamp-anas-snap-${n}.timer"
+    for fam in snap backup repl; do
+      printf '[Service]\n' > "${SYSTEMD_DIR}/anas-${fam}-${n}.service"
+      printf '[Timer]\n'   > "${SYSTEMD_DIR}/anas-${fam}-${n}.timer"
+      : > "${STAMPS}/stamp-anas-${fam}-${n}.timer"
+    done
   done
 }
 
-echo "== 1. uninstall with a scrub timer restores the mdcheck timers =="
+echo "== 1. all four families removed =="
 make_units
 source_uninstall
 check "anas-scrub.timer disabled before removal" \
@@ -78,41 +82,47 @@ check "both scrub unit files removed" \
   bash -c "! test -e '${SYSTEMD_DIR}/anas-scrub.timer' && ! test -e '${SYSTEMD_DIR}/anas-scrub.service'"
 check "the scrub timer's Persistent stamp removed" \
   bash -c "! test -e '${STAMPS}/stamp-anas-scrub.timer'"
-check "mdcheck_start re-enabled" \
-  grep -q 'enable mdcheck_start.timer mdcheck_continue.timer' "${WORK}/systemctl.log"
+for fam in snap backup repl; do
+  check "${fam} unit pairs + stamps removed" \
+    bash -c "! test -e '${SYSTEMD_DIR}/anas-${fam}-nightly.timer' && ! test -e '${SYSTEMD_DIR}/anas-${fam}-nightly.service' && ! test -e '${STAMPS}/stamp-anas-${fam}-nightly.timer'"
+  check "${fam} timer disabled" \
+    grep -q "disable --now anas-${fam}-nightly.timer" "${WORK}/systemctl.log"
+done
 
-echo "== 2. snapshot schedule units + stamps go with it =="
-check "snapshot units removed" \
-  bash -c "! test -e '${SYSTEMD_DIR}/anas-snap-nightly.service' && ! test -e '${SYSTEMD_DIR}/anas-snap-nightly.timer' && ! test -e '${SYSTEMD_DIR}/anas-snap-hourly.timer'"
-check "snapshot stamps removed" \
-  bash -c "! test -e '${STAMPS}/stamp-anas-snap-nightly.timer' && ! test -e '${STAMPS}/stamp-anas-snap-hourly.timer'"
-check "each snapshot timer disabled" \
-  bash -c "grep -q 'disable --now anas-snap-nightly.timer' '${WORK}/systemctl.log' && grep -q 'disable --now anas-snap-hourly.timer' '${WORK}/systemctl.log'"
+echo "== 2. mdcheck is NEVER re-enabled =="
+check "no mdcheck enable, ever" \
+  bash -c "! grep -qE 'enable.*mdcheck' '${WORK}/systemctl.log'"
 
-echo "== 3. no scrub timer → mdcheck left exactly as it is =="
-make_units
-rm -f "${SYSTEMD_DIR}/anas-scrub.timer" "${SYSTEMD_DIR}/anas-scrub.service" "${STAMPS}/stamp-anas-scrub.timer"
-source_uninstall
-check "no mdcheck enable without a removed scrub timer" \
-  bash -c "! grep -q 'enable mdcheck' '${WORK}/systemctl.log'"
-check "snapshot units still removed" \
-  bash -c "! test -e '${SYSTEMD_DIR}/anas-snap-nightly.timer'"
-
-echo "== 4. idempotent — a second run is clean =="
-make_units
-source_uninstall >/dev/null 2>&1
-source_uninstall >/dev/null 2>&1
-check "second run removes nothing, enables nothing" \
-  bash -c "! grep -q 'enable mdcheck' '${WORK}/systemctl.log' && ! grep -q 'anas-scrub' '${WORK}/systemctl.log'"
-
-echo "== 5. the printed line names the restoration =="
+echo "== 3. the honest mdcheck line is printed =="
 make_units
 PATH="$(dirname "${SYSTEMCTL}"):$PATH" SYSTEMD_DIR="${SYSTEMD_DIR}" TIMERS_STAMP_DIR="${STAMPS}" \
   ANAS_UNINSTALL_LIB_ONLY=1 bash -c "source '${UNINSTALL}'; remove_schedule_units" > "${WORK}/out.log" 2>&1
-check "restoration line printed" \
-  grep -q "restored mdadm's mdcheck timers" "${WORK}/out.log"
-check "scrub removal line printed" \
-  grep -q 'removed the ANAS periodic scrub units' "${WORK}/out.log"
+check "scrub removal line names the family and count" \
+  grep -F 'removed 1 ANAS schedule unit pair (anas-scrub.*)' "${WORK}/out.log"
+check "NOT-been-re-enabled admission printed" \
+  grep -q "has NOT been re-enabled" "${WORK}/out.log"
+check "restore command printed" \
+  grep -q 'systemctl enable --now mdcheck_start.timer mdcheck_continue.timer' "${WORK}/out.log"
+check "per-family count lines printed" \
+  bash -c "grep -q 'anas-snap-\*' '${WORK}/out.log' && grep -q 'anas-backup-\*' '${WORK}/out.log' && grep -q 'anas-repl-\*' '${WORK}/out.log'"
+
+echo "== 4. a node with no scrub units prints no mdcheck line =="
+make_units
+rm -f "${SYSTEMD_DIR}/anas-scrub.timer" "${SYSTEMD_DIR}/anas-scrub.service" "${STAMPS}/stamp-anas-scrub.timer"
+source_uninstall > "${WORK}/out2.log" 2>&1
+check "no mdcheck mention without a removed scrub timer" \
+  bash -c "! grep -q 'mdcheck' '${WORK}/out2.log'"
+check "other families still removed" \
+  bash -c "! test -e '${SYSTEMD_DIR}/anas-snap-nightly.timer' && ! test -e '${SYSTEMD_DIR}/anas-backup-hourly.timer'"
+
+echo "== 5. idempotent — a second run is clean =="
+make_units
+source_uninstall >/dev/null 2>&1
+source_uninstall >/dev/null 2>&1
+check "second run issues no mdcheck or anas-scrub systemctl calls" \
+  bash -c "! grep -q mdcheck '${WORK}/systemctl.log' && ! grep -q anas-scrub '${WORK}/systemctl.log'"
+check "second run leaves no units" \
+  bash -c "! test -e '${SYSTEMD_DIR}/anas-scrub.timer' && ! test -e '${SYSTEMD_DIR}/anas-snap-nightly.service'"
 
 echo
 echo "uninstall-schedules tests: ${PASS} passed, ${FAIL} failed"

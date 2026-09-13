@@ -7,7 +7,6 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { readScrubSchedule, renderScrubTimerUnit, SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME, writeScrubUnits } from '../scrub-schedule-units.js'
 import {
-  adoptMdcheckScrub,
   ahrScrubNote,
   ahrScrubRunning,
   foreignMdArrays,
@@ -186,23 +185,25 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
     }
   })
 
-  it('the note distinguishes the LEGACY mdcheck state (timer off, mdcheck on) from a true double (review R8)', async () => {
+  it('the LEGACY state (no ANAS units, mdcheck on) reads as mdcheck-timer with the takeover note (review F1/F4)', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'anas-scrub-legacy-'))
     try {
-      // An upgraded 0.3.1 node before adoption: ANAS timer off, mdcheck on.
-      // That is the ONLY parity check running — a "double" warning would be
-      // about a second mechanism that does not exist.
+      // A stock or 0.3.1-upgraded node: no ANAS units, mdcheck on. That is the
+      // OS's own parity check running — reported as the mechanism it is, never
+      // adopted onto the ANAS timer at daemon start.
       const exec = await stateExecutor({ timer: 'off', mdcheck: 'on' })
       const st = await readAhrScrubState(exec, 'ahr0', null, { dir })
       assert.equal(st.enabled, false)
-      assert.match(st.note ?? '', /mdcheck is the only periodic parity check running/)
-      assert.match(st.note ?? '', /adopted onto the anas-scrub timer at daemon start/)
+      assert.equal(st.mechanism, 'mdcheck-timer')
+      assert.match(st.note ?? '', /the OS's monthly md parity check \(mdcheck\) is on/)
+      assert.match(st.note ?? '', /enabling ANAS periodic scrub takes it over \(md parity \+ btrfs checksums, two phases\)/)
       assert.doesNotMatch(st.note ?? '', /double parity check/)
+      assert.doesNotMatch(st.note ?? '', /adopted/)
 
       // Both on is the true double — unchanged wording.
       assert.equal(ahrScrubNote(true, [], true), 'double parity check — mdcheck is on')
       // Timer off + mdcheck on names the legacy state; pure note function.
-      assert.match(ahrScrubNote(true, [], false), /only periodic parity check/)
+      assert.match(ahrScrubNote(true, [], false), /takes it over/)
       assert.equal(ahrScrubNote(false, [], false), 'one node-level timer scrubs the enabled AHR pools sequentially (phase 1 md parity, then phase 2 btrfs checksums)')
     }
     finally {
@@ -323,90 +324,23 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
   })
 })
 
-// The ONE-TIME upgrade migration from 0.3.1 (review R8): 0.3.1's periodic-scrub
-// toggle flipped the mdcheck timers, and selfheal.4's replacement disabled
-// mdcheck only inside the toggle — so an upgraded node with the toggle ON read
-// every pool OFF while mdcheck kept firing. The adoption runs at daemon start
-// when (and only when) the legacy state is unambiguous.
-describe('adoptMdcheckScrub — the 0.3.1 mdcheck upgrade migration (review R8)', () => {
-  let dir: string
-  let mock: MockExecutor
-  const lines: string[] = []
-  let origErr: typeof process.stderr.write
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'anas-scrub-adopt-'))
-    mock = new MockExecutor()
-    mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
-    // No mdcheck is-enabled fixture here: MockExecutor is first-fixture-wins on
-    // identical command+args, so each test registers its own mdcheck answer.
-    lines.length = 0
-    origErr = process.stderr.write.bind(process.stderr)
-    process.stderr.write = (s: string | Uint8Array) => {
-      lines.push(String(s))
-      return true
-    }
-  })
-  afterEach(async () => {
-    process.stderr.write = origErr
-    await rm(dir, { recursive: true, force: true })
-  })
-
-  it('ADOPTS: every AHR pool onto the timer (monthly), mdcheck disabled, one audit line', async () => {
-    mock.addFixture({
-      command: SYSTEMCTL,
-      args: isEnabledArgs('mdcheck_start.timer'),
-      result: { stdout: 'enabled\n', stderr: '', exitCode: 0 },
-    })
-    const report = await adoptMdcheckScrub(mock, { dir, pools: ['ahr0', 'ahr1'] })
-    assert.deepEqual(report, { adopted: true, reason: 'adopted', pools: ['ahr0', 'ahr1'] })
-    assert.deepEqual(await readScrubSchedule(dir), { kind: 'ahr-scrub', cadence: 'monthly', pools: ['ahr0', 'ahr1'] })
-    const cmds = mock.calls.map(c => c.args.join(' '))
-    assert.ok(cmds.includes(`enable --now ${SCRUB_TIMER_NAME}`))
-    assert.ok(cmds.includes('disable --now mdcheck_start.timer mdcheck_continue.timer'), 'ANAS owns md checks on this node from here on')
-    assert.ok(lines.some(l => l.includes('ADOPTED the legacy mdcheck periodic scrub') && l.includes('ahr0, ahr1')), lines.join(' | '))
-  })
-
-  it('is a NO-OP when mdcheck is not enabled (the operator never had the 0.3.1 toggle on)', async () => {
-    mock.addFixture({
-      command: SYSTEMCTL,
-      args: isEnabledArgs('mdcheck_start.timer'),
-      result: { stdout: 'disabled\n', stderr: '', exitCode: 1 },
-    })
-    const report = await adoptMdcheckScrub(mock, { dir, pools: ['ahr0'] })
-    assert.deepEqual(report, { adopted: false, reason: 'mdcheck-not-enabled', pools: [] })
-    assert.equal(await readScrubSchedule(dir), null, 'no units written')
-    assert.ok(!mock.calls.some(c => c.args[0] === 'disable' && c.args.includes('mdcheck_start.timer')), 'mdcheck untouched')
-  })
-
-  it('is a NO-OP when there is no AHR pool to adopt', async () => {
-    mock.addFixture({
-      command: SYSTEMCTL,
-      args: isEnabledArgs('mdcheck_start.timer'),
-      result: { stdout: 'enabled\n', stderr: '', exitCode: 0 },
-    })
-    const report = await adoptMdcheckScrub(mock, { dir, pools: [] })
-    assert.deepEqual(report, { adopted: false, reason: 'no-ahr-pools', pools: [] })
-    assert.equal(await readScrubSchedule(dir), null)
-  })
-
-  it('is a NO-OP when the anas-scrub units already exist (already migrated, or deliberately off)', async () => {
-    await writeScrubUnits(mock, dir, { kind: 'ahr-scrub', cadence: 'quarterly', pools: ['ahr0'] })
-    const callsBefore = mock.calls.length
-    const report = await adoptMdcheckScrub(mock, { dir, pools: ['ahr0'] })
-    assert.deepEqual(report, { adopted: false, reason: 'anas-scrub-units-present', pools: [] })
-    // The existing schedule is untouched, and mdcheck was never even asked
-    // about — the units' presence is the whole answer.
-    assert.deepEqual(await readScrubSchedule(dir), { kind: 'ahr-scrub', cadence: 'quarterly', pools: ['ahr0'] })
-    assert.equal(mock.calls.length, callsBefore, 'no new systemctl calls at all')
-  })
-
-  it('is a NO-OP when a FOREIGN unit squats on the anas-scrub name — never touched', async () => {
-    await writeFile(join(dir, SCRUB_SERVICE_NAME), '[Unit]\nDescription=not ours\n')
-    const report = await adoptMdcheckScrub(mock, { dir, pools: ['ahr0'] })
-    assert.deepEqual(report, { adopted: false, reason: 'foreign-unit', pools: [] })
-    assert.equal(await readFile(join(dir, SCRUB_SERVICE_NAME), 'utf-8'), '[Unit]\nDescription=not ours\n')
-    assert.equal(await readScrubSchedule(dir), null)
+// The mdcheck adoption is GONE (review F1/F4, design reversal 2026-09-13):
+// mdcheck's timers are enabled by default on a stock node, so "mdcheck is on"
+// is not an opt-in, and a daemon that armed a monthly multi-hour scrub — and
+// switched the OS parity check off — on its own was overreach. The per-pool
+// toggle is the only thing that writes units. This guard keeps the start path
+// clean: index.ts must never reach back into the scrub store.
+describe('no mdcheck adoption at daemon start (review F1/F4)', () => {
+  it('index.ts carries no adoption — no unit writes, no systemctl calls for scrub', async () => {
+    // The invariant is the import graph: the daemon start path does not touch
+    // the scrub store at all, so it can write no unit and call no systemctl.
+    const src = await readFile(new URL('../../index.ts', import.meta.url), 'utf-8')
+    assert.doesNotMatch(src, /scrub-schedules/, 'the start path does not import the scrub store')
+    assert.doesNotMatch(src, /scrub-schedule-units/, 'the start path does not import the scrub units')
+    // And the module no longer even exports an adoption to call.
+    const mod = await import('../scrub-schedules.js')
+    for (const key of Object.keys(mod))
+      assert.doesNotMatch(key, /[Aa]dopt/, `scrub-schedules must not export ${key}`)
   })
 })
 

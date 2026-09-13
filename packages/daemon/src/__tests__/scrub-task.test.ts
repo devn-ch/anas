@@ -162,7 +162,7 @@ describe('scrub-task runner (selfheal.4 — timer entrypoint)', () => {
     assert.ok(pollIdx >= 8700, `polled past the old cap (${pollIdx} polls)`)
   })
 
-  it('a VANISHED job (404 polls) ends the wait at the sanity cap, with a journald line', async () => {
+  it('a VANISHED job (404) ends the wait after 3 confirmations, with a journald line (review F9)', async () => {
     const lines: string[] = []
     const origErr = process.stderr.write.bind(process.stderr)
     process.stderr.write = (s: string | Uint8Array) => {
@@ -177,12 +177,72 @@ describe('scrub-task runner (selfheal.4 — timer entrypoint)', () => {
         pollIdx++
         return { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } }
       }
+      // No maxAttempts override: the 3-confirmation window is the DEFAULT — the
+      // old code polled a vanished job 8640 × 10 s (24 h) before giving up.
       await assert.rejects(
-        () => scrubPool(requester, 'p1', { sleep: noSleep, maxAttempts: 3 }),
-        /vanished/,
+        () => scrubPool(requester, 'p1', { sleep: noSleep }),
+        /vanished \(daemon restarted\?\) — moving to the next pool/,
       )
-      assert.equal(pollIdx, 3, 'the wait ends at the cap — never leaps to the next pool before it')
-      assert.ok(lines.some(l => l.includes('vanished')), 'the give-up is said on stderr (journald via the unit)')
+      assert.equal(pollIdx, 3, 'three 404s confirm the job is gone — a job id cannot come back')
+      assert.ok(lines.some(l => l.includes('moving to the next pool')), 'the give-up is said on stderr (journald via the unit)')
+    }
+    finally {
+      process.stderr.write = origErr
+    }
+  })
+
+  it('a vanished job does NOT block pools 2..n — the sequence proceeds within seconds (review F9)', async () => {
+    let j1Polls = 0
+    const requester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: req.path.includes('p1') ? 'j1' : 'j2', status: 'queued' } } }
+      if (req.path === '/v1/jobs/j1') {
+        j1Polls++
+        // The daemon restarted mid-scrub: its in-memory job list is gone.
+        return { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } }
+      }
+      return { statusCode: 200, body: { job: { id: 'j2', status: 'completed', result: {} } } }
+    }
+    const outcome = await runScrubSchedule(requester, ['p1', 'p2'], { sleep: noSleep })
+    assert.equal(j1Polls, 3, 'p1 wait ended at the third 404 — not 8640 polls later')
+    assert.deepEqual(outcome.failures.map(f => f.pool), ['p1'], 'the vanished pool is reported honestly — its outcome is unknown')
+    assert.equal(outcome.results.map(r => r.pool)[0], 'p2', 'the next pool was not blocked for a day')
+  })
+
+  it('one 404 blip is not a vanish — the wait continues (review F9)', async () => {
+    let polls = 0
+    const requester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+      polls++
+      if (polls === 2)
+        return { statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'no such job' } } }
+      return { statusCode: 200, body: { job: { id: 'j1', status: 'completed', result: { scrubbed: 'p1' } } } }
+    }
+    const job = await scrubPool(requester, 'p1', { sleep: noSleep })
+    assert.equal(job.status, 'completed', 'a lone 404 never abandons the wait')
+  })
+
+  it('a non-404 failure (500) is an outage, not a vanish — bounded by the outage cap, not 3 polls', async () => {
+    const lines: string[] = []
+    const origErr = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (s: string | Uint8Array) => {
+      lines.push(String(s))
+      return true
+    }
+    try {
+      let polls = 0
+      const requester: Requester = async (req) => {
+        if (req.method === 'POST')
+          return { statusCode: 202, body: { job: { id: 'j1', status: 'queued' } } }
+        polls++
+        return { statusCode: 500, body: { error: { code: 'INTERNAL', message: 'boom' } } }
+      }
+      await assert.rejects(
+        () => scrubPool(requester, 'p1', { sleep: noSleep, maxAttempts: 2 }),
+        /kept failing/,
+      )
+      assert.equal(polls, 2, 'the outage cap bounds it — the 3-poll vanish window is for 404s only')
     }
     finally {
       process.stderr.write = origErr

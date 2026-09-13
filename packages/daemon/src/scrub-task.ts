@@ -30,6 +30,16 @@ export interface ScrubRunnerOptions {
 /** The "pool is gone" error scrubPool throws, and runScrubSchedule skips on. */
 const GONE_RE = /no longer exists/
 
+/**
+ * Consecutive 404s that confirm a job is GONE (review F9). A job id is a
+ * randomUUID minted by the daemon that submitted it — it cannot come back, and
+ * the daemon's job list is in-memory, so a 404 means anasd restarted mid-scrub
+ * and the job no longer exists anywhere. Three polls (~30 s at the 10 s
+ * interval) separate that from a one-off blip; waiting the old 24 h backstop
+ * out blocked every pool behind the vanished one for a day.
+ */
+const VANISHED_CONFIRMATIONS = 3
+
 /** Parse the runner's argv (already sliced past `node script`). */
 export function parseRunnerArgs(argv: string[]): ScrubRunnerOptions {
   const opts: Partial<ScrubRunnerOptions> = { socket: defaultSocket() }
@@ -94,11 +104,19 @@ export async function scrubPool(
  *   - a job that exists and is not terminal is waited for. No cap. The daemon
  *     is the source of truth and the job always terminates; the runner's job
  *     is to mirror it, however long that takes.
- *   - only a job that VANISHES ends the wait: a 404 (the daemon restarted and
- *     its in-memory job list is gone) or a daemon outage, each polled up to
- *     {@link RUNNER_POLL_MAX_ATTEMPTS} attempts (≈ 24 h at the 10 s interval)
- *     before giving up with a journald line — a sanity cap on a missing job,
- *     never a judgment about how long the work should take.
+ *   - a job that VANISHES ends the wait quickly (review F9): 404 is terminal
+ *     after {@link VANISHED_CONFIRMATIONS} consecutive confirmations (~30 s at
+ *     the 10 s interval) — a job id cannot come back, so a 404 means the daemon
+ *     restarted mid-scrub and its in-memory job list is gone. The wait moves to
+ *     the next pool with a journald line instead of blocking pools 2..n for the
+ *     old 24 h backstop.
+ *   - a daemon OUTAGE (connection refused) keeps its own bounded retry: up to
+ *     {@link RUNNER_POLL_MAX_ATTEMPTS} failed polls (≈ 24 h) before giving up
+ *     with a journald line — a refused connection is NOT evidence the job is
+ *     gone (the daemon may come back with the job still running), and a sanity
+ *     cap on it is never a judgment about how long the work should take. When
+ *     the restart DID lose the job list, the polls above turn 404 and the
+ *     short vanish window ends the wait instead.
  */
 export async function pollScrubJob(
   requester: Requester,
@@ -106,7 +124,7 @@ export async function pollScrubJob(
   loop: RunLoopOptions = {},
 ): Promise<Job> {
   const intervalMs = loop.intervalMs ?? RUNNER_POLL_INTERVAL_MS
-  const vanishCap = loop.maxAttempts ?? RUNNER_POLL_MAX_ATTEMPTS
+  const outageCap = loop.maxAttempts ?? RUNNER_POLL_MAX_ATTEMPTS
   const sleep = loop.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms)))
   const headers = identityHeaders()
 
@@ -120,12 +138,11 @@ export async function pollScrubJob(
         path: `/v1/jobs/${jobRef.id}`,
         headers,
       })
-      outage = 0
     }
     catch (err) {
       outage += 1
-      if (outage >= vanishCap) {
-        const message = `scrub job ${jobRef.id} unreachable — the daemon has been answering for `
+      if (outage >= outageCap) {
+        const message = `scrub job ${jobRef.id} unreachable — the daemon has been unreachable for `
           + `${outage} consecutive polls (${Math.round(outage * intervalMs / 1000)}s); giving up on this pool's wait: ${
             err instanceof Error ? err.message : String(err)}`
         process.stderr.write(`scrub-task: ${message}\n`)
@@ -135,16 +152,29 @@ export async function pollScrubJob(
       continue
     }
     if (poll.statusCode === 200) {
+      // A live answer means the daemon is up and the job is known — both
+      // counters count CONSECUTIVE failures, so a 200 resets them both.
       missing = 0
+      outage = 0
       const job = (poll.body as { job?: Job }).job
       if (job && (job.status === 'completed' || job.status === 'failed'))
         return job
     }
-    else {
+    else if (poll.statusCode === 404) {
       missing += 1
-      if (missing >= vanishCap) {
-        const message = `scrub job ${jobRef.id} vanished — HTTP ${poll.statusCode} for `
-          + `${missing} consecutive polls (the daemon restarted and its job list is gone?); giving up on this pool's wait`
+      if (missing >= VANISHED_CONFIRMATIONS) {
+        const message = `scrub job ${jobRef.id} vanished (daemon restarted?) — moving to the next pool`
+        process.stderr.write(`scrub-task: ${message}\n`)
+        throw new Error(message)
+      }
+    }
+    else {
+      // Any other non-200 is a daemon problem, not a missing job — the outage
+      // cap's territory, not the short vanish window's.
+      outage += 1
+      if (outage >= outageCap) {
+        const message = `scrub job ${jobRef.id} poll kept failing — HTTP ${poll.statusCode} for `
+          + `${outage} consecutive polls; giving up on this pool's wait`
         process.stderr.write(`scrub-task: ${message}\n`)
         throw new Error(message)
       }

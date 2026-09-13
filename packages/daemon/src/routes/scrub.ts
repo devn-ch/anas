@@ -7,7 +7,7 @@ import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseScrubScans } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
-import { scrubUnitsAreForeign } from '../services/scrub-schedule-units.js'
+import { ForeignUnitError, scrubUnitsAreForeign } from '../services/scrub-schedule-units.js'
 import {
   ahrScrubRunning,
   readAhrScrubState,
@@ -216,7 +216,21 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
       async () => {
         // Node-level: edits the ONE anas-scrub timer's pool list; enabling also
         // takes mdcheck over (disable) — ANAS owns md checks on this node.
-        await setAhrScrubEnabled(executor, pool, enabled, { dir: systemdDir, cadence })
+        try {
+          await setAhrScrubEnabled(executor, pool, enabled, { dir: systemdDir, cadence })
+        }
+        catch (err) {
+          // A foreign unit keeps its own identity (review F14): the message says
+          // the name is not ours to touch. ANY other failure — a failed unit
+          // write, a failed enable — is reported as exactly that, never as
+          // `foreign-unit`; the door check above is the only thing that claims
+          // foreign.
+          if (err instanceof ForeignUnitError)
+            throw err
+          throw new Error(
+            `periodic scrub ${enabled ? 'enable' : 'disable'} failed for '${pool}': ${err instanceof Error ? err.message : String(err)}`,
+          )
+        }
         return { pool, periodicScrub: enabled, ...(cadence ? { cadence } : {}), scope: 'node-level' }
       },
     )

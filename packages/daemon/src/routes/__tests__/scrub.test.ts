@@ -324,6 +324,39 @@ describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)
     assert.equal((await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })).json().data.length, 0)
   })
 
+  it('a FAILED unit write is reported as the failure it is, never as foreign-unit (review F14)', async () => {
+    // The door check passes (nothing in the temp dir); the write's ENABLE step
+    // fails (the mock server pre-registers a daemon-reload success, so the
+    // failure goes on the one systemctl call no other test pins).
+    mockOf(server).addFixture({ command: SYSTEMCTL, args: ['enable', '--now', 'anas-scrub.timer'], result: { stdout: '', stderr: 'enable bus borked', exitCode: 1 } })
+    const res = await server.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
+    assert.equal(res.statusCode, 202)
+    const done = await waitForJob(server, res.json().job.id)
+    assert.equal(done.status, 'failed')
+    assert.match(done.error?.message ?? '', /periodic scrub enable failed for 'ahr0': enable bus borked/)
+    assert.doesNotMatch(done.error?.message ?? '', /foreign/i, 'a write failure is never misreported as a foreign unit')
+    // And the rollback left no half-written pair for the next attempt.
+    assert.equal(await readFile(join(unitDir, 'anas-scrub.service'), 'utf-8').then(() => 'present', () => 'absent'), 'absent')
+    assert.equal(await readFile(join(unitDir, 'anas-scrub.timer'), 'utf-8').then(() => 'present', () => 'absent'), 'absent')
+  })
+
+  it('GET /scrub reports the LEGACY state as mechanism mdcheck-timer, honestly off (review F1/F4)', async () => {
+    // mdcheck enabled (a stock node's default), no ANAS units: nothing armed,
+    // nothing adopted — the state says what is running.
+    mockOf(server).addFixture({ command: SYSTEMCTL, args: ['is-enabled', 'mdcheck_start.timer'], result: { stdout: 'enabled\n', stderr: '', exitCode: 0 } })
+    const res = await server.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200)
+    const ahr = (res.json() as { data: PeriodicScrubState[] }).data.find(s => s.target.kind === 'ahr')
+    assert.ok(ahr)
+    assert.equal(ahr!.enabled, false, 'ANAS never enabled itself — the legacy state is reported, not adopted')
+    assert.equal(ahr!.mechanism, 'mdcheck-timer')
+    assert.match(ahr!.note ?? '', /the OS's monthly md parity check \(mdcheck\) is on/)
+    assert.match(ahr!.note ?? '', /takes it over/)
+    // And the start path armed nothing: no units were written by anyone.
+    const { readdir } = await import('node:fs/promises')
+    assert.deepEqual(await readdir(unitDir), [], 'no anas-scrub units exist')
+  })
+
   it('GET /scrub reports a RUNNING md check on the AHR pool (stage 6)', async () => {
     // A bare server so the mdstat fixture can be the mid-`check` one (the mock
     // server's default replays the idle capture, and first fixture wins).

@@ -151,6 +151,56 @@ describe('scrub schedule units — CRUD lifecycle (temp dir + mocked systemctl)'
     assert.deepEqual(await readScrubSchedule(dir), schedule())
   })
 
+  it('the rendered timer carries the marker too (review F13)', () => {
+    assert.match(renderScrubTimerUnit(schedule()), /X-ANAS-Schedule=/)
+    // And a written pair leaves BOTH files marked.
+    return writeScrubUnits(mock, dir, schedule()).then(async () => {
+      const timer = await readFile(join(dir, SCRUB_TIMER_NAME), 'utf-8')
+      assert.match(timer, /X-ANAS-Schedule=/)
+    })
+  })
+
+  it('a TIMER-only foreign unit is refused (review F13) — the check covers both files', async () => {
+    await writeFile(join(dir, SCRUB_TIMER_NAME), '[Timer]\nOnCalendar=daily\n')
+    await assert.rejects(
+      () => writeScrubUnits(mock, dir, schedule()),
+      (err: Error) => err instanceof ForeignUnitError && err.code === 'foreign-unit',
+    )
+    assert.equal(await readFile(join(dir, SCRUB_TIMER_NAME), 'utf-8'), '[Timer]\nOnCalendar=daily\n')
+    assert.equal(await readdir(dir).then(f => f.length), 1, 'the service was never created')
+    assert.equal(mock.calls.length, 0)
+  })
+
+  it('a SERVICE-only foreign unit is refused even with no timer present (review F13)', async () => {
+    await writeFile(join(dir, SCRUB_SERVICE_NAME), '[Service]\nExecStart=/bin/true\n')
+    assert.equal(await scrubUnitsAreForeign(dir), true)
+    await assert.rejects(() => writeScrubUnits(mock, dir, schedule()), ForeignUnitError)
+  })
+
+  it('a foreign TIMER alongside an OURS service is still foreign (review F13)', async () => {
+    await writeScrubUnits(mock, dir, schedule())
+    await writeFile(join(dir, SCRUB_TIMER_NAME), '[Timer]\nOnCalendar=daily\n')
+    assert.equal(await scrubUnitsAreForeign(dir), true)
+    // removeScrubUnits refuses nothing — but the route's door check (this same
+    // predicate) stops the toggle before a foreign timer gets deleted.
+  })
+
+  it('a failed enable ROLLS BACK both files (review F14) — the next attempt is clean', async () => {
+    mock.addFixture({ command: SYSTEMCTL, args: ['enable', '--now', SCRUB_TIMER_NAME], result: { stdout: '', stderr: 'enable failed', exitCode: 1 } })
+    await assert.rejects(() => writeScrubUnits(mock, dir, schedule()), /enable failed/)
+    assert.deepEqual(await readdir(dir), [], 'no half-written pair left behind')
+    // Clean next attempt: the store reads no schedule, the foreign check is false.
+    assert.equal(await scrubUnitsAreForeign(dir), false)
+  })
+
+  it('a failed enable RESTORES the previous pair (review F14) — an update does not destroy the old schedule', async () => {
+    await writeScrubUnits(mock, dir, schedule({ pools: ['ahr0', 'ahr1'] }))
+    mock.addFixture({ command: SYSTEMCTL, args: ['enable', '--now', SCRUB_TIMER_NAME], result: { stdout: '', stderr: 'enable failed', exitCode: 1 } })
+    await assert.rejects(() => writeScrubUnits(mock, dir, schedule({ pools: ['ahr0'] })), /enable failed/)
+    assert.deepEqual(await readScrubSchedule(dir), { kind: 'ahr-scrub', cadence: 'monthly', pools: ['ahr0', 'ahr1'] }, 'the previous schedule survived the failed rewrite')
+    assert.deepEqual((await readdir(dir)).sort(), [SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME].sort())
+  })
+
   it('removeScrubUnits clears the timer\'s Persistent stamp (review R10)', async () => {
     await writeScrubUnits(mock, dir, schedule())
     // The stamp lives outside the unit dir; create it where the module points.

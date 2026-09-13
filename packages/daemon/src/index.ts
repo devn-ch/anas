@@ -6,7 +6,6 @@ import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
-import { adoptMdcheckScrub } from './services/scrub-schedules.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
 // no-env manual launch must NOT land the trust-boundary socket in world-writable
@@ -86,19 +85,11 @@ async function main() {
           server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI menu once the filesystem is mounted`)
       })
 
-      // Upgrade migration (review R8): a node upgraded from 0.3.1 whose operator
-      // had the periodic scrub toggle ON reads every AHR pool OFF while the old
-      // mdcheck timers keep firing — selfheal.4's replacement only disabled
-      // mdcheck inside the toggle. When no anas-scrub units exist, mdcheck IS
-      // enabled, and there is at least one AHR pool, ADOPT: the pools move onto
-      // the ANAS timer (monthly) and mdcheck goes off, with one journald audit
-      // line. One-time by construction (the units it writes are the no-op's own
-      // absence check). Non-blocking; failures are logged, never fatal. Skipped
-      // in mock mode with the rest of the boot scans.
-      void adoptMdcheckScrub(decorated.executor, { log: (line: string) => server.log.info(line) })
-        .catch((err) => {
-          server.log.warn(`mdcheck adoption failed: ${err instanceof Error ? err.message : String(err)}`)
-        })
+      // No periodic-scrub adoption here (review F1/F4, design reversal
+      // 2026-09-13): mdcheck's timers are enabled by default on a stock node, so
+      // their presence is not an opt-in. A node that has never enabled the ANAS
+      // scrub keeps its OS parity check exactly as it is; the legacy state is
+      // only REPORTED by GET /v1/scrub (mechanism 'mdcheck-timer' + note).
     }
   }
   catch (err) {

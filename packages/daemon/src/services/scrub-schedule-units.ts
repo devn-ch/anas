@@ -74,16 +74,21 @@ export class ForeignUnitError extends Error {
 }
 
 /**
- * Does the node's scrub service unit exist WITHOUT our marker line (a foreign
- * file)? A file carrying the marker — even with corrupt JSON inside, e.g. a
- * write interrupted mid-flight — is OURS to rewrite; one without it is
- * someone else's and is neither overwritten nor deleted (review R10).
+ * Does either of the node's `anas-scrub` units exist WITHOUT our marker line (a
+ * foreign file)? A file carrying the marker — even with corrupt JSON inside,
+ * e.g. a write interrupted mid-flight — is OURS to rewrite; one without it is
+ * someone else's and is neither overwritten nor deleted (review R10). BOTH
+ * files are checked (review F13): the timer carries the marker too, and a
+ * foreign `anas-scrub.timer` alone — no service on the name — would otherwise
+ * sail past the check and be deleted by `removeScrubUnits`.
  */
 export async function scrubUnitsAreForeign(dir: string): Promise<boolean> {
-  const content = await readUnitFile(dir, SCRUB_SERVICE_NAME)
-  if (content === null)
-    return false
-  return !SCHEDULE_MARKER_RE_LINE.test(content)
+  for (const name of [SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME]) {
+    const content = await readUnitFile(dir, name)
+    if (content !== null && !SCHEDULE_MARKER_RE_LINE.test(content))
+      return true
+  }
+  return false
 }
 
 // --- Cadence → OnCalendar ----------------------------------------------------
@@ -126,11 +131,19 @@ export function renderScrubServiceUnit(schedule: AhrScrubSchedule): string {
   ].join('\n')
 }
 
-/** Render the `.timer` unit for the node's scrub cadence. */
+/**
+ * Render the `.timer` unit for the node's scrub cadence. It carries the same
+ * `X-ANAS-Schedule=` marker comment as the service (review F13): the marker's
+ * PRESENCE is how `scrubUnitsAreForeign` tells our files from someone else's,
+ * and it checked the service only — a foreign timer squatting on
+ * `anas-scrub.timer` would have sailed past the check and been deleted by
+ * `removeScrubUnits`.
+ */
 export function renderScrubTimerUnit(schedule: AhrScrubSchedule): string {
   return [
     '[Unit]',
     'Description=ANAS periodic AHR scrub timer',
+    `# ${SCHEDULE_MARKER}${JSON.stringify(schedule)}`,
     '',
     '[Timer]',
     `OnCalendar=${scrubCadenceToOnCalendar(schedule.cadence)}`,
@@ -188,11 +201,19 @@ export async function readScrubTimerNext(executor: CommandExecutor): Promise<str
  * reload systemd, and enable the timer. Throws on any systemctl failure so the
  * mutation surfaces it.
  *
- * Read-before-write (review R10): an existing `anas-scrub.service` WITHOUT our
+ * Read-before-write (review R10): an existing `anas-scrub` unit WITHOUT our
  * marker is someone else's unit on ANAS's fixed name — refuse with
  * {@link ForeignUnitError} (409 `foreign-unit` at the route), never overwrite.
  * A file carrying the marker (ours, even with corrupt JSON inside) is ours to
  * rewrite.
+ *
+ * Rollback (review F14): a failure after the first file lands — the timer write,
+ * the reload, the enable — must not leave a HALF-WRITTEN pair for the next
+ * attempt to trip over. Both previous files are restored byte-for-byte (or
+ * removed, when this write was the pair's first), a best-effort reload drops the
+ * half-registered units from systemd, and the original error rethrows. A
+ * ForeignUnitError passes through untouched — nothing was written, nothing to
+ * roll back.
  */
 export async function writeScrubUnits(
   executor: CommandExecutor,
@@ -201,14 +222,31 @@ export async function writeScrubUnits(
 ): Promise<void> {
   if (await scrubUnitsAreForeign(dir)) {
     throw new ForeignUnitError(
-      `${join(dir, SCRUB_SERVICE_NAME)} exists without an X-ANAS-Schedule marker — `
+      `an anas-scrub unit in ${dir} exists without an X-ANAS-Schedule marker — `
       + 'not an ANAS unit; ANAS will not overwrite it',
     )
   }
-  await writeFile(join(dir, SCRUB_SERVICE_NAME), renderScrubServiceUnit(schedule), 'utf-8')
-  await writeFile(join(dir, SCRUB_TIMER_NAME), renderScrubTimerUnit(schedule), 'utf-8')
-  await runSystemctl(executor, ['daemon-reload'])
-  await runSystemctl(executor, ['enable', '--now', SCRUB_TIMER_NAME])
+  const previous = {
+    [SCRUB_SERVICE_NAME]: await readUnitFile(dir, SCRUB_SERVICE_NAME),
+    [SCRUB_TIMER_NAME]: await readUnitFile(dir, SCRUB_TIMER_NAME),
+  }
+  try {
+    await writeFile(join(dir, SCRUB_SERVICE_NAME), renderScrubServiceUnit(schedule), 'utf-8')
+    await writeFile(join(dir, SCRUB_TIMER_NAME), renderScrubTimerUnit(schedule), 'utf-8')
+    await runSystemctl(executor, ['daemon-reload'])
+    await runSystemctl(executor, ['enable', '--now', SCRUB_TIMER_NAME])
+  }
+  catch (err) {
+    for (const [name, prev] of Object.entries(previous)) {
+      if (prev === null)
+        await unlinkQuiet(join(dir, name))
+      else
+        await writeFile(join(dir, name), prev, 'utf-8')
+    }
+    // Best-effort: systemd may never have seen the half-written pair.
+    await executor.exec(SYSTEMCTL, ['daemon-reload']).catch(() => undefined)
+    throw err
+  }
 }
 
 /**

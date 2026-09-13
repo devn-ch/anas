@@ -18,49 +18,49 @@ err()  { printf 'ERROR: %s\n' "$*" >&2; }
 # months-old missed occurrence (review R10).
 TIMERS_STAMP_DIR="${TIMERS_STAMP_DIR:-/var/lib/systemd/timers}"
 
-# Remove the ANAS SCHEDULE units and restore the node's distro-default parity
-# check (review R8):
+# Remove the ANAS SCHEDULE units (review F2/F8). ONE rule for all four unit
+# families — `anas-snap-*`, `anas-backup-*`, `anas-repl-*`, `anas-scrub.*` —
+# and one reason for it: every family's runner lives in /opt/anas, which this
+# uninstall is deleting. A systemd timer left behind keeps firing a runner that
+# no longer exists, month after month; a lost schedule is the honest outcome of
+# uninstalling, a broken one is not. Each family's timers are disabled --now,
+# its unit files and Persistent stamps removed, and one line names the family
+# and the count.
 #
-#   * `anas-scrub.timer`/`.service` — selfheal.4's node-level two-phase scrub.
-#     Left behind, the timer keeps firing a runner that no longer exists every
-#     month. When one was removed, mdadm's `mdcheck_start`/`mdcheck_continue`
-#     timers are RE-ENABLED: selfheal.4 turned them off when ANAS took md checks
-#     over, so leaving them off would leave the node with NO periodic parity
-#     check at all. Re-enabling them is the distro default, not a new decision.
-#   * the `anas-snap-*.timer`/`.service` snapshot-schedule pairs — never removed
-#     by an uninstall before; the same runner-gone problem, same cure. Their
-#     Persistent stamps go with them.
+# mdcheck is NEVER re-enabled (review F2): ANAS is stateless and cannot know
+# whether mdadm's timers were on before ANAS was installed — for some nodes
+# they were never on at all. When the scrub timer is removed, the printed line
+# says plainly what state the node is left in and how to get the distro default
+# back if the operator wants it.
 #
 # Idempotent: every step is guarded, a partially-uninstalled node is fine.
 remove_schedule_units() {
-  local removed_scrub=0
-  if [ -f "${SYSTEMD_DIR}/anas-scrub.timer" ]; then
+  local family f svc count
+  for family in anas-snap anas-backup anas-repl; do
+    count=0
+    for f in "${SYSTEMD_DIR}"/${family}-*.service; do
+      [ -e "${f}" ] || continue
+      svc="${f##*/}"; svc="${svc%.service}"
+      systemctl disable --now "${svc}.timer" >/dev/null 2>&1 || true
+      rm -f "${SYSTEMD_DIR}/${svc}.service" "${SYSTEMD_DIR}/${svc}.timer"
+      rm -f "${TIMERS_STAMP_DIR}/stamp-${svc}.timer"
+      count=$((count + 1))
+    done
+    if [ "${count}" -gt 0 ]; then
+      info "removed ${count} ANAS schedule unit pair(s) (${family}-*)"
+    fi
+  done
+
+  if [ -f "${SYSTEMD_DIR}/anas-scrub.timer" ] || [ -f "${SYSTEMD_DIR}/anas-scrub.service" ]; then
     systemctl disable --now anas-scrub.timer >/dev/null 2>&1 || true
     rm -f "${SYSTEMD_DIR}/anas-scrub.timer" "${SYSTEMD_DIR}/anas-scrub.service"
     rm -f "${TIMERS_STAMP_DIR}/stamp-anas-scrub.timer"
-    removed_scrub=1
-    info "removed the ANAS periodic scrub units (anas-scrub.timer/.service)"
-  fi
-
-  local f svc removed_snap=0
-  for f in "${SYSTEMD_DIR}"/anas-snap-*.service; do
-    [ -e "${f}" ] || continue
-    svc="${f##*/}"; svc="${svc%.service}"
-    systemctl disable --now "${svc}.timer" >/dev/null 2>&1 || true
-    rm -f "${SYSTEMD_DIR}/${svc}.service" "${SYSTEMD_DIR}/${svc}.timer"
-    rm -f "${TIMERS_STAMP_DIR}/stamp-${svc}.timer"
-    removed_snap=$((removed_snap + 1))
-  done
-  if [ "${removed_snap}" -gt 0 ]; then
-    info "removed ${removed_snap} ANAS snapshot schedule unit pair(s) (anas-snap-*)"
-  fi
-
-  if [ "${removed_scrub}" -eq 1 ]; then
-    # The distro default restored: mdcheck resumes the node's monthly parity
-    # check on its own 1st-Sunday calendar. Best-effort — the timers may not be
-    # installed (mdadm absent); nothing about that is an uninstall failure.
-    systemctl enable mdcheck_start.timer mdcheck_continue.timer >/dev/null 2>&1 || true
-    info "restored mdadm's mdcheck timers (the distro default) — the node keeps a periodic parity check"
+    info "removed 1 ANAS schedule unit pair (anas-scrub.*)"
+    # Honest, not "restored" (review F2): ANAS cannot know whether mdcheck was
+    # on before ANAS, so it does not guess — it says what is off and how to
+    # turn it back on.
+    info "ANAS periodic scrub removed. mdadm's monthly parity check (mdcheck_start.timer) was disabled by ANAS when the scrub was enabled and has NOT been re-enabled;"
+    info "run \`systemctl enable --now mdcheck_start.timer mdcheck_continue.timer\` if you want it back."
   fi
 }
 
@@ -124,9 +124,9 @@ if [ "${removed_unit}" -eq 1 ]; then
   info "removed systemd unit files"
 fi
 
-# 3a. Remove the ANAS schedule units (periodic scrub + snapshot schedules) and,
-# when the scrub timer went away, restore mdadm's mdcheck timers — see the
-# function above (review R8).
+# 3a. Remove the ANAS schedule units (periodic scrub + the snapshot/backup/
+# replication schedules) — all four families, never a re-enable of mdcheck.
+# See the function above (review F2/F8).
 remove_schedule_units
 
 # 3b. Remove the iSCSI boot-ordering drop-in install.sh added beside
