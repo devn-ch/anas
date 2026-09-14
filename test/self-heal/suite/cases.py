@@ -15,15 +15,15 @@ import hashlib
 import json
 import os
 
-from common import (BS, LOGS, SUITE_OUT, array_end_sectors, bounded_end_check,
-                    bounded_range_check, bounded_window_check, btrfs_chunk_ranges,
-                    btrfs_metadata_ranges, call_parity, call_repair, chunk_sectors,
-                    components,
-                    drop_caches, fail_member, file_sector_digests, full_check,
-                    locate_block, make_marker, make_snap, md_attr, md_attr_or_none,
-                    md_geometry, readd_member, read_direct, regen, remove_snap,
+from common import (BS, LOGS, PARITY_CMD, SUITE_OUT, bounded_end_check,
+                    bounded_window_check, btrfs_chunk_ranges,
+                    btrfs_metadata_ranges, call_parity, call_repair, components,
+                    dm_segments, drop_caches, evict_stripe_cache, fail_member,
+                    file_sector_digests, find_btrfs_dev, full_check, locate_block,
+                    make_marker, make_snap, md_attr, md_attr_or_none, md_geometry,
+                    readd_member, read_direct, regen, remove_snap,
                     restore_sync_knobs, reverse_predict, sig_for, snapshot_read,
-                    write_direct)
+                    subvolume_names, write_direct)
 from oracle import (ORACLE_SNAP, corrupt_block, disambiguate_data_slot,
                     scan_device, scan_members)
 
@@ -31,6 +31,9 @@ REPAIR_SNAP = ".anas-repair-snap"
 TX_PROBE_SNAP = ".anas-tx-probe"
 REPORT_PATH = f"{SUITE_OUT}/last-repair.json"
 PARITY_REPORT_PATH = f"{SUITE_OUT}/last-parity.json"
+# F7: the bounded check's evidence file the parity verb gates on (case 8
+# writes it, the suite is what produces it — a rig has no job queue).
+PARITY_EVIDENCE_PATH = f"{SUITE_OUT}/parity-evidence.json"
 
 STEPS = ["pin", "resolve", "reverify", "precheck", "rmw", "reconstruct",
          "arbitrate", "guard", "write", "postcheck", "coldread"]
@@ -85,15 +88,17 @@ class CaseCtx:
         corrupt_block(dev, off)
         return dev, off, off - off % BS
 
-    def corrupt_through_md(self, path: str) -> int:
+    def corrupt_through_md(self, path: str) -> tuple[int, bytes]:
         """Injector for above-md rot: raw scan of the MD DEVICE itself, then a
-        4K junk write through md. No mapping code involved."""
+        4K junk write through md. No mapping code involved. Returns (md block
+        offset, junk bytes) — the junk is the on-disk ground truth for the
+        nothing-written assertion (F3)."""
         sig = sig_for(os.path.basename(path).removesuffix(".bin"), 300)
         hits = scan_device(self.mddev, sig)
         if len(hits) != 1:
             raise RuntimeError(f"md-device scan for {path}: {len(hits)} hits, expected 1")
-        corrupt_block(self.mddev, hits[0])
-        return hits[0] - hits[0] % BS
+        junk = corrupt_block(self.mddev, hits[0])
+        return hits[0] - hits[0] % BS, junk
 
     def naive_write_through_md(self, path: str, block: int) -> None:
         """Negative-control driver: write the ORIGINAL block through md at the
@@ -104,23 +109,34 @@ class CaseCtx:
         orig = regen(name)[block * BS:(block + 1) * BS]
         write_direct(self.mddev, loc["md_byte"] - loc["md_byte"] % BS, orig)
 
-    def verify_stripe(self, path: str, loc: dict) -> tuple[int, int]:
+    def verify_stripe(self, path: str, loc: dict) -> tuple[int, int, list[str]]:
         """Fail a member (caller does this), cold-read the whole stripe through
-        md, compare every 4K block to the regen content. Returns (wrong, total).
+        md, compare every 4K block of `path` that sits in the stripe to the
+        regen content. Returns (wrong, total, rows).
+
+        Vacuity review F4: the old version skipped a whole CHUNK when any part
+        of it fell outside the file's extent, counted the skipped blocks as
+        compared, and the callers asserted `wrong == 0` with no `total > 0`
+        guard — on the 512K rig it compared 512 of 640 row blocks and the gap
+        was invisible (an all-skipped row would have passed vacuously). Now a
+        block outside the extent (or past EOF) is not counted and is named in
+        `rows`; the callers assert `wrong == 0 AND total > 0`.
+
         loc: mapping dict with stripe/parity_disk/q_disk/extent info.
-        The md stripe cache must be evicted first: a stripe freshly read by a
-        bounded check is served from cache afterwards — a degraded read of a
-        cached stripe skips parity reconstruction and hides the poison
-        (probed live: stale-correct read with no sweep, wrong after a sweep)."""
+        The md stripe cache must be evicted first — the SHARED
+        common.evict_stripe_cache (F5): the old inline sweep here ran at the
+        DEFAULT cache size, which common.py documents as insufficient (at 256
+        slots a sequential sweep never evicts the target, so a degraded read
+        of a cached stripe skips parity reconstruction and hides the poison —
+        probed live: stale-correct read with no sweep, wrong after a sweep)."""
         raid6 = self.geo["raid6"]
         n, chunk = self.geo["n"], self.geo["chunk"]
         dc = n - (2 if raid6 else 1)
-        cs = chunk_sectors(self.geo)
-        t = loc["stripe"]
-        last = array_end_sectors(self.mddev) // cs
-        for s in list(range(max(0, t - 200), t)) + \
-                 list(range(t + 1, min(t + 201, last))):
-            read_direct(self.mddev, s * dc * chunk, chunk)
+        evict_stripe_cache(self.mddev, loc["stripe"])
+        name = os.path.basename(path).removesuffix(".bin")
+        want = regen(name)
+        e = loc["extent"]
+        nr = e.get("nr", e["ram"])
         wrong = total = 0
         rows = []
         for d in range(dc):
@@ -128,26 +144,25 @@ class CaseCtx:
             data = read_direct(self.mddev, md_off, chunk)
             lv = md_off - loc["start_sector"] * 512
             logical = lv - loc["chunk_device"] + loc["chunk_logical"]
-            e = loc["extent"]
-            blk0 = (logical - e["disk"]) // BS + e["foff"] // BS
-            off_in = logical - e["disk"]
-            if off_in < 0 or off_in + chunk > e.get("nr", e["ram"]):
-                rows.append(f"chunk {d} (md {md_off}): outside extent — skipped")
-                continue
-            name = os.path.basename(path).removesuffix(".bin")
-            want = regen(name)
-            bad = 0
+            compared = bad = 0
             for i in range(chunk // BS):
-                fb = blk0 + i
+                off_in = logical + i * BS - e["disk"]
+                if off_in < 0 or off_in + BS > nr:
+                    continue              # this block is not in the file's extent
+                fb = e["foff"] // BS + off_in // BS
                 if fb * BS >= len(want):
-                    break
+                    continue              # past the file's end
+                compared += 1
                 if want[fb * BS:(fb + 1) * BS] != data[i * BS:(i + 1) * BS]:
                     bad += 1
+            total += compared
             wrong += bad
-            total += chunk // BS
-            rows.append(f"chunk {d} (md {md_off}, blocks {blk0}..{blk0 + chunk // BS - 1}): "
-                        f"{bad} wrong of {chunk // BS}")
-        return wrong, total
+            row = f"chunk {d}: {bad} wrong of {compared}"
+            if compared < chunk // BS:
+                row += (f" ({chunk // BS - compared} row blocks outside the "
+                        f"file's extent or past EOF — not counted)")
+            rows.append(row)
+        return wrong, total, rows
 
 
 def run_repair(ctx: CaseCtx, path: str, block: int, fail_at: str | None = None,
@@ -159,23 +174,56 @@ def run_repair(ctx: CaseCtx, path: str, block: int, fail_at: str | None = None,
     return rc, rep, out
 
 
-def run_parity(ctx: CaseCtx, band: int = 1, tag: str = "p") -> tuple[int, dict, str]:
+def run_parity(ctx: CaseCtx, band: int = 1, tag: str = "p",
+               evidence: str | None = None,
+               command: str | None = None) -> tuple[int, dict, str]:
     """Invoke the parity-rewrite verb under test (PARITY_CMD, story
     selfheal.10). The sidecar is removed first so a crashed run can never be
-    read as this one's report."""
+    read as this one's report. `evidence` (a bounded-check's JSON file) is
+    passed as `--evidence <file>` — both implementations gate on it (F7);
+    `command` overrides the PARITY_CMD string (the 8-no-evidence control
+    passes it with the dev-only `--assume-mismatch` stripped)."""
     if os.path.exists(PARITY_REPORT_PATH):
         os.unlink(PARITY_REPORT_PATH)
     log = f"{LOGS}/{ctx.tag}-{tag}.log"
-    rc, out = call_parity(ctx.mp, band, report=PARITY_REPORT_PATH, log=log)
+    rc, out = call_parity(ctx.mp, band, report=PARITY_REPORT_PATH, log=log,
+                          evidence=evidence, command=command)
     rep = json.load(open(PARITY_REPORT_PATH)) if os.path.exists(PARITY_REPORT_PATH) else {}
     return rc, rep, out
 
 
-def assert_snap_absent(ctx: CaseCtx, rec: Recorder, what: str) -> None:
-    for name in (REPAIR_SNAP, ORACLE_SNAP):
-        p = os.path.join(os.path.dirname(ctx.mp.rstrip("/")), name)
-        if os.path.exists(p):
-            raise AssertionError(f"{what}: transient snapshot {p} still exists")
+def parity_cmd_without_assume() -> str:
+    """PARITY_CMD with the dev-only `--assume-mismatch` stripped — the
+    8-no-evidence control's command (F7). When the string carries no flag
+    (the reference), it is returned unchanged: the control then relies on
+    the reference's own evidence gate, which REQUIRES `--evidence <file>`
+    and the control passes none."""
+    import shlex
+    toks = [t for t in shlex.split(PARITY_CMD) if t != "--assume-mismatch"]
+    return " ".join(shlex.quote(t) for t in toks)
+
+
+def _digest12(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()[:12]
+
+
+def assert_subvolumes_unchanged(ctx: CaseCtx, baseline: set[str], what: str) -> None:
+    """No transient pin may SURVIVE the repair — implementation-agnostic
+    (vacuity review F2). The old check looked only for the REFERENCE's names
+    (`.anas-repair-snap`, `.anas-oracle-snap`) in the mountpoint's PARENT;
+    the engine names its pins `anas-selfheal-<epoch>` and, on these flat
+    rigs, places them INSIDE the mountpoint — a leaked pin passed it. Every
+    pin is a subvolume of the filesystem, so the set from `btrfs subvolume
+    list` is the check that cannot miss a naming or placement scheme: the
+    set after the run must equal the set before it (a leak adds an entry, a
+    stray deletion removes one — both fail)."""
+    now = subvolume_names(ctx.mp)
+    leaked = sorted(now - baseline)
+    if leaked:
+        raise AssertionError(f"{what}: subvolumes leaked: {leaked}")
+    gone = sorted(baseline - now)
+    if gone:
+        raise AssertionError(f"{what}: subvolumes removed: {gone}")
 
 
 def knobs(ctx: CaseCtx) -> dict:
@@ -187,7 +235,11 @@ def knobs(ctx: CaseCtx) -> dict:
 
 def assert_knobs_default(ctx: CaseCtx, what: str) -> None:
     k = knobs(ctx)
-    if not (k.get("rmw_level", "1") == "1" and k["sync_min"] == "0"
+    # F12: `or "1"` — on RAID1 the rmw_level knob is ABSENT (GT-16), knobs()
+    # records it as None, and the old `.get(key, "1")` default only applied
+    # to missing keys, so this assertion could never pass on a RAID1 array
+    # even though there is nothing to restore there.
+    if not ((k.get("rmw_level") or "1") == "1" and k["sync_min"] == "0"
             and k["sync_max"] == "max" and k["sync_action"] == "idle"):
         raise AssertionError(f"{what}: knobs not restored: {k}")
 
@@ -201,7 +253,14 @@ def wait_a_moment():
 
 def case1_parity_trap(ctx: CaseCtx, rec: Recorder, level: int) -> None:
     """Corrupt a data block on a member -> repair -> fail a DIFFERENT member
-    -> every sibling block in the stripe reads back correctly."""
+    -> every sibling block in the stripe reads back correctly.
+
+    Vacuity review F4: the sibling check (`verify_stripe`) counts the blocks
+    it actually compares (a block outside the file's extent or past EOF is
+    not counted and is named in the detail line) and the assertion is
+    `wrong == 0 AND total > 0` — the old chunk-granular skip compared 512 of
+    640 row blocks on the 512K rig with the gap invisible, and `wrong == 0`
+    alone would pass an all-skipped row vacuously."""
     path = ctx.files["c1"] if level == 5 else ctx.files["r1"]
     name = os.path.basename(path).removesuffix(".bin")
 
@@ -227,11 +286,13 @@ def case1_parity_trap(ctx: CaseCtx, rec: Recorder, level: int) -> None:
     victim = pick_victim(rep, ctx.geo)
     fail_member(ctx.mddev, ctx.members[victim])
     drop_caches()
-    wrong, total = ctx.verify_stripe(path, m)
-    ok = wrong == 0
+    wrong, total, rows = ctx.verify_stripe(path, m)
+    # F4: total > 0 — an all-skipped row must not pass `wrong == 0` vacuously
+    ok = wrong == 0 and total > 0
     rec.add("case", f"1{ctx.tag}-a2", f"sibling blocks correct with m{victim} failed "
             f"({level_label(level)})", ok,
-            f"stripe {rep['stripe']}: {wrong} wrong of {total} 4K blocks")
+            f"stripe {rep['stripe']}: {wrong} wrong of {total} 4K blocks — "
+            + "; ".join(rows))
     readd_member(ctx.mddev, ctx.members[victim])
 
     # --- RAID6 P-member variant
@@ -253,11 +314,12 @@ def p_fail_variant(ctx: CaseCtx, rec: Recorder) -> None:
     fail_member(ctx.mddev, ctx.members[rep["parity_disk"]])   # fail the P member
     drop_caches()
     m = locate_block(ctx.mddev, ctx.mp, path, block)   # verification-side mapping
-    wrong, total = ctx.verify_stripe(path, m)
-    ok = wrong == 0
+    wrong, total, rows = ctx.verify_stripe(path, m)
+    ok = wrong == 0 and total > 0
     rec.add("case", "1r6-b2", f"sibling blocks correct with P member m{rep['parity_disk']} "
             f"failed (Q reconstruction)", ok,
-            f"stripe {rep['stripe']}: {wrong} wrong of {total} 4K blocks")
+            f"stripe {rep['stripe']}: {wrong} wrong of {total} 4K blocks — "
+            + "; ".join(rows))
     readd_member(ctx.mddev, ctx.members[rep["parity_disk"]])
 
 
@@ -279,29 +341,41 @@ def level_label(level: int) -> str:
 
 def control1_parity_trap(ctx: CaseCtx, rec: Recorder, level: int) -> None:
     """Negative control: the same repair at DEFAULT rmw_level MUST break
-    sibling blocks (GT-7 / GT-12)."""
+    sibling blocks (GT-7 / GT-12).
+
+    Vacuity review F5 — the canary: the naive write just went THROUGH md, so
+    the stripe sits in md's stripe cache, and a bounded check over it WITHOUT
+    the eviction reads the cached pre-corruption content and reports 0 — the
+    stale cache would have hidden the poison. Both numbers are recorded and
+    both asserted: if the no-eviction check ever reads > 0, the staleness
+    premise this control (and the evicted checks of every case) stands on is
+    gone, and the suite fails loudly instead of proving less than it claims."""
     path = ctx.files["c1"] if level == 5 else ctx.files["r1"]
     block = 300 if level == 5 else 1400
     # fresh corruption (scan-located)
     dev, off, boff = ctx.corrupt_below_md(path, block)
     loc = locate_block(ctx.mddev, ctx.mp, path, block)
     ctx.naive_write_through_md(path, block)     # original bytes through md, rmw default
+    mm_stale = bounded_window_check(ctx.mddev, loc["stripe"], evict=False)
     mm = bounded_window_check(ctx.mddev, loc["stripe"])
-    ok1 = mm > 0
+    ok1 = mm > 0 and mm_stale == 0
     rec.add("control", f"1{ctx.tag}-n1", f"naive repair at default rmw_level poisons "
             f"parity ({level_label(level)})", ok1,
-            f"bounded check stripe {loc['stripe']}: mismatch_cnt={mm} (expected >0)")
+            f"bounded check stripe {loc['stripe']}: mismatch_cnt={mm} (evicted, "
+            f"expected >0); no-eviction canary mismatch_cnt={mm_stale} (expected "
+            f"0 — the stale cache would have hidden the poison)")
     # fail a different data member: sibling blocks must read back WRONG
     rep = {"stripe": loc["stripe"], "disk": loc["disk"],
            "parity_disk": loc["parity_disk"], "q_disk": loc.get("q_disk")}
     victim = pick_victim(rep, ctx.geo)
     fail_member(ctx.mddev, ctx.members[victim])
     drop_caches()
-    wrong, total = ctx.verify_stripe(path, loc)
+    wrong, total, rows = ctx.verify_stripe(path, loc)
     ok2 = wrong > 0
     rec.add("control", f"1{ctx.tag}-n2", f"sibling blocks BROKEN with m{victim} failed "
             f"({level_label(level)}, default rmw)", ok2,
-            f"stripe {loc['stripe']}: {wrong} wrong of {total} 4K blocks (expected >0)")
+            f"stripe {loc['stripe']}: {wrong} wrong of {total} 4K blocks (expected >0) "
+            + "— " + "; ".join(rows))
     readd_member(ctx.mddev, ctx.members[victim])
     restore_sync_knobs(ctx.mddev)
 
@@ -319,9 +393,10 @@ def case2_zero_block_abort(ctx: CaseCtx, rec: Recorder) -> None:
     same = (dev == ctx.members[loc300["disk"]] and
             off - off % BS == loc300["moff"] - loc300["moff"] % BS)
     rec.add("case", "2-scan", "oracle scan+flip disambiguation picked the data slot "
-            "(zeros file)", same,
+            "(zeros file) — LOAD-BEARING: the rest of the case repairs the block "
+            "the scan hit, so a wrong-slot pick stops the case here", same,
             f"scan hit {dev}@{off - off % BS} vs mapped m{loc300['disk']}@"
-            f"{loc300['moff']} (cross-check only)")
+            f"{loc300['moff']}")
     if not same:
         return
 
@@ -386,16 +461,30 @@ def case3_compressed_coldread(ctx: CaseCtx, rec: Recorder) -> None:
         return
 
     # which file block did the scan-located corruption land in? (verification side)
-    from common import find_btrfs_dev, file_extents, reverse_locate
-    srcdev = find_btrfs_dev(ctx.mp)
+    from common import reverse_locate
     disk = ctx.members.index(dev)
     m = reverse_locate(ctx.mddev, ctx.mp, disk, boff, [path])
     blk = m["block"]
+    # F9: this row used to pass `True` unconditionally (informational). Now it
+    # asserts a round trip: the FORWARD mapping (file block -> member) of the
+    # block the reverse mapping computed must land on the very member sector
+    # the scan found — the scan's sector must sit inside the forward map's
+    # blob span. On this rig the compressed blob is a single 4K sector
+    # (disknr == BS), so that is an equality. A mapping that sent the repair
+    # to the wrong sector would make it exit 4 at reverify; this row proves
+    # the two mapping directions agree before the repair runs.
+    locm = locate_block(ctx.mddev, ctx.mp, path, blk)
+    same_loc = (locm["disk"] == disk
+                and locm["moff"] <= boff < locm["moff"] + locm["blob_sectors"] * BS)
     rec.add("case", "3-map", "corrupted compressed sector mapped back to a file block "
-            "(verification side)", True,
-            f"m{disk}@{boff} -> {os.path.basename(path)} block {blk} "
-            f"(compressed={m['compressed']}, extent disk {m['extent']['disk']} "
+            "(verification side); the forward mapping of that block lands on the "
+            "scan's member sector", same_loc,
+            f"m{disk}@{boff} -> {os.path.basename(path)} block {blk} -> "
+            f"m{locm['disk']}@{locm['moff']} (blob {locm['blob_sectors']} sector(s); "
+            f"compressed={m['compressed']}, extent disk {m['extent']['disk']} "
             f"nr {m['extent']['disknr']} ram {m['extent']['ram']})")
+    if not same_loc:
+        return
 
     rc, rep, out = run_repair(ctx, path, blk, tag="c3r")
     ok = rc == 0 and rep.get("postcheck_mismatch") == 0
@@ -429,28 +518,30 @@ def case3_compressed_coldread(ctx: CaseCtx, rec: Recorder) -> None:
 
 def case4_knob_restore(ctx: CaseCtx, rec: Recorder) -> None:
     """Inject an exception at EVERY step boundary; assert rmw_level, sync_min,
-    sync_max restored and no transient snapshot remains; then a full md check
-    covers the whole array again."""
+    sync_max restored and no transient pin survives (the subvolume set of the
+    filesystem is UNCHANGED after each run — the implementation-agnostic
+    check, F2), then a full md check covers the whole array again."""
     path = ctx.files["c4"]
 
     fails = []
     for step in STEPS:
         ctx.corrupt_below_md(path, 300)          # fresh rot before every run
         remove_snap(ctx.mp, REPAIR_SNAP)
+        base = subvolume_names(ctx.mp)           # F2: baseline before the run
         rc, rep, out = run_repair(ctx, path, 300, fail_at=step, tag=f"c4-{step}")
         detail = f"rc={rc} (expected 70)"
         ok = rc == 70
         try:
             assert_knobs_default(ctx, f"after REPAIR_FAIL_AT={step}")
-            assert_snap_absent(ctx, rec, f"after REPAIR_FAIL_AT={step}")
-            detail += f" knobs={knobs(ctx)} snapshots=absent"
+            assert_subvolumes_unchanged(ctx, base, f"after REPAIR_FAIL_AT={step}")
+            detail += f" knobs={knobs(ctx)} subvolumes=unchanged"
         except AssertionError as e:
             ok = False
             detail += f" {e}"
         if not ok:
             fails.append(step)
         rec.add("case", f"4-{step}", f"REPAIR_FAIL_AT={step}: exit 70, knobs restored, "
-                "no transient snapshot", ok, detail)
+                "no transient pin survives (subvolume set unchanged)", ok, detail)
 
     # full md check covers the whole array again: a check bounded one stripe
     # short of the end must SUSPEND there (GT-5) — deterministic proof the
@@ -471,31 +562,119 @@ def case4_knob_restore(ctx: CaseCtx, rec: Recorder) -> None:
             f"/{f['total']} mismatch_cnt={f['mismatch_cnt']}")
 
     # negative control: a clean run repairs and restores
+    base = subvolume_names(ctx.mp)
     rc, rep, out = run_repair(ctx, path, 300, tag="c4-clean")
     ok = rc == 0 and rep.get("postcheck_mismatch") == 0
     try:
         assert_knobs_default(ctx, "clean run")
-        assert_snap_absent(ctx, rec, "clean run")
-        ok = ok and True
+        assert_subvolumes_unchanged(ctx, base, "clean run")
     except AssertionError as e:
         ok = False
         out += f" {e}"
     rec.add("control", "4-neg", "clean run (no injection) repairs, restores knobs, "
-            "removes its snapshot", ok,
+            "leaves the subvolume set unchanged", ok,
             f"rc={rc} postcheck={rep.get('postcheck_mismatch')}")
 
 
 # ---------------------------------------------------------------- case 5
 
+def measure_tx_blocks(ctx: CaseCtx, devs: list[str], seg: dict) -> tuple[dict, dict, set[int]]:
+    """Run the SAME transaction the repair runs (RO snapshot create + delete)
+    and measure the 4K member blocks it writes, mapped to LV bytes through
+    `seg`'s array geometry. Returns (pre-digests, post-digests, tx LV-byte
+    set). btrfs's superblock mirrors are not stable across mkfs runs
+    (measured: a live super at 64 KiB + 64 MiB, a magic-less csum block at
+    1 MiB, an all-zero 320 KiB mirror a later transaction fills), so the set
+    is MEASURED every run, never a fixed list — and it is re-measured here
+    rather than guessed because any later "which member sectors may change"
+    assertion would have a blind spot at an unmeasured mirror (the
+    tx-probe). The post-digests double as the baseline: nothing changes
+    between the probe and the operation under test."""
+    pre = {d: file_sector_digests(d) for d in devs}
+    make_snap(ctx.mp, TX_PROBE_SNAP)
+    remove_snap(ctx.mp, TX_PROBE_SNAP)
+    post = {d: file_sector_digests(d) for d in devs}
+    blocks: set[int] = set()
+    for i, d in enumerate(devs):
+        for s, (hb, ha) in enumerate(zip(pre[d], post[d])):
+            if hb != ha:
+                moff = s * BS
+                if moff < ctx.geo["data_offset"]:
+                    continue        # md's own super region — never file data
+                blocks.add(reverse_predict(i, moff, ctx.geo)
+                           - seg["ss"] * 512 + seg["start"])
+    return pre, post, blocks
+
+
+def classify_member_changes(devs: list[str], before: dict, after: dict,
+                            geo: dict, seg: dict, tx_blocks: set[int],
+                            excl: list[tuple[int, int]],
+                            content_digest: str | None = None) -> tuple[int, int, int, list[str]]:
+    """Classify every changed 4K member sector (per-sector before/after
+    digests) as housekeeping or a data write. Housekeeping = md's own
+    superblock region (below the data offset), a MEASURED superblock-mirror
+    block (tx_blocks), or a non-DATA (SYSTEM/METADATA) chunk range — btrfs
+    commits its own transactions there on ANY repair, even a correct one.
+    With `content_digest` set, a changed sector whose AFTER digest equals it
+    is counted separately as CONTENT: a byte-for-byte copy of a known block
+    that landed in a whitelisted range — the classification-independent
+    assertion, because the range whitelist alone would excuse it (a wrong-
+    band write of the repair's candidate landing in a metadata chunk, vacuity
+    review F6; in case 5, a false "repair" writing the reconstructed junk at
+    a wrong offset). Returns (housekeeping, data, content, bad sectors)."""
+    doff = geo["data_offset"]
+    housekeeping = data = content = 0
+    bad: list[str] = []
+    for i, d in enumerate(devs):
+        b, a = before[d], after[d]
+        if b == a:
+            continue
+        for s, (hb, ha) in enumerate(zip(b, a)):
+            if hb == ha:
+                continue
+            moff = s * BS
+            if content_digest is not None and ha == content_digest:
+                content += 1
+                if len(bad) < 5:
+                    bad.append(f"{os.path.basename(d)}@{moff} (candidate/junk content)")
+                continue
+            if moff < doff:
+                housekeeping += 1      # md's own superblock region
+                continue
+            lv = reverse_predict(i, moff, geo) - seg["ss"] * 512 + seg["start"]
+            if lv in tx_blocks or any(lo <= lv < hi for lo, hi in excl):
+                housekeeping += 1
+            else:
+                data += 1
+                if len(bad) < 5:
+                    bad.append(f"{os.path.basename(d)}@{moff} (LV {lv})")
+    return housekeeping, data, content, bad
+
+
 def case5_above_md(ctx: CaseCtx, rec: Recorder) -> None:
     """Rot written THROUGH md: pre-check diagnosis (exit 3), not a failed
-    repair; pre-check mismatch_cnt==0."""
+    repair; pre-check mismatch_cnt==0.
+
+    Vacuity review F3: "nothing written" used to be proven by the sidecar
+    alone (the repair says it wrote nothing, so it did). It is now proven on
+    disk: the rot's bytes are exactly what the injector wrote (undisturbed —
+    note a false "repair" would reconstruct the junk itself, since md parity
+    agrees with it, so the bytes cannot prove the fix; what they DO prove is
+    that nothing was "repaired" or moved), and no member sector changed
+    outside btrfs housekeeping. A correct exit-3 run still commits btrfs
+    transactions (its pin snapshot), so the changed sectors are classified
+    exactly as case 7 does: md's super region, MEASURED superblock-mirror
+    blocks, or SYSTEM/METADATA chunk ranges — anything else is a data write
+    and fails, and a copy of the junk at a wrong offset fails as CONTENT even
+    inside a whitelisted range."""
     path = ctx.files["c5"]
-    md_off = ctx.corrupt_through_md(path)
+    md_off, junk = ctx.corrupt_through_md(path)
     loc = locate_block(ctx.mddev, ctx.mp, path, 300)
     same = md_off == loc["md_byte"] - loc["md_byte"] % BS
-    rec.add("case", "5-scan", "md-device scan located the through-md rot", same,
-            f"scan md@{md_off} vs mapped {loc['md_byte']} (cross-check only)")
+    rec.add("case", "5-scan", "md-device scan located the through-md rot — "
+            "LOAD-BEARING: every later assertion is about the block the scan "
+            "found, so a wrong hit stops the case here", same,
+            f"scan md@{md_off} vs mapped {loc['md_byte']}")
     if not same:
         return
     # sanity: md sees nothing (GT-6)
@@ -505,13 +684,35 @@ def case5_above_md(ctx: CaseCtx, rec: Recorder) -> None:
     if mm != 0:
         return
 
+    # F3 baseline, immediately before the run: the tx probe measures this
+    # run's superblock-mirror writes (the repair's pin snapshot commits a
+    # btrfs transaction, so members DO change even on a correct exit-3 run)
+    srcdev = find_btrfs_dev(ctx.mp)
+    seg = dm_segments(srcdev)[0]
+    _, before, tx_blocks = measure_tx_blocks(ctx, ctx.members, seg)
+    excl = btrfs_metadata_ranges(srcdev)
+
     rc, rep, out = run_repair(ctx, path, 300, tag="c5a")
     ok = rc == 3 and rep.get("precheck_mismatch") == 0 and rep.get("outcome") == "above-md"
     rec.add("case", "5-diag", "repair diagnoses above-md corruption (exit 3, "
-            "mismatch_cnt==0 in pre-check, nothing written)", ok,
+            "mismatch_cnt==0 in pre-check)", ok,
             f"rc={rc} precheck_mismatch={rep.get('precheck_mismatch')} "
             f"outcome={rep.get('outcome')} steps={len(rep.get('steps_done', []))} "
             f"reason={rep.get('reason', out)[:140]}")
+
+    # F3 on-disk assertion, run regardless of the exit: nothing was written.
+    after = {d: file_sector_digests(d) for d in ctx.members}
+    h, data, content, badsect = classify_member_changes(
+        ctx.members, before, after, ctx.geo, seg, tx_blocks, excl,
+        content_digest=hashlib.sha256(junk).hexdigest())
+    junk_now = read_direct(ctx.mddev, md_off, BS)
+    okd = data == 0 and content == 0 and junk_now == junk
+    rec.add("case", "5-disk", "nothing was written: the rot's bytes are exactly "
+            "the injector's (undisturbed) and every changed member sector is "
+            "btrfs housekeeping (measured mirrors + non-DATA chunks)", okd,
+            f"rot at md@{md_off} unchanged={junk_now == junk}; changed sectors "
+            f"classified: housekeeping={h} data={data} content={content}"
+            + (f" — {badsect}" if (data or content) else ""))
 
     # negative control: below-md rot must NOT be diagnosed as above-md
     dev, off, boff = ctx.corrupt_below_md(path, 700)
@@ -537,11 +738,18 @@ def case6_raid1(ctx: CaseCtx, rec: Recorder) -> None:
     must read back correct on BOTH legs afterwards (md writes every leg); the
     post-repair cold snapshot read matches.
 
-    Negative control BEFORE the repair: with one leg rotten, a cold read
-    through md may be served either leg — record which leg md served and
-    whether the btrfs read EIOs accordingly. Both outcomes are legitimate;
-    what is asserted is only that the recorded pair is coherent (EIO iff md
-    served the corrupt bytes) and that the rot is real on the member."""
+    Negative control AFTER the repair (vacuity review F8): the old control
+    "recorded which leg md served" and asserted only coherence — with a
+    one-leg rot, md may serve EITHER leg, so both outcomes were legitimate
+    and the control proved the state, not the serving. Now: the repair
+    restored the original bytes, so the signature is back on EVERY leg and
+    the oracle's scan re-locates the block; corrupt one leg behind md and
+    FAIL THE OTHER — with only the corrupt leg left, md has no choice but to
+    serve it, and the cold btrfs read of the block MUST EIO (stored csum vs
+    the junk). The EIO is asserted, not recorded. The failed leg is then
+    re-added and the rebuild waited out; the rebuild re-propagates the fresh
+    rot to the other leg, which is fine — the rig is torn down after the
+    case."""
     path = ctx.files["l1"]
     name = "l1"
 
@@ -564,27 +772,7 @@ def case6_raid1(ctx: CaseCtx, rec: Recorder) -> None:
     if not same_off:
         return
     corrupt_block(leg_dev, off)
-
-    # --- negative control (before the repair): record what md serves, assert
-    # only coherence — never a specific leg
     want = regen(name)[300 * BS:(300 + 1) * BS]
-    rot_real = read_direct(leg_dev, boff, BS) != want
-    drop_caches()
-    snap = make_snap(ctx.mp, ORACLE_SNAP)
-    try:
-        r = snapshot_read(os.path.join(snap, f"{name}.bin"), [300])
-    finally:
-        remove_snap(ctx.mp, ORACLE_SNAP)
-    if 300 in r["eio"]:
-        served = "the corrupt leg (btrfs read EIOs)"
-        coherent = rot_real
-    else:
-        served = "the good leg (btrfs read succeeds)"
-        coherent = rot_real and r["data"].get(300) == want
-    rec.add("control", "6-neg", f"cold read through md with leg m{leg} rotten: md "
-            "served " + served, coherent,
-            f"rot_on_m{leg}={rot_real} eio={r['eio']} (either leg is a "
-            "legitimate serving; recorded, not asserted)")
 
     # --- repair
     rc, rep, out = run_repair(ctx, path, 300, tag="c6r")
@@ -619,6 +807,40 @@ def case6_raid1(ctx: CaseCtx, rec: Recorder) -> None:
                 f"eio={r['eio']} content_match={okc}")
     finally:
         remove_snap(ctx.mp, REPAIR_SNAP)
+    if not okc:
+        return
+
+    # --- negative control (AFTER the repair): deterministic leg observability.
+    # The repair restored the original bytes, so the signature is back on
+    # EVERY leg and the scan re-locates the block; corrupt one leg behind md
+    # and FAIL THE OTHER. With only the corrupt leg left, md has no choice
+    # but to serve it — the cold read MUST EIO. The failed leg is re-added
+    # and the rebuild waited out; the rebuild re-propagates the fresh rot to
+    # the other leg (harmless: the rig is torn down after the case).
+    hits2 = scan_members(ctx.members, sig_for(name, 300))
+    if len(hits2) != len(ctx.members):
+        rec.add("control", "6-neg", "deterministic leg observability: scan re-located "
+                "the repaired marker on every leg", False,
+                f"{len(hits2)} hits, expected {len(ctx.members)}")
+        return
+    rot_dev, rot_off = hits2[0]
+    rot_leg = ctx.members.index(rot_dev)
+    good_leg = 1 - rot_leg
+    corrupt_block(rot_dev, rot_off)
+    fail_member(ctx.mddev, ctx.members[good_leg])
+    drop_caches()
+    snap = make_snap(ctx.mp, ORACLE_SNAP)
+    try:
+        r2 = snapshot_read(os.path.join(snap, f"{name}.bin"), [300])
+    finally:
+        remove_snap(ctx.mp, ORACLE_SNAP)
+    readd_member(ctx.mddev, ctx.members[good_leg])
+    rec.add("control", "6-neg", "with the other leg FAILED, md can only serve the "
+            "corrupt leg — the cold read EIOs (deterministic observability)",
+            300 in r2["eio"],
+            f"rot re-injected on m{rot_leg}, m{good_leg} failed: eio={r2['eio']} "
+            f"(expected [300]); m{good_leg} re-added, rebuild waited out (it "
+            f"re-propagates the rot — the rig is torn down after)")
 
 
 # ---------------------------------------------------------------- case 7
@@ -710,7 +932,16 @@ def case7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
     block (the mirrors are measured by running the repair's own transaction
     first — their positions are not stable across mkfs runs), or a
     SYSTEM/METADATA chunk stripe. Then an evicted bounded check over band B's
-    stripe reads 0 and a cold snapshot read matches."""
+    stripe reads 0 and a cold snapshot read matches.
+
+    Vacuity review F6: the range whitelist above is hundreds of MiB of
+    legitimate housekeeping, and a wrong-band write of the repair's CANDIDATE
+    landing in it would be carved out and pass. So there is a second,
+    classification-independent assertion: no changed band-A 4K block may be a
+    byte-for-byte copy of the candidate. The candidate a correct repair writes
+    is exactly the original block content (it is arbitrated against the stored
+    csum), so any changed sector whose digest equals sha256(original block) is
+    counted as CONTENT and fails — wherever it landed, whitelist included."""
     bl = _tb_blocks(ctx)
     path, block = bl["seg2"]
     name = os.path.basename(path).removesuffix(".bin")
@@ -719,6 +950,8 @@ def case7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
     segA = m["segs"][0]
     assert segA["dev"] == ctx.mddevs[0], \
         f"rig: the first dm segment is {segA['dev']}, expected band A {ctx.mddevs[0]}"
+    want = regen(name)[block * BS:(block + 1) * BS]
+    cand_digest = hashlib.sha256(want).hexdigest()
 
     # R1 baseline: per-sector digests of every band-A member, plus btrfs's
     # housekeeping ranges from the chunk tree (re-read after the repair, in
@@ -733,19 +966,7 @@ def case7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
     # survives that — so measure the set: run the SAME transaction the repair
     # runs (RO snapshot create + delete) and record the band-A 4K blocks it
     # writes, mapped to LV bytes through band A's geometry.
-    probe_b = {d: file_sector_digests(d) for d in band_a_devs}
-    make_snap(ctx.mp, TX_PROBE_SNAP)
-    remove_snap(ctx.mp, TX_PROBE_SNAP)
-    probe_a = {d: file_sector_digests(d) for d in band_a_devs}
-    tx_blocks: set[int] = set()
-    for i, d in enumerate(band_a_devs):
-        for s, (pb, pa) in enumerate(zip(probe_b[d], probe_a[d])):
-            if pb != pa:
-                moff = s * BS
-                if moff < ctx.geo["data_offset"]:
-                    continue        # md's own super region — carved out below
-                tx_blocks.add(reverse_predict(i, moff, ctx.geo)
-                              - segA["ss"] * 512 + segA["start"])
+    _, before, tx_blocks = measure_tx_blocks(ctx, band_a_devs, segA)
 
     # a measured block inside a DATA chunk would be a BLIND SPOT for the R1
     # assertion below (a data write landing there would be carved out as
@@ -761,7 +982,6 @@ def case7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
             f"{len(tx_blocks)} band-A blocks measured, {len(probe_data)} in a "
             f"data chunk" + (f": {probe_data[:8]}" if probe_data else ""))
 
-    before = probe_a   # nothing changes between the probe and the repair
     excl = btrfs_metadata_ranges(m["srcdev"])
 
     # --- injector: the oracle scans the members of BOTH arrays
@@ -779,32 +999,16 @@ def case7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
     # --- the R1 assertion, run regardless of rc: no DATA write on band A
     after = {d: file_sector_digests(d) for d in band_a_devs}
     excl += btrfs_metadata_ranges(m["srcdev"])
-    doff = ctx.geo["data_offset"]
-    housekeeping = data = 0
-    bad_sectors = []
-    for i, d in enumerate(band_a_devs):
-        b, a = before[d], after[d]
-        if b == a:
-            continue
-        for s, (hb, ha) in enumerate(zip(b, a)):
-            if hb == ha:
-                continue
-            moff = s * BS
-            if moff < doff:
-                housekeeping += 1      # md's own superblock region: never file data
-                continue
-            lv = reverse_predict(i, moff, ctx.geo) - segA["ss"] * 512 + segA["start"]
-            if lv in tx_blocks or any(lo <= lv < hi for lo, hi in excl):
-                housekeeping += 1
-            else:
-                data += 1
-                if len(bad_sectors) < 5:
-                    bad_sectors.append(f"{os.path.basename(d)}@{moff} (LV {lv})")
+    housekeeping, data, content, bad_sectors = classify_member_changes(
+        band_a_devs, before, after, ctx.geo, segA, tx_blocks, excl,
+        content_digest=cand_digest)
     rec.add("case", "7-bandA-untouched", "no DATA write on band A: every changed "
-            "band-A sector is btrfs superblock/metadata housekeeping (the R1 "
-            "assertion)", data == 0,
-            f"changed sectors: {housekeeping + data} — housekeeping={housekeeping} "
-            f"data={data}" + (f" — DATA CHANGED: {bad_sectors}" if data else ""))
+            "band-A sector is btrfs superblock/metadata housekeeping, and none "
+            "is a copy of the repair's candidate (the R1 assertion, incl. the "
+            "F6 content check)", data == 0 and content == 0,
+            f"changed sectors: {housekeeping + data + content} — "
+            f"housekeeping={housekeeping} data={data} content={content}"
+            + (f" — BAD: {bad_sectors}" if (data or content) else ""))
 
     ok = rc == 0 and rep.get("postcheck_mismatch") == 0
     same = (rep.get("stripe") == m["stripe"] and rep.get("disk") == m["disk"]
@@ -818,7 +1022,6 @@ def case7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
         return
 
     # --- band B's member block equals the original
-    want = regen(name)[block * BS:(block + 1) * BS]
     got = read_direct(dev, boff, BS)
     rec.add("case", "7-member", "band-B member block equals the original after "
             "repair", got == want, f"{os.path.basename(dev)}@{boff} match={got == want}")
@@ -919,24 +1122,44 @@ def case8_parity_rewrite(ctx: CaseCtx, rec: Recorder) -> None:
     scan-derived exactly as everywhere else in this suite (the oracle finds the
     data block's member offset, and every member of a stripe row shares it);
     only WHICH member is parity comes from the mapping helper, which is the
-    verification side. That is the same construction GT-18 used."""
+    verification side. That is the same construction GT-18 used.
+
+    Vacuity review fixes:
+    - F13: the two "the file still reads MATCH" rows compared the later read
+      to the EARLIER read (`kept`). A cold-read path broken the same way both
+      times (always the same bytes, always EIO, ...) would have passed both.
+      Both now compare against the regen("p1") ground truth.
+    - F9: 8-inject passed `True` unconditionally (informational). It now
+      asserts the parity row on disk actually differs from its pre-injection
+      digest — the rot is on disk, not merely intended.
+    - F7: the 8-no-evidence control (below) proves the evidence gate: with
+      the dev-only --assume-mismatch stripped and no --evidence file, the verb
+      must exit 3 with no-parity-mismatch and issue NO md action."""
     path = ctx.files["p1"]
+    name = "p1"
+    want = regen(name)[300 * BS:301 * BS]
     dev, off = ctx.scan_locate(path, 300)
     boff = off - off % BS
     loc = locate_block(ctx.mddev, ctx.mp, path, 300)
     parity_dev = ctx.members[loc["parity_disk"]]
     kept = _cold_block(path, 300)
-    if kept is None:
-        rec.add("case", "8-precondition", "the marker block reads before the rot", False,
-                "the cold read EIO'd before anything was injected")
+    if kept != want:
+        rec.add("case", "8-precondition", "the marker block reads back the original "
+                "content before the rot (not merely readable)", False,
+                "cold read differs from regen or EIO'd before anything was injected")
         return
+    par_pre = read_direct(parity_dev, boff, BS)
     corrupt_block(parity_dev, boff)
     drop_caches()
+    par_post = read_direct(parity_dev, boff, BS)
     rec.add("case", "8-inject", "parity member's stripe row corrupted behind md "
-            "(data members untouched)", True,
+            "(data members untouched) — the row on disk actually changed",
+            par_post != par_pre,
             f"data m{loc['disk']}({os.path.basename(dev)}) scan-located at {boff}; "
             f"rot injected on PARITY m{loc['parity_disk']}({os.path.basename(parity_dev)})@{boff}, "
-            f"stripe {loc['stripe']}")
+            f"stripe {loc['stripe']}; parity row {_digest12(par_pre)} -> {_digest12(par_post)}")
+    if par_post == par_pre:
+        return
 
     # md sees it, btrfs does not — the whole reason this case exists (GT-18 a/b).
     mm = bounded_window_check(ctx.mddev, loc["stripe"])
@@ -944,12 +1167,38 @@ def case8_parity_rewrite(ctx: CaseCtx, rec: Recorder) -> None:
             mm > 0, f"mismatch_cnt={mm} (expected > 0)")
     before = _cold_block(path, 300)
     rec.add("case", "8-data-intact", "the file still reads correctly through btrfs "
-            "(parity rot is invisible above md)", before == kept,
-            "cold read MATCH" if before == kept else "cold read differs or EIO'd")
-    if mm == 0 or before != kept:
+            "(parity rot is invisible above md) — against the regen ground truth",
+            before == want,
+            "cold read MATCH" if before == want else "cold read differs or EIO'd")
+    if mm == 0 or before != want:
         return
 
-    rc, rep, out = run_parity(ctx, band=1, tag="p8")
+    # F7: the evidence file, produced by the bounded check just above — the
+    # rig's stand-in for "the last completed scrub counted a parity mismatch
+    # on this band" (a rig has no job queue to hold such a job). Both
+    # implementations gate on it; the suite is what produces it.
+    with open(PARITY_EVIDENCE_PATH, "w") as fh:
+        json.dump({"band": 1, "stripe": loc["stripe"], "mismatch_cnt": mm}, fh)
+
+    # --- 8-no-evidence: the evidence gate (negative control). The verb runs
+    # with --assume-mismatch stripped and no --evidence: it must exit 3 with
+    # no-parity-mismatch and issue NO md action — last_sync_action unchanged,
+    # and the parity row on disk still byte-identical to the junk (a repair
+    # would have rewritten it).
+    last_before = md_attr(ctx.mddev, "last_sync_action")
+    rc0, rep0, out0 = run_parity(ctx, band=1, tag="p8noev",
+                                 command=parity_cmd_without_assume())
+    last_after0 = md_attr(ctx.mddev, "last_sync_action")
+    par_now0 = read_direct(parity_dev, boff, BS)
+    rec.add("control", "8-no-evidence", "the verb REFUSES without the evidence gate "
+            "(exit 3, no-parity-mismatch) and issues no md action",
+            rc0 == 3 and rep0.get("reason_code") == "no-parity-mismatch"
+            and last_after0 == last_before and par_now0 == par_post,
+            f"rc={rc0} code={rep0.get('reason_code')} reason={rep0.get('reason', out0)[:120]}; "
+            f"last_sync_action {last_before} -> {last_after0}; parity row "
+            f"unchanged={par_now0 == par_post}")
+
+    rc, rep, out = run_parity(ctx, band=1, tag="p8", evidence=PARITY_EVIDENCE_PATH)
     ok = rc == 0 and rep.get("outcome") == "rewritten" and rep.get("mismatch_after") == 0
     rec.add("case", "8-rewrite", "the verb rewrites the band's parity (exit 0, "
             "mismatch_cnt 0 afterwards)", ok,
@@ -963,8 +1212,9 @@ def case8_parity_rewrite(ctx: CaseCtx, rec: Recorder) -> None:
     rec.add("case", "8-clean", "an independent bounded check over the stripe reads 0",
             mm2 == 0, f"mismatch_cnt={mm2}")
     after = _cold_block(path, 300)
-    rec.add("case", "8-match", "the file still reads MATCH after the rewrite",
-            after == kept, "cold read MATCH" if after == kept else "cold read differs or EIO'd")
+    rec.add("case", "8-match", "the file still reads MATCH after the rewrite — "
+            "against the regen ground truth",
+            after == want, "cold read MATCH" if after == want else "cold read differs or EIO'd")
     same, digests = _xor_rows(ctx.members, boff, loc["parity_disk"])
     rec.add("case", "8-xor", "the parity row is the XOR of the data rows again",
             same, f"parity row == XOR(data rows): {same} — " + " ".join(digests))
@@ -979,11 +1229,20 @@ def control8_data_rot_refused(ctx: CaseCtx, rec: Recorder) -> None:
     blessed — invisible to every later check while btrfs still EIOs the file).
     The fresh btrfs scrub is what tells the two apart, so the control asserts
     both halves: the verb exits 3 with `data-corruption-found`, AND md never
-    ran a repair (`last_sync_action` is untouched)."""
+    ran a repair.
+
+    Vacuity review F1: the "never ran a repair" half used to assert only that
+    `last_sync_action` was unchanged — but case 8 leaves it at `check`, so a
+    verb that ran `repair` and then its own `check` before refusing would
+    still pass. The refusal is now also asserted ON DISK: an evicted bounded
+    check over the stripe must still count the mismatch (the parity was NOT
+    rewritten to match the junk), and the parity member's row must be
+    byte-identical to its pre-refusal digest."""
     path = ctx.files["p2"]
     dev, off, boff = ctx.corrupt_below_md(path, 300)
     drop_caches()
     loc = locate_block(ctx.mddev, ctx.mp, path, 300)
+    parity_dev = ctx.members[loc["parity_disk"]]
     mm = bounded_window_check(ctx.mddev, loc["stripe"])
     rec.add("control", "8-neg-inject", "data-member rot injected below md", mm > 0,
             f"m{loc['disk']}({os.path.basename(dev)})@{boff} stripe {loc['stripe']}: "
@@ -992,13 +1251,22 @@ def control8_data_rot_refused(ctx: CaseCtx, rec: Recorder) -> None:
         return
 
     last_before = md_attr(ctx.mddev, "last_sync_action")
-    rc, rep, out = run_parity(ctx, band=1, tag="p8neg")
+    par_pre = read_direct(parity_dev, boff, BS)
+    rc, rep, out = run_parity(ctx, band=1, tag="p8neg",
+                              evidence=PARITY_EVIDENCE_PATH)
     refused = rc == 3 and rep.get("reason_code") == "data-corruption-found"
     rec.add("control", "8-neg", "the verb REFUSES data rot (exit 3, "
             "data-corruption-found) instead of blessing it", refused,
             f"rc={rc} outcome={rep.get('outcome')} code={rep.get('reason_code')} "
             f"reason={rep.get('reason', out)[:160]}")
     last_after = md_attr(ctx.mddev, "last_sync_action")
-    rec.add("control", "8-neg-no-repair", "md never ran a repair on the band",
-            last_after == last_before and last_after != "repair",
-            f"last_sync_action {last_before} -> {last_after}")
+    mm_after = bounded_window_check(ctx.mddev, loc["stripe"])
+    par_after = read_direct(parity_dev, boff, BS)
+    ok_nr = (last_after == last_before and last_after != "repair"
+             and mm_after > 0 and par_after == par_pre)
+    rec.add("control", "8-neg-no-repair", "md never ran a repair on the band — on "
+            "disk: the stripe still counts the mismatch and the parity row is "
+            "byte-identical to its pre-refusal digest", ok_nr,
+            f"last_sync_action {last_before} -> {last_after}; bounded check "
+            f"mismatch_cnt={mm_after} (expected >0); parity row "
+            f"unchanged={par_after == par_pre}")

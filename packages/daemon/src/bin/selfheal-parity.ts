@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import type { CommandExecutor } from '../executor/types.js'
 import type { ParityRewriteEvidence, ParityRewritePool } from '../services/ahr-parity-rewrite.js'
-import { writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import process from 'node:process'
 import { AhrParityRewriteResult as AhrParityRewriteResultSchema } from '@anas/shared'
 import { ProdExecutor } from '../executor/prod.js'
@@ -31,11 +31,18 @@ import { memberDataSectors } from '../services/selfheal-repair.js'
  *
  * `--assume-mismatch` is DEV-ONLY and exists for exactly one reason: on a rig
  * there is no daemon, no job queue and therefore no completed scrub job to read
- * the band's parity-mismatch count out of. It supplies that ONE precondition
- * and nothing else — the fresh btrfs scrub, the array gates, the whole-band
- * repair, the verifying check and the `mismatch_cnt == 0` proof all run exactly
- * as they do in the job. The product path never sets it, and the route has no
- * way to.
+ * the band's parity-mismatch count out of. It BYPASSES THE EVIDENCE GATE with
+ * a hardcoded count and nothing else — the fresh btrfs scrub, the array gates,
+ * the whole-band repair, the verifying check and the `mismatch_cnt == 0` proof
+ * all run exactly as they do in the job. The product path never sets it, and
+ * the route has no way to.
+ *
+ * Without the flag the gate is real, and `--evidence <file>` is the rig's
+ * stand-in for the completed-scrub job: a JSON file with the bounded check's
+ * count (`{"mismatch_cnt": N, ...}`, N > 0), produced by the selfheal.2 suite
+ * from a bounded check on the rig. With neither the flag nor a valid evidence
+ * file the entry refuses (exit 3, `no-parity-mismatch`) before touching md —
+ * the same refusal the product route gives when the lookup has no proof.
  */
 
 const EXIT = {
@@ -83,24 +90,50 @@ async function poolFor(executor: CommandExecutor, mountpoint: string): Promise<P
 async function main(): Promise<number> {
   const argv = process.argv.slice(2)
   const assumeMismatch = argv.includes('--assume-mismatch')
-  const [mountpoint, bandText] = argv.filter(a => !a.startsWith('--'))
+  // `--evidence <file>`: the suite's bounded-check evidence file. Its VALUE
+  // is not a flag, so it must be consumed here or it would be parsed as the
+  // band.
+  const evidenceIdx = argv.indexOf('--evidence')
+  const evidenceFile = evidenceIdx >= 0 && evidenceIdx + 1 < argv.length ? argv[evidenceIdx + 1] : null
+  const [mountpoint, bandText] = argv
+    .filter((a, i) => evidenceIdx < 0 || (i !== evidenceIdx && i !== evidenceIdx + 1))
+    .filter(a => !a.startsWith('--'))
   if (!mountpoint || !bandText || !BAND_ARG_RE.test(bandText)) {
-    process.stderr.write('usage: selfheal-parity <mountpoint> <band> [--assume-mismatch]\n')
+    process.stderr.write('usage: selfheal-parity <mountpoint> <band> [--assume-mismatch | --evidence <file>]\n')
     return EXIT.internal
   }
   const band = Number(bandText)
   const executor = new ProdExecutor()
 
-  // The rig's stand-in for "the last completed scrub counted mismatches on this
-  // band and its checksum pass was clean". Without the flag the answer is the
-  // honest one for a rig: there is no such scrub on record.
-  const evidence = (): ParityRewriteEvidence => assumeMismatch
-    ? { ok: true, mismatchCnt: 8, jobId: 'dev:--assume-mismatch' }
-    : {
+  // The rig's stand-in for "the last completed scrub counted mismatches on
+  // this band and its checksum pass was clean". `--assume-mismatch` bypasses
+  // the gate with a hardcoded count; without it, `--evidence <file>` (the
+  // suite's bounded-check JSON, mismatch_cnt > 0) supplies the proof; with
+  // neither the answer is the honest one for a rig: no such scrub on record.
+  const evidence = async (): Promise<ParityRewriteEvidence> => {
+    if (assumeMismatch)
+      return { ok: true, mismatchCnt: 8, jobId: 'dev:--assume-mismatch' }
+    if (evidenceFile) {
+      try {
+        const parsed = JSON.parse(await readFile(evidenceFile, 'utf8')) as { mismatch_cnt?: unknown }
+        if (typeof parsed.mismatch_cnt === 'number' && parsed.mismatch_cnt > 0)
+          return { ok: true, mismatchCnt: parsed.mismatch_cnt, jobId: `dev:--evidence ${evidenceFile}` }
+      }
+      catch {
+        // an unreadable or malformed evidence file is no evidence
+      }
+      return {
         ok: false,
         code: 'no-parity-mismatch',
-        reason: 'no completed scrub job is on record (this dev entry has no job queue) — pass --assume-mismatch to stand in for that ONE precondition on a test rig',
+        reason: `the evidence file ${evidenceFile} records no parity mismatch on this band — it must be a JSON file with the bounded check's mismatch_cnt > 0`,
       }
+    }
+    return {
+      ok: false,
+      code: 'no-parity-mismatch',
+      reason: 'no completed scrub job is on record (this dev entry has no job queue) — pass --assume-mismatch to bypass the evidence gate on a test rig, or --evidence <file> with a bounded check\'s count',
+    }
+  }
 
   try {
     const result = await rewriteBandParity(executor, await poolFor(executor, mountpoint), band, {

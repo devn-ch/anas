@@ -20,9 +20,20 @@ The verb, in the order the story fixes it:
 Exit codes: 0 rewritten · 2 still-mismatched · 3 refused · 1 internal error.
 `PARITY_REPORT=<path>` writes the JSON sidecar the suite cross-checks.
 
+The EVIDENCE GATE (vacuity review F7): the product's precondition is "the
+pool's last COMPLETED scrub job counted a parity mismatch on this band and
+its checksum pass was clean". A rig has no daemon and no job queue to hold
+such a job, so the suite produces the evidence: a JSON file written from a
+bounded check on the rig (`{"mismatch_cnt": N, ...}`, N > 0), passed as
+`--evidence <file>`. WITHOUT it this reference refuses — exit 3,
+`no-parity-mismatch`, before the scrub, before md — exactly as the product
+refuses when the lookup has no proof. That is what the suite's 8-no-evidence
+control asserts.
+
 Unknown `--flags` are accepted and ignored, so a PARITY_CMD carrying the ANAS
 dev entry's `--assume-mismatch` (which stands in for the completed-scrub
-evidence a rig has no job queue for) runs against this reference unchanged.
+evidence a rig has no job queue for) runs against this reference unchanged —
+but the reference itself has no such bypass: it requires `--evidence`.
 """
 import json
 import os
@@ -109,13 +120,74 @@ def wait_for_op(mddev: str, expect: str) -> str | None:
     raise RuntimeError(f"the {expect} on {mddev} did not finish in {FINISH_TIMEOUT_S}s")
 
 
+def parse_args() -> tuple[list[str], str | None]:
+    """(positional args, evidence file). `--evidence <file>` is the evidence
+    gate (F7); unknown `--flags` are accepted and ignored — the ANAS dev
+    entry's `--assume-mismatch` is one, and a PARITY_CMD carrying it must
+    still run against this reference unchanged."""
+    argv = sys.argv[1:]
+    positional: list[str] = []
+    evidence_file: str | None = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--evidence":
+            i += 1
+            if i >= len(argv):
+                raise ValueError("--evidence takes a file argument")
+            evidence_file = argv[i]
+        elif a.startswith("--"):
+            pass                      # unknown flags: accepted and ignored
+        else:
+            positional.append(a)
+        i += 1
+    return positional, evidence_file
+
+
+def evidence_gate(evidence_file: str | None) -> int | None:
+    """The precondition gate (F7): run BEFORE the scrub, before md. The
+    product stands on "the last completed scrub counted a parity mismatch on
+    this band and its checksum pass was clean"; on a rig the stand-in is the
+    bounded check's evidence file. Missing or zero-count => refuse exit 3
+    `no-parity-mismatch`, having touched nothing. Returns the refusal exit
+    code, or None when the gate passes (the count is recorded for the
+    sidecar)."""
+    if evidence_file is None:
+        return refuse("refused: no parity-mismatch evidence provided — the "
+                      "product's precondition is the pool's last completed "
+                      "scrub job counting a parity mismatch on this band with "
+                      "a clean checksum pass; on a rig that proof is "
+                      "--evidence <file> (a bounded check's JSON)",
+                      "no-parity-mismatch")
+    try:
+        with open(evidence_file) as fh:
+            parsed = json.load(fh)
+        cnt = parsed.get("mismatch_cnt")
+    except (OSError, json.JSONDecodeError, AttributeError) as exc:
+        return refuse(f"refused: the evidence file {evidence_file} could not "
+                      f"be read ({type(exc).__name__})", "no-parity-mismatch")
+    if not isinstance(cnt, int) or cnt <= 0:
+        return refuse(f"refused: the evidence file {evidence_file} records no "
+                      f"parity mismatch (mismatch_cnt={cnt!r}) — there is "
+                      f"nothing here to rewrite", "no-parity-mismatch")
+    report["evidence_mismatch"] = cnt
+    report["evidence_file"] = evidence_file
+    return None
+
+
 def main() -> int:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    if len(args) != 2 or not args[1].isdigit():
-        sys.stderr.write("usage: parity-ref.py <mountpoint> <band>\n")
+    positional, evidence_file = parse_args()
+    if len(positional) != 2 or not positional[1].isdigit():
+        sys.stderr.write("usage: parity-ref.py <mountpoint> <band> "
+                         "[--evidence <file>]\n")
         return EXIT_INTERNAL
-    mountpoint, band = args[0], int(args[1])
+    mountpoint, band = positional[0], int(positional[1])
     report["band"] = band
+
+    # --- phase 0: the evidence gate — before the scrub, before md (F7)
+    refused = evidence_gate(evidence_file)
+    if refused is not None:
+        return refused
 
     # --- phase 1/3: the fresh scrub
     errors = btrfs_scrub(mountpoint)

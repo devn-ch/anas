@@ -36,6 +36,14 @@ RIG5_FILES = [("c1", "random", 8 * 1024 * 1024, 1, [300]),
               ("z1", "zeros", 4 * 1024 * 1024, None, [300]),
               ("c4", "random", 4 * 1024 * 1024, 4, [300]),
               ("c5", "random", 4 * 1024 * 1024, 5, [300, 700])]
+# The 512K rig (F4) gets its own c1, large enough to cover the WHOLE stripe
+# row: the row is 5 × 512 KiB = 2.5 MiB and block 300 sits 1.2 MiB into the
+# file, so the row's tail reaches at most 3.7 MiB in — 16 MiB leaves six
+# times the room. (The row's HEAD can still start before the file's extent —
+# that is an allocation fact no file size controls — and verify_stripe now
+# counts block-by-block and reports every such block instead of silently
+# dropping a whole chunk.)
+RIG5X_FILES = [("c1", "random", 16 * 1024 * 1024, 1, [300])]
 RIG6_FILES = [("r1", "random", 8 * 1024 * 1024, 1, [300, 1000, 1400])]
 RIG1_FILES = [("l1", "random", 4 * 1024 * 1024, 7, [300])]
 # Case 8 (selfheal.10) gets a rig of its own: the verb scrubs the WHOLE
@@ -301,7 +309,7 @@ def main() -> int:
         # F4 proof: the parity case again on the AHR band shape — md's 512 KiB
         # default chunk, where a hardcoded 128-sector window is refused EINVAL
         ("RAID5 512K", lambda: run_rig(5, rec, notes, chunk="512K", tag="r5x",
-                                       files=RIG5_FILES[:1], cases=("1", "1-neg"))),
+                                       files=RIG5X_FILES, cases=("1", "1-neg"))),
         # GT-16: RAID1 has no rmw_level / stripe_cache_size and chunk_size
         # reads 0 — case 6 with its negative control
         ("RAID1", lambda: run_rig(1, rec, notes, files=RIG1_FILES,

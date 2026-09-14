@@ -491,7 +491,13 @@ def evict_stripe_cache(mddev: str, stripe: int, span: int = 200) -> None:
     cache is small: with 17 slots the sweep is forced through every slot and
     the target's entry is recycled. Restore the size afterwards.
     RAID1 (GT-16) has no stripe_cache_size knob and no stripe cache at all —
-    an absent attribute is skipped, never an error."""
+    an absent attribute is skipped, never an error.
+
+    The shrink is asserted by reading the knob back: a write that silently
+    did not take would make every downstream bounded check read the STALE
+    cache and report 0 — a false pass indistinguishable from a clean array
+    (vacuity review F5). This is the ONE eviction in the suite: bounded
+    checks and the degraded stripe read (cases.verify_stripe) both call it."""
     m = mdsys(mddev)
     sz_path = f"{m}/stripe_cache_size"
     if not os.path.exists(sz_path):
@@ -499,6 +505,10 @@ def evict_stripe_cache(mddev: str, stripe: int, span: int = 200) -> None:
     orig = open(sz_path).read().strip()
     with open(sz_path, "w") as fh:
         fh.write("17")
+    if open(sz_path).read().strip() != "17":
+        raise RuntimeError(f"{mddev}: stripe_cache_size write of 17 did not "
+                           f"take — the eviction is a no-op and every bounded "
+                           f"check below would read the stale cache")
     geo = md_geometry(mddev)
     cs = chunk_sectors(geo)
     dc = geo["n"] - (2 if geo["raid6"] else 1)
@@ -511,16 +521,21 @@ def evict_stripe_cache(mddev: str, stripe: int, span: int = 200) -> None:
         fh.write(orig)
 
 
-def bounded_window_check(mddev: str, stripe: int, cap: int = 180) -> int:
+def bounded_window_check(mddev: str, stripe: int, cap: int = 180,
+                         evict: bool = True) -> int:
     """md check bounded to `stripe` (sync_min/sync_max in per-member sectors,
     GT-5 convention). The stripe width comes from the array's own chunk_size
     (F4: it was hardcoded to the loop rig's 64 KiB / 128 sectors, which md
     refuses with EINVAL on a 512 KiB-chunk array). The stripe cache is evicted
     first (see evict_stripe_cache) so the check reads the members, not cached
-    pre-corruption content."""
+    pre-corruption content — except with `evict=False`, which the case-1
+    control uses for its canary: the same check over a stripe that was just
+    written through md, WITHOUT the eviction, must read the stale cache and
+    report 0 (proof the eviction is what makes the evicted check honest)."""
     geo = md_geometry(mddev)
     cs = chunk_sectors(geo)
-    evict_stripe_cache(mddev, stripe)
+    if evict:
+        evict_stripe_cache(mddev, stripe)
     return bounded_range_check(mddev, stripe * cs, (stripe + 1) * cs, cap=cap)
 
 
@@ -557,7 +572,10 @@ def bounded_range_check(mddev: str, lo: int, hi: int, cap: int = 180) -> int:
         import time
         time.sleep(0.5)
     if not ended:
-        raise RuntimeError(f"bounded check stripe {stripe} did not settle in {cap}s")
+        # (vacuity review F11: this interpolated an undefined `stripe` — the
+        # NameError masked the real timeout when it fired)
+        raise RuntimeError(f"bounded check {mddev} [{lo}, {hi}) did not "
+                           f"settle in {cap * 0.5:g}s")
     # settle: sync_action flips to idle slightly before mismatch_cnt is
     # finalized for the op (probed live: reading immediately returned the
     # PREVIOUS check's count)
@@ -676,6 +694,28 @@ def readd_member(mddev: str, dev: str, cap: int = 600) -> None:
 
 
 # ---------------------------------------------------------------- snapshots
+
+def subvolume_names(mountpoint: str) -> set[str]:
+    """Every subvolume and snapshot of the filesystem that holds
+    `mountpoint`, as its path relative to the filesystem root
+    (`btrfs subvolume list`). Implementation-agnostic pin check (vacuity
+    review F2): whatever a repair names its transient pin — the reference's
+    `.anas-repair-snap` in the mountpoint's PARENT, the engine's
+    `anas-selfheal-<epoch>` INSIDE the mountpoint on a flat rig — it is a
+    subvolume of this filesystem, so a leaked pin shows up here no matter
+    the naming or placement scheme."""
+    r = run(["btrfs", "subvolume", "list", mountpoint])
+    names = set()
+    for line in r.stdout.splitlines():
+        # lines are `ID <n> gen <n> top level <n> path <relpath>`; the path
+        # is everything after the ` path ` marker (it may contain spaces;
+        # the top level's line has none and is skipped)
+        if " path " in line:
+            p = line.split(" path ", 1)[1]
+            if p:
+                names.add(p)
+    return names
+
 
 def snap_path(mountpoint: str, name: str) -> str:
     return os.path.join(os.path.dirname(mountpoint.rstrip("/")), name)
@@ -894,7 +934,8 @@ PARITY_CMD = os.environ.get("PARITY_CMD") or f"python3 {GT}/suite/parity-ref.py"
 
 
 def call_parity(mountpoint: str, band: int, report: str | None = None,
-                log: str | None = None) -> tuple[int, str]:
+                log: str | None = None, evidence: str | None = None,
+                command: str | None = None) -> tuple[int, str]:
     """Run the parity-rewrite verb under test (story selfheal.10, case 8).
 
     Contract — the same shape as REPAIR_CMD, one verb along:
@@ -906,9 +947,21 @@ def call_parity(mountpoint: str, band: int, report: str | None = None,
     A PARITY_CMD may carry flags of its own (the ANAS dev entry's
     `--assume-mismatch` stands in for the completed-scrub evidence a loop rig
     has no job queue for); they are part of the command string and are passed
-    before the two positional arguments."""
+    before the two positional arguments.
+
+    The EVIDENCE GATE (vacuity review F7): both implementations refuse with
+    exit 3 / `no-parity-mismatch` when they have no proof that a parity
+    mismatch was counted on the band — the reference requires `--evidence
+    <file>`, the ANAS dev entry takes `--evidence <file>` in place of its
+    dev-only `--assume-mismatch` (which bypasses the gate and hardcodes the
+    count). The suite passes the evidence file itself: it is produced by a
+    bounded check on the rig (a JSON `{"mismatch_cnt": N, ...}` with
+    N > 0). `evidence=None` and a `command` with the assume-flag stripped is
+    the 8-no-evidence control: the verb must refuse before touching md."""
     import shlex
-    cmd = shlex.split(PARITY_CMD) + [mountpoint, str(band)]
+    base = shlex.split(command if command is not None else PARITY_CMD)
+    cmd = base + (["--evidence", evidence] if evidence else []) + \
+        [mountpoint, str(band)]
     env = dict(os.environ)
     if report:
         env["PARITY_REPORT"] = report
