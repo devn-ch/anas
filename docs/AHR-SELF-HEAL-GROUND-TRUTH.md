@@ -6,13 +6,16 @@ helpers `lib.sh`/`crc32c.py`), raw outputs under `test/self-heal/gt/out/` (gitig
 GT-18..21 (2026-09-14, follow-up to the self-heal design review) add stages
 `09-gt18.sh`(+`09-gt18-xor.py`), `10-gt19.sh`, `11-gt20.sh`(+`11-gt20-leaf.py`,
 `11-gt20-followup.sh`), `12-gt21.sh`; raw outputs under `out/gt18..gt21/`, `out/gt20f/`.
+GT-22 (2026-09-14, story selfheal.11) adds `13-gt22.sh`(+`13-gt22.py`); raw outputs
+under `out/gt22/`; each arm ran on its own freshly built 2 × 200 MiB RAID1 rig.
 Rig: 7 × 200 MiB loop files under `/root/gtsh/`, `md/gtsh5` (RAID5, 6 members),
 `md/gtsh6` (RAID6, 7 members), VG `gtsh` → `gtsh/data`, btrfs `-m dup -d single`,
 subvolume `@data`. Marker files carry a 33-byte ASCII signature at file block 300.
 
 - Node: `anas-pve` (192.168.200.50), Debian PVE 9
-- Kernel: `7.0.14-12-pve`; mdadm `v4.4 - 2024-11-07`; btrfs-progs `v6.14`; python 3.13.5
-- Date: 2026-09-11
+- Kernel: `7.0.14-12-pve` (GT-1..21), `7.0.14-17-pve` (GT-22, after the stunt-node
+  point-release upgrade); mdadm `v4.4 - 2024-11-07`; btrfs-progs `v6.14`; python 3.13.5
+- Date: 2026-09-11 (GT-1..21), 2026-09-14 (GT-22)
 
 Verdicts are per the drill brief; `UNEXPECTED` carries the verbatim lines. Where the
 kernel's own report differs from the brief's assumption, the fact is recorded — not
@@ -717,6 +720,198 @@ against mdadm upgrades but not against a blanket preset pass; if the timers
 must stay off, they need an explicit preset/disable, not just `is-enabled`.
 
 ---
+
+## GT-22 — Fail-one-leg scrub on a RAID1 band: the scrub-arm works, `--re-add` of a failed member does NOT resync, and `md repair` blindly copies leg 0 — PROVEN (with UNEXPECTEDs)
+
+Story selfheal.11's design-to-ground-truth question: can a MIRROR band's mismatch
+(the decision tree's F1/R9 root — md counts disagreeing legs, btrfs reads through md,
+phase 2 names nothing) be repaired with md's own mechanism? Rig per arm: freshly built
+2 × 200 MiB loop RAID1 (`md/gtsh1`, LVM, btrfs `-m dup -d single`, `@data`), f1 marker
+at block 300 located by the raw signature scan on BOTH legs (the suite's
+`oracle.py`/`common.py`, pushed to the node as `run-suite.sh` does):
+
+```
+{"hits": [["/dev/loop0", 16957440], ["/dev/loop1", 16957440]], "boff": 16957440,
+ "data_offset": 1048576, "md_byte": 15908864, "members": ["/dev/loop0", "/dev/loop1"],
+ "mddev": "/dev/md127"}
+```
+
+Same member offset on both legs (`data_offset` 1 MiB + md LBA, GT-16's RAID1 shape);
+rot = 4 KiB of fresh junk written DIRECT to one leg's block 300 behind md. Every
+multi-run scrub arm re-injects a fresh rot before each run — see UNEXPECTED(1).
+
+**(a) Rot on leg A, both legs in — md serves the rotten leg, and the scrub REPAIRS
+the band through md — PROVEN, with UNEXPECTED(1).** Cold single-block read first:
+`[a] cold read of blk300 through md: EIO (rot leg served)`. Three cold scrubs (fresh
+rot before each), identical every time:
+
+```
+[p1-a-scrub1] read_errors: 0 csum_errors: 1 uncorrectable_errors: 0 corrected_errors: 1
+[p1-a-scrub1] WARNING: errors detected during scrubbing, 1 corrected
+[p1-a-post-blkA1] m0 (/dev/loop0) blk300: MATCH sha=a6109fa891e1265b
+[p1-a-post-blkB1] m1 (/dev/loop1) blk300: MATCH sha=a6109fa891e1265b
+```
+
+(scrubs 2/3 byte-identical in shape; dmesg `scrub: fixed up error at logical
+14811136 on dev /dev/mapper/gtsh-data physical 14811136`). Bounded full check with a
+fresh rot: `mismatch_cnt=128` — the brief's ">0" holds, but note the unit: on RAID1
+one rotted 4 KiB block counts 128, on RAID5 it counted 8 (GT-18).
+
+**(b) Order 1 — fail the GOOD leg B: the rot becomes visible, repairable by hand,
+and md's own resync finishes the job — PROVEN.** After `--fail` (`[2/1] [U_]`), the
+scrub with only the rotten leg servable:
+
+```
+ERROR: there are 1 uncorrectable errors
+csum_errors: 1 / uncorrectable_errors: 1 / corrected_errors: 0 ; scrub rc=3
+```
+
+The naming is in dmesg, not in the scrub summary (GT-3's rule, now on RAID1):
+
+```
+[5203.975852] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 14811136 on dev /dev/mapper/gtsh-data physical 14811136
+[5203.975898] BTRFS warning (device dm-0): scrub: checksum error at logical 14811136 on dev /dev/mapper/gtsh-data, physical 14811136 root 256 inode 257 offset 1179648 length 4096 links 1 (path: f1.bin)
+```
+
+(the plain read path names the exact 4 KiB file offset instead:
+`csum failed root 256 ino 257 off 1228800 csum 0x… expected csum 0x02db94b8 mirror 1`
+— 1228800 = 300 × 4096; the scrub line's `offset 1179648` is extent-relative, the
+extent starts at file offset 49152). Then `--remove` B, hand repair the way the
+engine would — the kept-original block written THROUGH md at `md_byte=15908864`,
+landing on A only (`m0 blk300: MATCH`), junk injected into the removed B
+(`m1 blk300: BAD sha=12ce88678df023d5`), then:
+
+```
+[p1-b] mdadm --re-add /dev/md127 /dev/loop1 rc=1 (mdadm: --re-add for /dev/loop1 to /dev/md127 is not possible )
+[p1-b-add] mdadm --add /dev/md127 /dev/loop1 rc=0 (mdadm: added /dev/loop1 )
+[p1-b-add] recovery done in 1.30s (200 MiB leg)
+```
+
+**`--re-add` of a REMOVED member is refused without a write-intent bitmap** (rc=1,
+verbatim above) — the verb the story text hoped for does not exist on this rig;
+`--add` is the real path. The recovery trail (`out/gt22/p1-b-add-recovery.txt`) shows
+md copying A→B: speed ramps 0 → 203776 K/sec, and the poll line that flips the state
+is
+
+```
+[===================>.]  recovery = 99.7% (203776/203776) finish=0.0min speed=203776K/sec  →  [2/2] [UU]
+```
+
+Direction proven by the junk: B's block 300 held junk BEFORE the recovery and reads
+`MATCH sha=a6109fa891e1265b` after — **the resync overwrote B's junk with A's good
+block**. Post: bounded check `mismatch_cnt=0`, cold btrfs read `MATCH=True`.
+
+**(c) Order 2 — fail the BAD leg A: scrub clean, but `--re-add` does NOT fix A —
+REFUTED as stated; the engine-correct arm (--remove + --add) is PROVEN.** Three cold
+scrubs with only the good leg servable, all clean every time
+(`csum_errors: 0 … corrected_errors: 0`) — the brief's "expected clean" holds, and
+with one leg failed the bounded check reads `mismatch_cnt=0` (md compares nothing —
+a degraded check cannot see leg rot). Then the arm as the story sketched it:
+
+```
+[p2] mdadm --re-add /dev/md127 /dev/loop0 rc=0 (mdadm: re-add /dev/loop0 to md127 succeed )
+[p2] recovery done in 0.12s (200 MiB leg)
+      [===================>.]  recovery = 99.7% (203776/203776) finish=0.0min speed=0K/sec
+[p2-post-readd (bounded full check)] mismatch_cnt=1408
+[p2-04-blkA] m0 (/dev/loop0) blk300: BAD sha=f4e8ceb93b2e020f
+[p2-06-coldread] coldread: EIO
+```
+
+**UNEXPECTED(2): `--re-add` of a FAILED-but-present member "succeeds" without
+syncing anything.** rc=0, "succeed", a 0.12 s no-op recovery at `speed=0K/sec`, the
+member returns to `[UU]`, and the rot survives untouched (cold read EIO). The story's
+order-2 arm must not rely on `--re-add`. The engine-correct sequence — `--fail` +
+`--remove` (a still-active member refuses `--remove` outright: `Cannot open
+/dev/loop0: Device or resource busy`), then `--add` — gives a REAL recovery:
+
+```
+[p2-c2] mdadm --add /dev/md127 /dev/loop0 rc=0 (mdadm: added /dev/loop0 )
+[p2-c2] recovery done in 1.20s (200 MiB leg)   →  [2/2] [UU]
+[p2-c2 (bounded full check)] mismatch_cnt=0
+[p2-c2-03-blkA] m0 (/dev/loop0) blk300: MATCH sha=a6109fa891e1265b
+[p2-c2-05-coldread] coldread: MATCH=True sha=a6109fa891e1265b
+```
+
+— resync copied B over A's junk (A was BAD before, MATCH after). "If the scrub is
+clean, let md's resync fix it" is real, but only via remove+add.
+
+**(d) Read-balance leakage — PROVEN.** With both legs in and a fresh rot before each
+run, all 5 cold scrubs saw the rot (`csum_errors: 1, corrected_errors: 1` each, leg A
+MATCH after every one) — across four complete probe runs, every cold read and every
+cold scrub with a fresh rot served the rotten leg (4/4 cold reads; 3× (a) + 5× (d)
+per run, `csum_errors: 1` each). md's read-balance shows no good-leg stickiness here
+— but it is not contractual, and a pass where md serves the good leg (scrub clean,
+rot persists on A) is exactly what the story's second pass covers. With the GOOD leg
+failed and a fresh rot before each run, all 3 scrubs see the error and none can heal:
+
+```
+[p3-d-failed-scrub1] read_errors: 0 csum_errors: 1 uncorrectable_errors: 1 corrected_errors: 0
+[p3-d-failed-scrub1] ERROR: there are 1 uncorrectable errors
+```
+
+(3/3 identical; `scrub rc=3`). Stripe-cache eviction is N/A — RAID1 has no
+`stripe_cache_size` (GT-16); only `drop_caches` between runs.
+
+**(e) Timing — PROVEN.** Full-leg recovery of the 200 MiB member: 1.2–1.5 s in every
+run that did one ((b) and (c2), reproducible across three complete probe runs);
+`/proc/mdstat` speed ramps 0 → 203776 K/sec (≈199 MiB/s = md's default 200 MB/s
+sync throttle, not the loop devices). For the confirm gate's estimate: measured
+200 MiB legs land at ≈6–7.5 s/GiB with the ramp, floor ≈5.2 s/GiB at the throttle
+cap; the cap can be raised with `sync_speed_max` if a gate ever needs to. A full-array
+`mdadm --action=repair` runs 1.40–1.51 s with `sync_completed: none` (GT-18's
+no-recovery-target rule holds on RAID1).
+
+**(f) `mdadm --action=repair` on a mirror copies leg 0 blindly — PROVEN, both
+directions (the notification evidence).** Fresh rigs, bounded check first
+(`mismatch_cnt=128` each), repair, then both legs read:
+
+```
+rot on m0: [p4-0-blkA] m0 blk300: BAD sha=987155173e8d0462
+           [p4-0-blkB] m1 blk300: BAD sha=987155173e8d0462     ; coldread: EIO
+rot on m1: [p4-1-blkA] m0 blk300: MATCH sha=a6109fa891e1265b
+           [p4-1-blkB] m1 blk300: MATCH sha=a6109fa891e1265b   ; coldread: MATCH
+```
+
+With the rot on leg 0, the junk was propagated to leg 1 (the band now agrees on
+rotten data — the GT-18 "blessed rot" on a mirror); with the rot on leg 1, leg 0's
+good copy won. The winner is always leg 0, never "the good one". Post-repair
+`mismatch_cnt` still read 128 (the GT-18 stale-counter note; no re-check was run).
+
+**UNEXPECTED summary**
+
+1. **A scrub that sees a mirror band's rot can heal the whole band through md as a
+   side effect.** btrfs re-reads (md's read-balance then serves the good leg),
+   writes the good block back, and md propagates the write to BOTH legs:
+   `csum_errors: 1, corrected_errors: 1`, both legs MATCH afterwards. This is why
+   every multi-run scrub arm here re-injects a fresh rot before each run — without
+   that, later runs measure the array an earlier run healed (that exact mistake
+   invalidated the first probe run's (a) and (d) arms before the re-injection was
+   added).
+   It also means a btrfs scrub is ITSELF a repair verb for a RAID1 band whose legs
+   disagree — when md cooperates; the case where md serves the good leg every time
+   (scrub reports clean, rot persists on A) is the one the fail-one-leg order covers.
+2. **`--re-add` of a failed-but-present member is a silent no-op** — rc=0, "re-add …
+   succeed", `speed=0K/sec`, no resync, rot survives (and the post-re-add check found
+   `mismatch_cnt=1408` — more than the one rotted block's 128; extra units recorded
+   verbatim, unexplained). Only a removed member gets a real recovery.
+3. **`--re-add` of a removed member is refused** on a bitmap-less RAID1:
+   `mdadm: --re-add for /dev/loop1 to /dev/md127 is not possible` (rc=1) — `--add`
+   is the verb.
+4. **A degraded `check` cannot see leg rot**: with one leg failed, the bounded full
+   check read `mismatch_cnt=0` while a rotted block was being served — there is no
+   second copy to compare against. With both legs in, one rotted 4 KiB block counts
+   `128` (RAID5 counted 8, GT-18).
+
+**Verdict: PROVEN** for the fail-one-leg scrub as a repair mechanism, with the story's
+verbs corrected by ground truth: order 1 = `--fail` good leg → scrub (uncorrectable,
+names the file) → `--remove` → engine repair per block through md (lands on the
+surviving leg) → `--add` (never `--re-add`) → md's resync overwrites the re-added
+leg; order 2 = `--fail` bad leg → scrub clean → `--fail` + `--remove` + `--add` →
+resync copies the good leg over the rotten one. Every step is md-native; the
+degraded window is real and the confirm gate's estimate is ≈6–7.5 s/GiB of band at
+md's default sync throttle. `mdadm --action=repair` on a mirror is confirmed dangerous
+in both directions (copies leg 0 blindly) — the parity-only notification wording is
+justified.
 
 ## Drill notes (factual, no recommendations)
 
