@@ -210,19 +210,19 @@ case "$EVENT" in
     TITLE="md ${EVENT}: ${DEVICE}"
     if [ "$EVENT" = "RebuildFinished" ] && [ "$ACTION" = "check" ]; then
       TITLE="md check finished: ${DEVICE}"
-      MSG="The scheduled parity check (scrub) on ${DEVICE} finished its run window - this is routine, no disk was rebuilt. Long checks pause and resume in daily windows until the whole array has been read."
+      MSG="The scheduled parity check (scrub) on ${DEVICE} finished its run window. This is routine, no disk was rebuilt. Long checks pause and resume in daily windows until the whole array has been read."
       if [ -n "$MISMATCHES" ] && [ "$MISMATCHES" -gt 0 ] 2>/dev/null; then
         NOTIFY_SEV=warning
-        MSG="${MSG} md counted ${MISMATCHES} parity mismatch(es) during this check - the periodic scrub's phase 2 checks every file's checksum and will name any affected file; run Scrub now if you do not want to wait."
+        MSG="${MSG} md counted ${MISMATCHES} parity mismatch(es) during this check. The periodic scrub's phase 2 checks every file's checksum and will name any affected file. Run Scrub now if you do not want to wait."
       elif [ "$MISMATCHES" = "0" ]; then
         MSG="${MSG} No parity mismatches were counted."
       fi
     elif [ "$EVENT" = "RebuildFinished" ]; then
       if [ -n "$BADBLOCKS" ] && [ "$BADBLOCKS" -gt 0 ] 2>/dev/null; then
         NOTIFY_SEV=warning
-        MSG="${MSG}. ${BADBLOCKS} unreadable sector range(s) are recorded on the array's members - data in those ranges could not be reconstructed during the rebuild. The periodic scrub's phase 2 checks every file's checksum and will name any affected file; run Scrub now if you do not want to wait."
+        MSG="${MSG}. ${BADBLOCKS} unreadable sector range(s) are recorded on the array's members. Data in those ranges could not be reconstructed during the rebuild. The periodic scrub's phase 2 checks every file's checksum and will name any affected file. Run Scrub now if you do not want to wait."
       elif [ "$BADBLOCKS" = "0" ]; then
-        MSG="${MSG}. No unreadable sectors were recorded - the rebuild reconstructed everything exactly. As a precaution, a Scrub will verify all data checksums."
+        MSG="${MSG}. No unreadable sectors were recorded. The rebuild reconstructed everything exactly. As a precaution, a Scrub will verify all data checksums."
       else
         MSG="${MSG}. As a precaution, run a Scrub on this pool to verify all data checksums."
       fi

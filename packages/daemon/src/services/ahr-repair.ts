@@ -66,7 +66,7 @@ export interface AhrRepairOptions {
 const NOTIFY_FILE_LIMIT = 20
 
 /** Above-md wording — an implication, never a certainty (GT-5/GT-6). */
-const ABOVE_MD_SENTENCE = 'parity already agreed with the bad data — this implicates something '
+const ABOVE_MD_SENTENCE = 'parity already agreed with the bad data. This implicates something '
   + 'other than the disks (memory, controller, software)'
 
 /**
@@ -83,11 +83,11 @@ const ABOVE_MD_SENTENCE = 'parity already agreed with the bad data — this impl
  *    here would overwrite data whose corruption was never confirmed.
  */
 const RESTORE_FILE_SENTENCE = 'restore this file from backup'
-const CSUM_UNREADABLE_SENTENCE = 'the file\'s checksum could not be read reliably; '
-  + 're-scrub after the metadata is repaired — a btrfs scrub repairs metadata copies'
+const CSUM_UNREADABLE_SENTENCE = 'the file\'s checksum could not be read reliably. '
+  + 'Re-scrub after the metadata is repaired. A btrfs scrub repairs metadata copies'
 
 function lunRestoreSentence(held: IscsiHeldByLun): string {
-  return `this block backs iSCSI LUN ${held.targetIqn}/${held.index} — restore the LUN image `
+  return `this block backs iSCSI LUN ${held.targetIqn}/${held.index}. Restore the LUN image `
     + `from a PBS backup (Backup → Restore as new LUN) or the guest's own backup`
 }
 
@@ -118,7 +118,7 @@ function csumUnreadableLunSentence(held: IscsiHeldByLun): string {
  * so it gets its own count and its own sentence.
  */
 const MAPPING_ABORT_SENTENCE = 'Blocks reported "not corrupt here" were left alone: the bytes on '
-  + 'the member still pass their stored checksum, so there was nothing to reconstruct — either '
+  + 'the member still pass their stored checksum, so there was nothing to reconstruct. Either '
   + 'the block was already repaired or the finding no longer describes it. Nothing was written, '
   + 'and they need no restore.'
 
@@ -137,19 +137,19 @@ const MAPPING_ABORT_SENTENCE = 'Blocks reported "not corrupt here" were left alo
  * examinable, never a promise that it is fine.
  */
 const NOT_EXAMINED_ADVICE: Record<string, string> = {
-  'inline-extent': 'the file is rewritten so its tail no longer lives in the metadata tree — an inline extent has no on-disk location to read, arbitrate or write',
-  'hole': 'the range has been written — a hole has nothing on disk, and every LUN image ANAS creates is sparse, so a hole says nothing about the LUN\'s data',
-  'owner-scan-truncated': 'the extent has fewer references — the back-reference scan hit its bound, so what it found is a prefix and not this file\'s extents in that stripe',
-  'band-unreadable': 'the band\'s md geometry can be read again — the array was not answering when the lookup ran',
-  'unresolvable': 'the mapping and the array agree again — nothing about this block was established',
-  'inode-changed': 'a fresh scrub has named the file that is at this path now — the file the finding describes is not the file there',
+  'inline-extent': 'the file is rewritten so its tail is no longer stored in the metadata tree. An inline extent has no on-disk location to read, arbitrate or write',
+  'hole': 'the range has been written. A hole has nothing on disk, and every LUN image ANAS creates is sparse, so a hole says nothing about the LUN\'s data',
+  'owner-scan-truncated': 'the extent has fewer references: the back-reference scan hit its bound, so it lists only part of this file\'s extents in that stripe',
+  'band-unreadable': 'the band\'s md geometry can be read again: the array was not answering when the lookup ran',
+  'unresolvable': 'the mapping and the array agree again. Nothing about this block was established',
+  'inode-changed': 'a fresh scrub has named the file that is at this path now. The file the finding describes is not the file at that path',
 }
 
 /** The not-examined bucket's sentence for one block, with its own reason. */
 function notExaminedSentence(reasonCode: string | undefined, reason: string): string {
   const advice = (reasonCode && NOT_EXAMINED_ADVICE[reasonCode]) ?? NOT_EXAMINED_ADVICE.unresolvable
-  return `this block could not be examined: ${reasonCode ?? 'unresolvable'} — ${reason} `
-    + `Nothing was written, and nothing is known about this file's bytes; re-scrub after ${advice}.`
+  return `this block could not be examined: ${reasonCode ?? 'unresolvable'} (${reason}). `
+    + `Nothing was written, and nothing is known about this file's bytes. Re-scrub after ${advice}.`
 }
 
 function errorText(error: unknown): string {
@@ -175,7 +175,7 @@ function fileLine(file: AhrRepairFileOutcome): string {
   const parts: string[] = []
   for (const [outcome, n] of counts)
     parts.push(`${n} ${outcome}`)
-  return `  ${file.path} — ${parts.join(', ')}`
+  return `  ${file.path}: ${parts.join(', ')}`
 }
 
 /**
@@ -205,11 +205,11 @@ function repairBody(
   // was fine all along.
   if (result.unrepairable > 0) {
     const advice = unrepairableFiles.slice(0, NOTIFY_FILE_LIMIT)
-      .map(f => `  ${f.path} — ${f.advice}`)
+      .map(f => `  ${f.path}: ${f.advice}`)
     if (unrepairableFiles.length > NOTIFY_FILE_LIMIT)
       advice.push(`  …and ${unrepairableFiles.length - NOTIFY_FILE_LIMIT} more`)
-    tail.push('Unrepairable blocks have no source of truth left below the checksum tree'
-      + ` — what to restore, per file:\n${advice.join('\n')}`)
+    tail.push('Unrepairable blocks have no source of truth left below the checksum tree. '
+      + `What to restore, per file:\n${advice.join('\n')}`)
   }
   if (result.mappingAbort > 0)
     tail.push(MAPPING_ABORT_SENTENCE)
@@ -217,11 +217,11 @@ function repairBody(
   // (seventh pass, F3): "nothing was written" is all these blocks share, and
   // the reason is the only thing that says what a re-scrub would need.
   if (result.notExamined > 0) {
-    const advice = notExaminedFiles.slice(0, NOTIFY_FILE_LIMIT).map(f => `  ${f.path} — ${f.advice}`)
+    const advice = notExaminedFiles.slice(0, NOTIFY_FILE_LIMIT).map(f => `  ${f.path}: ${f.advice}`)
     if (notExaminedFiles.length > NOTIFY_FILE_LIMIT)
       advice.push(`  …and ${notExaminedFiles.length - NOTIFY_FILE_LIMIT} more`)
-    tail.push('Blocks that could not be EXAMINED were not written, and nothing is known about their'
-      + ` bytes — this is neither a clean bill of health nor a reason to restore:\n${advice.join('\n')}`)
+    tail.push('Blocks that could not be EXAMINED were not written, and nothing is known about their bytes. '
+      + `This is neither a clean bill of health nor a reason to restore:\n${advice.join('\n')}`)
   }
   if (result.aboveMd > 0)
     tail.push(`Blocks diagnosed above md were not written: ${ABOVE_MD_SENTENCE}.`)
@@ -231,10 +231,10 @@ function repairBody(
   // scrub to rediscover a residual this run already measured.
   if (result.parityResiduals.length > 0) {
     const bands = result.parityResiduals
-      .map(r => `  ${r.band} (${r.array}) — mismatch_cnt ${r.mismatchCnt}`)
+      .map(r => `  ${r.band} (${r.array}): mismatch_cnt ${r.mismatchCnt}`)
     tail.push('Blocks were repaired and PROVEN against their stored checksum, and md still counts'
-      + ' mismatching stripes on their band: the data is right and the parity (or Q) member is what'
-      + ` disagrees. Run Rewrite parity on:\n${bands.join('\n')}`)
+      + ' mismatching stripes on their band. The data is right, and the parity (or Q) member is'
+      + ` what disagrees. Run Rewrite parity on:\n${bands.join('\n')}`)
   }
   return [`${head}\n\nFiles:\n${lines.join('\n')}`, ...tail].join('\n\n')
 }

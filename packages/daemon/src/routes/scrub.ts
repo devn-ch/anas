@@ -205,7 +205,7 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
         error: {
           code: 'CONFLICT',
           reason: 'foreign-unit',
-          message: `an anas-scrub unit without an X-ANAS-Schedule marker exists in ${systemdDir} — not an ANAS unit; the periodic scrub toggle will not change it`,
+          message: `an anas-scrub unit without an X-ANAS-Schedule marker exists in ${systemdDir}. It is not an ANAS unit, so the periodic scrub toggle will not change it`,
         },
       }
     }

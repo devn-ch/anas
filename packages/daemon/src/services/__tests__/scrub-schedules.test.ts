@@ -167,7 +167,7 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
         mdKernelNames: ['md127', 'md126', 'md9'],
         ahrKernelNames: ['md127', 'md126'],
       })
-      assert.match(st.note ?? '', /double parity check — mdcheck is on/)
+      assert.match(st.note ?? '', /double parity check: mdcheck is on/)
       assert.match(st.note ?? '', /md9 is not an ANAS pool and is not scrubbed by ANAS/)
 
       // With mdcheck off and no foreign arrays, the mechanism sentence stands.
@@ -201,12 +201,12 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
       // ANAS puts it back when the last pool's scrub goes off — a rule, not a
       // claim about this node's history.
       assert.match(st.note ?? '', /the distro default, and what ANAS puts back when the last pool's periodic scrub is turned off/)
-      assert.match(st.note ?? '', /enabling ANAS periodic scrub takes it over \(md parity \+ btrfs checksums, two phases\)/)
+      assert.match(st.note ?? '', /Enabling ANAS periodic scrub takes it over \(md parity \+ btrfs checksums, two phases\)/)
       assert.doesNotMatch(st.note ?? '', /double parity check/)
       assert.doesNotMatch(st.note ?? '', /adopted/)
 
       // Both on is the true double — unchanged wording.
-      assert.equal(ahrScrubNote(true, [], true), 'double parity check — mdcheck is on')
+      assert.equal(ahrScrubNote(true, [], true), 'double parity check: mdcheck is on')
       // Timer off + mdcheck on names the legacy state; pure note function.
       assert.match(ahrScrubNote(true, [], false), /takes it over/)
       assert.equal(ahrScrubNote(false, [], false), 'one node-level timer scrubs the enabled AHR pools sequentially (phase 1 md parity, then phase 2 btrfs checksums)')

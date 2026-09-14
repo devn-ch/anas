@@ -331,7 +331,7 @@ async function cancelBandCheck(
     // Nothing to read `sync_action` from, so nothing can be proven about what
     // md is doing — and an unprovable `idle` is exactly the write that aborts
     // a rebuild. Leave it, and say the check may still be armed.
-    return `could not drop this scrub's check on ${label} — ${device} does not resolve to a kernel device, so what md is running there cannot be read; nothing was written and the check may still run beside a later band's`
+    return `could not drop this scrub's check on ${label}. ${device} does not resolve to a kernel device, so what md is running there cannot be read. Nothing was written, and the check may still run beside a later band's check`
   }
 
   const own = await ownsSyncOp(kernelName, () => syncAction(executor, kernelName))
@@ -340,16 +340,16 @@ async function cancelBandCheck(
     // no-op here — and an array that is frozen is one md may be about to do
     // something of its own on. Say plainly that the check may still be armed.
     retireCheckIssued(kernelName)
-    return `could not drop this scrub's check on ${label} — md refuses idle on a frozen array, so the check may still run when it thaws`
+    return `could not drop this scrub's check on ${label}. md refuses idle on a frozen array, so the check may still run when it thaws`
   }
   if (own.foreign) {
     retireCheckIssued(kernelName)
-    return `left ${label} alone — ${foreignOpNote(label, own.action)}; this scrub's check on ${label} was not dropped, because ending md's own operation would abort it`
+    return `left ${label} alone: ${foreignOpNote(label, own.action)}. This scrub's check on ${label} was not dropped, because ending md's own operation would abort it`
   }
   if (!own.owned) {
     // Already idle: md is running nothing, so there is nothing to take back.
     retireCheckIssued(kernelName)
-    return `this scrub's check on ${label} is no longer running — nothing to drop`
+    return `this scrub's check on ${label} is no longer running. Nothing to drop`
   }
 
   let failure: string | null = null
@@ -367,11 +367,11 @@ async function cancelBandCheck(
     // bounce — say plainly that the check may still be armed when it thaws.
     return failure === null
       ? `asked md to drop this scrub's check on ${label}`
-      : `could not drop this scrub's check on ${label} (${failure}) — md refuses idle on a frozen array, so the check may still run when it thaws`
+      : `could not drop this scrub's check on ${label} (${failure}). md refuses idle on a frozen array, so the check may still run when it thaws`
   }
   return failure === null
-    ? `dropped this scrub's check on ${label} so it cannot run beside the next band's`
-    : `could not drop this scrub's check on ${label} (${failure}) — it may still run beside a later band's`
+    ? `dropped this scrub's check on ${label} so it cannot run beside the next band's check`
+    : `could not drop this scrub's check on ${label} (${failure}). The check may still run beside a later band's check`
 }
 
 /**
@@ -1136,13 +1136,13 @@ export async function attributeScrub(
 /** The notification body: the summary sentence, then the files it is about. */
 function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult): string {
   const head = `btrfs scrub on pool '${pool.name}' reported: ${btrfsErrors}. `
-    + `Latent corruption was surfaced — check 'btrfs scrub status ${pool.mountpoint}' and the pool's disks.`
+    + `Latent corruption was found. Check 'btrfs scrub status ${pool.mountpoint}' and the pool's disks.`
   const findings = result.findings ?? []
   if (findings.length === 0) {
     // Errors with nothing to name: rate-limited kernel warnings, or errors the
     // kernel never attached a path to. Say which, rather than print an empty list.
     const unattributed = result.unattributed
-      ? `\n\n${result.unattributed} error(s) name no file (read/IO or metadata errors) — no per-file attribution.`
+      ? `\n\n${result.unattributed} error(s) name no file (read/IO or metadata errors). No per-file attribution is possible.`
       : ''
     return `${head}${unattributed}${skippedSection(result.bandsSkipped)}`
   }
@@ -1163,14 +1163,14 @@ function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult
     const unverified = f.probedUnverified && !f.unidentified
       ? ` (search window unverified: ${f.reason ?? 'no reason recorded'})`
       : ''
-    return `  ${f.path} — ${blocks}${unverified}`
+    return `  ${f.path}: ${blocks}${unverified}`
   })
   if (findings.length > NOTIFY_PATH_LIMIT)
     lines.push(`  …and ${findings.length - NOTIFY_PATH_LIMIT} more`)
   const counts = [
     `${result.errorsAttributed ?? 0} of ${result.errorsReported ?? 0} reported error(s) attributed`,
     ...(result.unattributed ? [`${result.unattributed} naming no file`] : []),
-    ...(result.truncated ? [`the list is incomplete — the ${AHR_SCRUB_FINDINGS_CAP}-file cap or the kernel-journal read cap was reached`] : []),
+    ...(result.truncated ? [`the list is incomplete: the ${AHR_SCRUB_FINDINGS_CAP}-file cap or the kernel-journal read cap was reached`] : []),
   ].join(', ')
   return `${head}\n\nAffected files (${counts}):\n${lines.join('\n')}${skippedSection(result.bandsSkipped)}`
 }
@@ -1210,24 +1210,22 @@ function parityTitle(parity: { band: string }[]): string {
 function parityBody(pool: AhrPool, parity: { band: string, mismatchCnt: number }[], dataClean: boolean): string {
   const bands = parity.map(p => `${p.band} (${p.mismatchCnt})`).join(', ')
   if (dataClean) {
-    return `Parity mismatch on ${bands}, but the checksum scrub found no corrupt files — every file's checksum passes. `
-      + `The rot is in the PARITY (or Q) member of the band, not in the data. `
+    return `Parity mismatch on ${bands}, but the checksum scrub found no corrupt files. Every file's checksum passes, `
+      + `so the rot is in the PARITY (or Q) member of the band. `
       + `Rewrite it from the pool's Scrubs row: Scrubs → parity mismatch → Rewrite parity (a fresh checksum scrub runs first, and any finding aborts the run before md is touched). `
-      + `Until that runs, at the next disk failure in this band md would reconstruct from the wrong parity. `
-      + `See docs/AHR-DESIGN.md §7.2 (parity-only rot).`
+      + `Until that runs, at the next disk failure in this band md would reconstruct from the wrong parity.`
   }
   return `Parity mismatch on ${bands}. The checksum scrub reported errors but named no file, so this scrub cannot tell whether the rot is in parity or in data. `
     + `Do the data first: repair from parity any file a scrub names (Scrubs → the pool's findings), then scrub pool '${pool.name}' again and see what the second run says. `
-    + `Rewrite parity is refused while a finding stands — md recomputes parity from the data as it is, so running it over rot would make that rot permanent and invisible. `
-    + `At the next disk failure in this band, md would reconstruct from parity nothing has proven right. `
-    + `See docs/AHR-DESIGN.md §7.2 (parity-only rot).`
+    + `Rewrite parity is refused while a finding stands. md recomputes parity from the data as it is, so running it over rot would make that rot permanent and invisible. `
+    + `At the next disk failure in this band, md would reconstruct from parity nothing has proven right.`
 }
 
 /** The skipped-bands notification body (D8): what was not looked at, and why. */
 function skippedBody(skipped: { band: string, reason: string }[]): string {
   return `The scrub did not check every band of the pool:\n${
     skipped.map(s => `  ${s.band} was not checked: ${s.reason}`).join('\n')
-  }\nThe unchecked band has no verdict from this scrub — run Scrub again once the cause has passed.`
+  }\nThe unchecked bands have no verdict from this scrub. Run Scrub again once the cause has passed.`
 }
 
 /** One btrfs scrub pass over a filesystem — the scrub's phase 2, on its own. */
@@ -1293,7 +1291,7 @@ export async function scrubAhrPool(
   const interval = opts?.pollIntervalMs ?? AHR_SCRUB_POLL_MS
   const mismatchDelay = opts?.mismatchDelayMs ?? AHR_SCRUB_MISMATCH_DELAY_MS
   if (!pool.mounted)
-    throw new Error(`pool '${name}' is not mounted — btrfs scrub needs the filesystem online`)
+    throw new Error(`pool '${name}' is not mounted. btrfs scrub needs the filesystem online`)
 
   // --- Phase 1/2: md parity checks, one band at a time (sequenced, §4) --------
   // Band-ascending order without copying the pool's array list.
@@ -1361,7 +1359,7 @@ export async function scrubAhrPool(
         // is doing immediately before issuing, per band.
         const busy = await syncAction(executor, kernelName)
         if (!isIdleAction(busy)) {
-          updateProgress(`${label} was not checked (md is running ${busy}) — a parity check would fight the operation md is already running on that band`)
+          updateProgress(`${label} was not checked. md is running ${busy} on that band, and a parity check would fight it`)
           bandsSkipped.push({ band: label, reason: `md was running '${busy}' when this band's turn came` })
           continue
         }
@@ -1375,10 +1373,10 @@ export async function scrubAhrPool(
         if ((syncMax !== null && syncMax !== MD_DEFAULT_SYNC_MAX) || (syncMin !== null && syncMin !== MD_DEFAULT_SYNC_MIN)) {
           const widened = await restoreSyncWindow(kernelName)
           if (widened) {
-            updateProgress(`${label}: sync window was bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} (an interrupted repair left it there) — restored to ${MD_DEFAULT_SYNC_MIN}..${MD_DEFAULT_SYNC_MAX} before issuing the check`)
+            updateProgress(`${label}: sync window was bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} (an interrupted repair left it there). It was restored to ${MD_DEFAULT_SYNC_MIN}..${MD_DEFAULT_SYNC_MAX} before issuing the check`)
           }
           else {
-            updateProgress(`${label} was not checked — its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored, so a check would cover that sliver of the band and suspend there`)
+            updateProgress(`${label} was not checked. Its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored, so a check would cover that sliver of the band and suspend there`)
             bandsSkipped.push({ band: label, reason: `its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored` })
             continue
           }
@@ -1408,7 +1406,7 @@ export async function scrubAhrPool(
         // name there is no `sync_action` to prove the check is still what md is
         // running, and an unprovable `idle` is the write that aborts a rebuild.
         updateProgress(await cancelBandCheck(executor, array.device, null, label, null))
-        updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
+        updateProgress(`Cannot resolve ${array.device} to a kernel device. Not waiting on its check`)
         bandsSkipped.push({ band: label, reason: 'the md device could not be resolved to a kernel name' })
         continue
       }
@@ -1473,7 +1471,7 @@ export async function scrubAhrPool(
             updateProgress(
               `md check on ${label} finished before the first poll`
               + `${priorAction !== null && priorAction !== 'check' ? ` (md was last running '${priorAction}')` : ''}`
-              + ` — its counter moved from ${priorMismatch} to ${nowMismatch}`,
+              + `. Its counter moved from ${priorMismatch} to ${nowMismatch}`,
             )
           }
           else {
@@ -1494,10 +1492,10 @@ export async function scrubAhrPool(
         // did not run to the end.
         updateProgress(
           !checkStateUnknown
-            ? `md never started the check on ${label} — this band was not checked (its mismatch_cnt belongs to an earlier check)`
+            ? `md never started the check on ${label}. This band was not checked, and its mismatch_cnt read belongs to an earlier check`
             : priorAction !== 'check'
-              ? `check state unknown on ${label} — not counted (md took a check and is idle again, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing says the check ran to the end)`
-              : `check state unknown on ${label} — not counted (md is idle and last ran a check, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing tells this scrub's check from an earlier one)`,
+              ? `check state unknown on ${label}. Not counted. md took a check and is idle again, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing says the check ran to the end`
+              : `check state unknown on ${label}. Not counted. md is idle and last ran a check, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing tells this scrub's check from an earlier one`,
         )
         // The skip rides the result (D8): the band reads as "not checked", with
         // the same why the progress line just gave the operator.
@@ -1505,7 +1503,7 @@ export async function scrubAhrPool(
           band: label,
           reason: !checkStateUnknown
             ? 'md never started the check'
-            : 'check state unknown — nothing proves md ran the check to the end',
+            : 'check state unknown: nothing proves md ran the check to the end',
         })
         continue
       }
@@ -1543,17 +1541,17 @@ export async function scrubAhrPool(
           if (action !== null && !isIdleAction(action) && action !== 'check') {
             // No counter read: whatever `mismatch_cnt` holds is not this band's
             // check verdict, and a resync/recover/reshape overwrites it anyway.
-            updateProgress(`${label} was not checked (sync_action=${action}) — md is not running this scrub's check on that band`)
+            updateProgress(`${label} was not checked (sync_action=${action}). md is not running this scrub's check on that band`)
             checked = false
             abandonedOn = action
             skippedReason = `md was running '${action}' instead of this scrub's check`
             break
           }
           if (Date.now() >= finishDeadline) {
-            updateProgress(`${label} was not checked (sync_action=${action ?? 'unreadable'}) — still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling; not waiting on it any longer`)
+            updateProgress(`${label} was not checked (sync_action=${action ?? 'unreadable'}). Still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling. Not waiting on it any longer`)
             checked = false
             abandonedOn = action
-            skippedReason = `still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling — the check may still be running`
+            skippedReason = `still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling: the check may still be running`
             break
           }
           updateProgress(`md check on ${label}${md?.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
@@ -1591,7 +1589,7 @@ export async function scrubAhrPool(
       // and no finding. Counting it as coverage is the same false assurance D8
       // closed for the bands that were never checked at all.
       if (mismatches === null) {
-        updateProgress(`${label} was checked, but its mismatch_cnt could not be read — this band has no verdict from this scrub`)
+        updateProgress(`${label} was checked, but its mismatch_cnt could not be read. This band has no verdict from this scrub`)
         bandsSkipped.push({ band: label, reason: 'checked, but its mismatch_cnt could not be read' })
         continue
       }
@@ -1606,8 +1604,8 @@ export async function scrubAhrPool(
           executor,
           'warning',
           `AHR scrub: parity mismatch on ${label}`,
-          `rot exists in ${label} — phase 2 (running now) checks every file's checksum; `
-          + `if a file is affected, it will be named`,
+          `rot exists in ${label}. Phase 2 is running now and checks every file's checksum. `
+          + `If a file is affected, it will be named`,
         )
       }
     }

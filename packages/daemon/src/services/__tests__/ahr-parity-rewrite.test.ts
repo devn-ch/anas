@@ -242,7 +242,7 @@ describe('rewriteBandParity — the sequence', () => {
 
     assert.equal(result.outcome, 'refused')
     assert.equal(result.reasonCode, 'data-corruption-found')
-    assert.ok(result.reason?.startsWith('refused: data corruption found; repair data first (selfheal.6)'), result.reason)
+    assert.ok(result.reason?.startsWith('refused: data corruption found. Repair the data first.'), result.reason)
     assert.equal(result.btrfsErrors, 'csum_errors=3')
     assert.deepEqual(result.findings?.map(f => f.path), ['/mnt/tank/f1.bin'], 'the files are named in the result')
     assert.deepEqual(md.actions(), [], 'md was never asked to repair anything')
@@ -570,7 +570,7 @@ describe('rewrite parity — a member with recorded bad blocks (F8)', () => {
     assert.equal(result.outcome, 'refused')
     assert.equal(result.reasonCode, 'bad-blocks-present')
     assert.ok(result.reason?.includes('recorded bad blocks'), result.reason)
-    assert.ok(result.reason?.includes('replace the member first'), result.reason)
+    assert.ok(result.reason?.includes('Replace the member first'), result.reason)
     assert.deepEqual(md.actions(), [], 'no repair and no check were issued')
   })
 

@@ -196,14 +196,14 @@ export function parityRewriteWarnings(
   // cannot report them says so rather than quoting a number it does not have.
   const scrub = poolUsedBytes !== null && poolUsedBytes > 0
     ? `after a full checksum scrub of the pool (${gib(poolUsedBytes)} of data, ≈${approximateDuration(poolUsedBytes / PARITY_REWRITE_RATE_BYTES_S)}, usually the dominant term)`
-    : 'after a full checksum scrub of the pool, whose duration this node could not estimate — on a pool with real data in it that pass is usually the dominant term'
+    : 'after a full checksum scrub of the pool, whose duration this node could not estimate. On a pool with real data in it, that pass is usually the dominant term'
   return [
-    `Parity on band r${array.band} is recomputed from the data AS IT IS NOW — md counts mismatching stripes, it never says which member is wrong, so whatever the data members hold becomes the truth for this band`,
+    `Parity on band r${array.band} is recomputed from the data AS IT IS NOW. md counts mismatching stripes, and it does not say which member is wrong. Whatever the data members hold becomes the truth for this band`,
     `A fresh btrfs scrub of the whole pool runs FIRST and any finding aborts the run before md is touched: data rot has to be repaired (Repair from parity) before parity is rewritten, because md repair would make that rot permanent and invisible`,
-    `Files WITHOUT checksums are not protected — a hand-set NOCOW (chattr +C) file or a preallocated range has no checksum to prove it right, so rot inside one would be blessed by this run. ANAS creates neither, and cannot see into one it did not create`,
-    `The run reads every member of band r${array.band} twice — the repair pass, then a verifying check: ${gib(array.heightBytes)} per member each time across ${array.members} member(s), about ${approximateDuration(perPass)} per pass (~${approximateDuration(perPass * 2)} in total), ${scrub}. All of it assumes a deliberately conservative 60 MiB/s per member; real disks are usually faster, and the pool stays usable throughout, slower`,
+    `Files WITHOUT checksums are not protected. A hand-set NOCOW (chattr +C) file or a preallocated range has no checksum to prove it right, so rot inside it would be blessed by this run. ANAS creates neither, and cannot see into one it did not create`,
+    `The run reads every member of band r${array.band} twice: the repair pass, then a verifying check. ${gib(array.heightBytes)} per member each time across ${array.members} member(s), about ${approximateDuration(perPass)} per pass (~${approximateDuration(perPass * 2)} in total), ${scrub}. All of it assumes a deliberately conservative 60 MiB/s per member, so real disks usually finish the run sooner. The pool stays usable throughout, but it will be slower while the run is on`,
     `Nothing else is touched: no file is written, no other band of pool '${poolName}' is read, and no md knob is left changed`,
-    `This is never automatic — nothing in ANAS rewrites parity unless an operator asks for this band, with this proof in hand`,
+    `This is never automatic. ANAS rewrites parity only when an operator asks for this band, with this proof in hand`,
   ]
 }
 
@@ -294,7 +294,7 @@ export function parityRewriteEvidence(
     return {
       ok: false,
       code: 'no-parity-mismatch',
-      reason: `no completed scrub of AHR pool '${poolName}' is on record — a parity rewrite stands entirely on the last two-phase scrub (band r${band} counted mismatches, the checksum pass found nothing). Scrub the pool first. The record is in-memory, so a daemon restart also clears it`,
+      reason: `no completed scrub of AHR pool '${poolName}' is on record. A parity rewrite stands entirely on the last two-phase scrub (band r${band} counted mismatches, the checksum pass found nothing). Scrub the pool first. The record is in-memory, so a daemon restart also clears it`,
     }
   }
   const evidence = ScrubEvidenceShape.safeParse(job.result)
@@ -302,14 +302,14 @@ export function parityRewriteEvidence(
     return {
       ok: false,
       code: 'no-parity-mismatch',
-      reason: `the last completed scrub of AHR pool '${poolName}' (job ${job.id}) did not report a result this verb can read`,
+      reason: `the last completed scrub of AHR pool '${poolName}' (job ${job.id}) did not report a result the parity rewrite can read`,
     }
   }
   if (evidence.data.btrfsErrors != null || (evidence.data.findings?.length ?? 0) > 0) {
     return {
       ok: false,
       code: 'data-findings-present',
-      reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) found data corruption${evidence.data.btrfsErrors ? `: ${evidence.data.btrfsErrors}` : ''} — repair those files from parity first. Rewriting parity now would recompute it from the corrupt data and make the rot permanent`,
+      reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) found data corruption${evidence.data.btrfsErrors ? `: ${evidence.data.btrfsErrors}` : ''}. Repair those files from parity first. Rewriting parity now would recompute it from the corrupt data and make the rot permanent`,
     }
   }
   const rows = scrubParityMismatches(job.result)
@@ -317,7 +317,7 @@ export function parityRewriteEvidence(
     return {
       ok: false,
       code: 'no-parity-mismatch',
-      reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) reports no per-band parity counts — scrub the pool again and rewrite parity from that run's findings`,
+      reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) reports no per-band parity counts. Scrub the pool again and rewrite parity from that run's findings`,
     }
   }
   const row = rows.find(r => r.bandIndex === band)
@@ -325,7 +325,7 @@ export function parityRewriteEvidence(
     return {
       ok: false,
       code: 'no-parity-mismatch',
-      reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) counted no parity mismatch on band r${band} — there is nothing here to rewrite`,
+      reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) counted no parity mismatch on band r${band}. There is nothing here to rewrite`,
     }
   }
   return { ok: true, mismatchCnt: row.mismatchCnt, jobId: job.id }
@@ -353,7 +353,7 @@ function repairEvidence(poolName: string, job: Job, band: number): ParityRewrite
     return {
       ok: false,
       code: 'no-parity-mismatch',
-      reason: `the last completed repair on AHR pool '${poolName}' (job ${job.id}) did not report a result this verb can read`,
+      reason: `the last completed repair on AHR pool '${poolName}' (job ${job.id}) did not report a result the parity rewrite can read`,
     }
   }
   const unrepaired = (parsed.data.unrepairable ?? 0) + (parsed.data.aboveMd ?? 0) + (parsed.data.notExamined ?? 0)
@@ -361,7 +361,7 @@ function repairEvidence(poolName: string, job: Job, band: number): ParityRewrite
     return {
       ok: false,
       code: 'data-findings-present',
-      reason: `the last repair on AHR pool '${poolName}' (job ${job.id}) left ${unrepaired} block(s) unrepaired, above md or unexamined — repair or restore those first. Rewriting parity now would recompute it from data this node cannot vouch for`,
+      reason: `the last repair on AHR pool '${poolName}' (job ${job.id}) left ${unrepaired} block(s) unrepaired, above md or unexamined. Repair or restore those first. Rewriting parity now would recompute it from data this node cannot vouch for`,
     }
   }
   const row = (parsed.data.parityResiduals ?? []).find(r => r.bandIndex === band)
@@ -369,7 +369,7 @@ function repairEvidence(poolName: string, job: Job, band: number): ParityRewrite
     return {
       ok: false,
       code: 'no-parity-mismatch',
-      reason: `the last repair on AHR pool '${poolName}' (job ${job.id}) recorded no leftover parity mismatch on band r${band} — there is nothing here to rewrite`,
+      reason: `the last repair on AHR pool '${poolName}' (job ${job.id}) recorded no leftover parity mismatch on band r${band}. There is nothing here to rewrite`,
     }
   }
   return { ok: true, mismatchCnt: row.mismatchCnt, jobId: job.id }
@@ -397,7 +397,7 @@ export interface ParityRewriteRefusal {
  * btrfs stored for it, and writes back only the leg that matches.
  */
 export function mirrorBandRefusal(device: string): string {
-  return `${device} is a RAID1 mirror band — there is no parity on it to rewrite. md's repair on a mirror copies the first in-sync leg over the others without looking at which one is right, so on a band whose legs disagree it overwrites the good copy half the time. A mirror mismatch is arbitrated by Repair from parity per block, never by md repair`
+  return `${device} is a RAID1 mirror band. It has no parity to rewrite. md's repair on a mirror copies the first in-sync leg over the others, and it cannot tell which leg is right. On a band whose legs disagree, it overwrites the good copy half the time. A mirror mismatch is arbitrated by Repair from parity per block, never by md repair`
 }
 
 /**
@@ -414,7 +414,7 @@ export function mirrorBandRefusal(device: string): string {
 export function badBlocksRefusal(geo: MdGeometry): string {
   const carriers = bandBadBlocks(geo)
   const named = carriers.map(c => `${c.device} (${c.ranges.length} range${c.ranges.length === 1 ? '' : 's'})`).join(', ')
-  return `${geo.device} has members with recorded bad blocks: ${named}. md cannot reconstruct from a member with recorded bad blocks — replace the member first. A whole-band repair would recompute this band's parity from rows md cannot read`
+  return `${geo.device} has members with recorded bad blocks: ${named}. md cannot reconstruct from a member with recorded bad blocks. Replace the member first. A whole-band repair would recompute this band's parity from rows md cannot read`
 }
 
 /** Why this band cannot be rewritten right now (precondition 2), or null. */
@@ -440,7 +440,7 @@ export async function parityRewriteArrayRefusal(geo: MdGeometry): Promise<Parity
   const max = await readMdAttrOrNull(geo.sys, 'sync_max')
   if ((max !== null && max !== MD_DEFAULT_SYNC_MAX) || (min !== null && min !== MD_DEFAULT_SYNC_MIN)) {
     return {
-      reason: `${geo.device}'s sync window is bounded to ${min ?? '?'}..${max ?? '?'} (an interrupted repair or check left it there) — a whole-band repair under it would cover only that sliver. A scrub of the pool restores the window`,
+      reason: `${geo.device}'s sync window is bounded to ${min ?? '?'}..${max ?? '?'} (an interrupted repair or check left it there). A whole-band repair under it would cover only that sliver. A scrub of the pool restores the window`,
       code: 'array-busy',
     }
   }
@@ -510,7 +510,7 @@ async function waitForOwnSyncOp(
     if (own.action !== expect)
       return { ended: false, foreign: foreignOpNote(label, own.action) }
     if (Date.now() >= finishDeadline)
-      throw new Error(`the md ${expect} on ${label} was still running after the ${Math.round((opts.finishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS) / 3600000)} h ceiling — not waiting on it any longer`)
+      throw new Error(`the md ${expect} on ${label} was still running after the ${Math.round((opts.finishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS) / 3600000)} h ceiling. Not waiting on it any longer`)
     const completed = await readMdAttrOrNull(geo.sys, 'sync_completed')
     opts.updateProgress?.(`md ${expect} on ${label}${completed ? ` (${completed.replace(WHITESPACE_RE, ' ')} sectors)` : ''}`)
     await sleep(poll)
@@ -584,7 +584,7 @@ export async function rewriteBandParity(
     return finish('refused', null, { reason: `AHR pool '${pool.name}' has no band r${band}`, reasonCode: 'no-such-band' })
 
   if (!pool.mounted)
-    return finish('refused', array.device, { reason: `AHR pool '${pool.name}' is not mounted — the fresh btrfs scrub this verb runs first needs the filesystem online`, reasonCode: 'pool-not-mounted' })
+    return finish('refused', array.device, { reason: `AHR pool '${pool.name}' is not mounted. The parity rewrite starts with a fresh btrfs scrub, which needs the filesystem online`, reasonCode: 'pool-not-mounted' })
 
   const label = `${pool.name}-r${band}`
 
@@ -608,7 +608,7 @@ export async function rewriteBandParity(
   // The evidence scrub can be hours old. md repair recomputes parity from the
   // data, so a finding that arrived since would be blessed by phase 2 — this is
   // the pass that makes "the data is intact" a statement about NOW.
-  progress(`phase 1/3: fresh btrfs checksum scrub of pool '${pool.name}' — any finding aborts before md is touched`)
+  progress(`phase 1/3: fresh btrfs checksum scrub of pool '${pool.name}'. Any finding aborts the run before md is touched`)
   const scrubStart = Date.now()
   const pass = await btrfsScrubPass(executor, pool.mountpoint, pool.name, progress, opts.pollIntervalMs ?? AHR_SCRUB_POLL_MS)
   state.scrubMs = Date.now() - scrubStart
@@ -622,13 +622,13 @@ export async function rewriteBandParity(
       progress(`the fresh scrub's errors could not be attributed to files: ${error instanceof Error ? error.message : String(error)}`)
     }
     return finish('refused', array.device, {
-      reason: `refused: data corruption found; repair data first (selfheal.6) — the fresh btrfs scrub of pool '${pool.name}' reported: ${pass.btrfsErrors}`,
+      reason: `refused: data corruption found. Repair the data first. The fresh btrfs scrub of pool '${pool.name}' reported: ${pass.btrfsErrors}`,
       reasonCode: 'data-corruption-found',
       btrfsErrors: pass.btrfsErrors,
       ...(findings ? { findings } : {}),
     })
   }
-  progress(`the fresh scrub of '${pool.name}' is clean — every file btrfs can vouch for is intact, so parity is what is wrong`)
+  progress(`the fresh scrub of '${pool.name}' is clean. The files btrfs holds checksums for all passed, so parity is what is wrong`)
 
   // --- The same preconditions, immediately before the md write --------------
   // A scrub takes hours on a real pool, and every one of these can have stopped
@@ -647,7 +647,7 @@ export async function rewriteBandParity(
       busyNow = { reason: preWrite, code: 'array-busy' }
   }
   if (busyNow)
-    return finish('refused', array.device, { reason: `${busyNow.reason} — nothing was written`, reasonCode: busyNow.code })
+    return finish('refused', array.device, { reason: `${busyNow.reason}. Nothing was written`, reasonCode: busyNow.code })
 
   // md zeroes `mismatch_cnt` when a sync op starts, so this read — taken with
   // the array idle, immediately before the repair — is the last completed
@@ -658,13 +658,13 @@ export async function rewriteBandParity(
 
   // --- Phase 2/3: md repair over the whole band ------------------------------
   const estimate = approximateDuration(array.heightBytes / PARITY_REWRITE_RATE_BYTES_S)
-  progress(`phase 2/3: mdadm --action=repair on ${label} (whole band, ${gib(array.heightBytes)} per member — roughly ${estimate})`)
+  progress(`phase 2/3: mdadm --action=repair on ${label} (whole band, ${gib(array.heightBytes)} per member, roughly ${estimate})`)
   const repairPrior = await lastSyncAction(executor, geo.kernel)
   const repairStart = Date.now()
   const issued = await executor.exec(MDADM, ['--action=repair', array.device])
   if (issued.exitCode !== 0) {
     return finish('refused', array.device, {
-      reason: `mdadm --action=repair on ${label} exited ${issued.exitCode}${issued.stderr.trim() ? `: ${issued.stderr.trim()}` : ''} — md did not take the repair, and nothing was written`,
+      reason: `mdadm --action=repair on ${label} exited ${issued.exitCode}${issued.stderr.trim() ? `: ${issued.stderr.trim()}` : ''}. md did not take the repair, and nothing was written`,
       reasonCode: 'array-busy',
     })
   }
@@ -672,7 +672,7 @@ export async function rewriteBandParity(
   state.repairMs = Date.now() - repairStart
   if (!repaired.ended) {
     return finish('refused', array.device, {
-      reason: `${repaired.foreign} — md replaced this run's repair with an operation of its own, so the rewrite is not proven and no knob was touched`,
+      reason: `${repaired.foreign}. md replaced this run's repair with an operation of its own, so the rewrite is not proven and no knob was touched`,
       reasonCode: 'foreign-sync-op',
     })
   }
@@ -688,13 +688,13 @@ export async function rewriteBandParity(
   // the members. This check covers the whole band, which is orders of magnitude
   // more stripes than the cache holds, and the repair that preceded it wrote
   // through the same cache — so cache and disk agree by construction.
-  progress(`phase 3/3: md check on ${label} (whole band) — proving the parity md just wrote`)
+  progress(`phase 3/3: md check on ${label} (whole band). Proving the parity md just wrote`)
   const checkPrior = await lastSyncAction(executor, geo.kernel)
   const checkStart = Date.now()
   const checkIssued = await executor.exec(MDADM, ['--action=check', array.device])
   if (checkIssued.exitCode !== 0) {
     return finish('still-mismatched', array.device, {
-      reason: `the repair ran, but mdadm --action=check on ${label} exited ${checkIssued.exitCode}${checkIssued.stderr.trim() ? `: ${checkIssued.stderr.trim()}` : ''} — the rewrite is unproven; scrub the pool to check it`,
+      reason: `the repair ran, but mdadm --action=check on ${label} exited ${checkIssued.exitCode}${checkIssued.stderr.trim() ? `: ${checkIssued.stderr.trim()}` : ''}. The rewrite is unproven. Scrub the pool to check it`,
     })
   }
   markCheckIssued(geo.kernel)
@@ -711,7 +711,7 @@ export async function rewriteBandParity(
   state.checkMs = Date.now() - checkStart
   if (!checked.ended) {
     return finish('still-mismatched', array.device, {
-      reason: `the repair ran, but ${checked.foreign} — the verifying check did not complete, so the rewrite is unproven`,
+      reason: `the repair ran, but ${checked.foreign}. The verifying check did not complete, so the rewrite is unproven`,
       reasonCode: 'foreign-sync-op',
     })
   }
@@ -720,12 +720,12 @@ export async function rewriteBandParity(
   state.mismatchAfter = await mismatchCount(executor, geo.kernel)
   if (state.mismatchAfter === null) {
     return finish('still-mismatched', array.device, {
-      reason: `the repair and the check both ran, but ${geo.device}'s mismatch_cnt could not be read — the rewrite is not proven`,
+      reason: `the repair and the check both ran, but ${geo.device}'s mismatch_cnt could not be read. The rewrite is not proven`,
     })
   }
   if (state.mismatchAfter > 0) {
     return finish('still-mismatched', array.device, {
-      reason: `${label} still counts ${state.mismatchAfter} mismatch(es) after the repair — parity was rewritten and the band did not come back clean. Scrub the pool and look at its disks before rewriting again`,
+      reason: `${label} still counts ${state.mismatchAfter} mismatch(es) after the repair. Parity was rewritten, and the band did not come back clean. Scrub the pool and look at its disks before rewriting again`,
     })
   }
   return finish('rewritten', array.device)

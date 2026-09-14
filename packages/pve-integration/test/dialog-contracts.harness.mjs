@@ -7004,7 +7004,7 @@ const SCRUB_STATES = {
     // selfheal.4 — the AHR periodic scrub is the node-level ANAS timer running
     // the WHOLE two-phase scrub: phases in the state, nextRun when on.
     { target: { kind: 'ahr', pool: 'ahr0' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'one node-level timer scrubs the enabled AHR pools sequentially (phase 1 md parity, then phase 2 btrfs checksums)', lastScrub: null, running: null },
-    { target: { kind: 'ahr', pool: 'ahr1' }, enabled: false, cadence: 'quarterly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'double parity check — mdcheck is on', lastScrub: null, running: null },
+    { target: { kind: 'ahr', pool: 'ahr1' }, enabled: false, cadence: 'quarterly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'double parity check: mdcheck is on', lastScrub: null, running: null },
     // review cut-but-verified — ahr2's newest scrub was CLEAN (a later clean
     // pass displaces an older one's findings); its note is the LEGACY mdcheck
     // wording (review R8).
@@ -7403,7 +7403,7 @@ async function rewriteParityChecks() {
   ok('rewrite: …and the band NUMBER the request names, carried not parsed',
     !!pGrid && pGrid.getStore().getAt(0).get('bandIndex') === 1)
   ok('rewrite: the head says the data is right and the parity is what is wrong',
-    /the data is right and the parity is what is wrong/.test((win.items.getAt(0) || {}).html || ''),
+    /the data is right, and the parity is what is wrong/.test((win.items.getAt(0) || {}).html || ''),
     (win.items.getAt(0) || {}).html)
 
   // --- enablement -----------------------------------------------------------
@@ -7547,7 +7547,7 @@ async function rewriteParityRefusedChecks() {
   await settle()
   ok('rewrite: …but the verb stays dark with a band ticked', btn.disabled === true)
   ok('rewrite: …and the reason is the one the daemon would 409 with',
-    /repair those from parity first/.test(btn.tooltip || '')
+    /Repair those from parity first/.test(btn.tooltip || '')
       && /make the rot permanent/.test(btn.tooltip || ''), btn.tooltip)
   ok('rewrite: the head says the same thing, before the operator reaches the button',
     /Repair those from parity first/.test((win.items.getAt(0) || {}).html || ''),
@@ -7597,7 +7597,7 @@ async function rewriteParityMirrorChecks() {
   // instead is what the operator must not do.
   ok('rewrite: …it says there is no parity to rewrite, and names no verb the operator cannot reach',
     /no parity to rewrite/.test(cell)
-      && /not yet repairable from ANAS \(selfheal\.11\)/.test(cell)
+      && /not yet repairable from ANAS/.test(cell)
       && /do not run md repair on a mirror/.test(cell)
       && !/Repair from parity/.test(cell), cell)
 
@@ -7611,7 +7611,7 @@ async function rewriteParityMirrorChecks() {
       && /RAID1 mirror bands/.test((win.items.getAt(0) || {}).html || ''),
     (win.items.getAt(0) || {}).html)
   ok('rewrite: …and it names no verb the operator cannot reach either (F1)',
-    /not yet repairable from ANAS \(selfheal\.11\)/.test((win.items.getAt(0) || {}).html || '')
+    /not yet repairable from ANAS/.test((win.items.getAt(0) || {}).html || '')
       && !/Repair from parity/.test((win.items.getAt(0) || {}).html || ''),
     (win.items.getAt(0) || {}).html)
 
@@ -7623,7 +7623,7 @@ async function rewriteParityMirrorChecks() {
   ok('rewrite: a ticked mirror band leaves the verb dark', btn.disabled === true)
   ok('rewrite: …with the reason the daemon would 409 with',
     /no parity to rewrite/.test(btn.tooltip || '')
-      && /not yet repairable from ANAS \(selfheal\.11\)/.test(btn.tooltip || '')
+      && /not yet repairable from ANAS/.test(btn.tooltip || '')
       && !/Repair from parity/.test(btn.tooltip || ''), btn.tooltip)
 
   let sent = null
@@ -7750,7 +7750,7 @@ async function ahrSnapshotPinChecks() {
   const nameCol = (snapGrid.columns || []).find(c => c.dataIndex === 'name')
   const pinCell = nameCol.renderer(SNAPS.data[1].name)
   ok('snappin: a leftover repair pin is labelled as what it is',
-    /transient — ANAS repair pin; safe to delete if no repair is running/.test(pinCell), pinCell)
+    /transient ANAS repair pin; safe to delete if no repair is running/.test(pinCell), pinCell)
   ok('snappin: an operator snapshot carries no pin label',
     !/repair pin/.test(nameCol.renderer(SNAPS.data[0].name)))
 
@@ -7951,7 +7951,7 @@ async function repairFromParityChecks() {
     return `${html} ${meta.tdAttr || ''}`
   }
   ok('repair: a COMPRESSED extent says what it is, with the extent\'s block count',
-    /compressed extent — 32 blocks/.test(blockCell(4)), blockCell(4))
+    /compressed extent: 32 blocks/.test(blockCell(4)), blockCell(4))
   ok('repair: …and its tooltip names the failing blocks', /failing 4 KiB file blocks: 32/.test(blockCell(4)), blockCell(4))
   ok('repair: an UNIDENTIFIED corruption says so instead of showing 0',
     /corrupt, block not identified/.test(blockCell(5)) && !/>0</.test(blockCell(5)), blockCell(5))
@@ -8017,7 +8017,7 @@ async function repairFromParityChecks() {
   await settle()
   eq('repair: the result appears in the window the request was made from', panel.hidden, false)
   ok('repair: the three buckets are counted', /1 repaired · 1 unrepairable · 1 above md/.test(panel.html), panel.html)
-  ok('repair: unrepairable says restore from backup', /restore this file from backup/.test(panel.html), panel.html)
+  ok('repair: unrepairable says restore from backup', /Restore this file from backup/.test(panel.html), panel.html)
   ok('repair: above md implicates something other than the disks, as an implication',
     /implicates something other than the disks/.test(panel.html) && !/proves/.test(panel.html), panel.html)
   ok('repair: a repaired file carries its verdict on its own row', /repaired/.test(repairCell(0)), repairCell(0))
@@ -8040,7 +8040,7 @@ async function repairFromParityChecks() {
   ok('repair: the mapping-abort count rides the headline, its OWN number',
     /0 repaired · 0 unrepairable · 0 above md · 1 not corrupt at the mapped location/.test(panel.html), panel.html)
   ok('repair: mapping-abort says nothing was written and nothing needs a restore',
-    /1 block\(s\) were not corrupt at the mapped location — nothing was written, nothing to restore/.test(panel.html), panel.html)
+    /1 block\(s\) were not corrupt at the mapped location. Nothing was written, nothing to restore/.test(panel.html), panel.html)
   ok('repair: …and the restore advice stays reserved for the TRUE unrepairable',
     !/restore this file from backup/.test(panel.html), panel.html)
 
@@ -8090,7 +8090,7 @@ async function repairFromParityChecks() {
     /Repaired, and md still counts mismatching stripes on ahr0-r1 \(mismatch_cnt 8\)/.test(panel.html), panel.html)
   ok('repair: …and points at Rewrite parity, never a restore',
     /Rewrite parity on that band/.test(panel.html)
-      && /no fresh scrub is needed/.test(panel.html)
+      && /No fresh scrub is needed/.test(panel.html)
       && !/restore/i.test(panel.html), panel.html)
 
   // --- D3/D10 — the csum-unreadable verdict does NOT say restore -------------
@@ -8134,7 +8134,7 @@ async function repairFromParityChecks() {
   }))
   await settle()
   ok('repair: a MIXED unrepairable file keeps the ordinary restore advice',
-    /restore this file from backup/.test(panel.html), panel.html)
+    /Restore this file from backup/.test(panel.html), panel.html)
   ok('repair: …and does not claim the checksum was unreadable for it',
     !/checksum could not be read reliably/.test(panel.html), panel.html)
 

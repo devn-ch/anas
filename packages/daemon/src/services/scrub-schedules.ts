@@ -184,9 +184,9 @@ async function isTimerEnabled(executor: CommandExecutor): Promise<boolean> {
  * (mdcheck off, the two-phase timer on) is a decision for the toggle, never
  * something the daemon does by itself.
  */
-const MDCHECK_LEGACY_SENTENCE = 'the OS\'s monthly md parity check (mdcheck) is on — the distro '
-  + 'default, and what ANAS puts back when the last pool\'s periodic scrub is turned off; '
-  + 'enabling ANAS periodic scrub takes it over (md parity + btrfs checksums, two phases)'
+const MDCHECK_LEGACY_SENTENCE = 'the OS\'s monthly md parity check (mdcheck) is on. It is the '
+  + 'distro default, and what ANAS puts back when the last pool\'s periodic scrub is turned off. '
+  + 'Enabling ANAS periodic scrub takes it over (md parity + btrfs checksums, two phases)'
 
 /**
  * The honest `note` for an AHR state, from what the node actually shows:
@@ -207,7 +207,7 @@ export function ahrScrubNote(
 ): string {
   const parts: string[] = []
   if (mdcheckOn)
-    parts.push(anasTimerOn ? 'double parity check — mdcheck is on' : MDCHECK_LEGACY_SENTENCE)
+    parts.push(anasTimerOn ? 'double parity check: mdcheck is on' : MDCHECK_LEGACY_SENTENCE)
   for (const name of foreignArrays)
     parts.push(`${name} is not an ANAS pool and is not scrubbed by ANAS`)
   if (parts.length === 0)
@@ -309,7 +309,7 @@ export async function setAhrScrubEnabled(
   // never rewritten on enable, and never DELETED on disable either (review
   // R10). The route surfaces this before the job even starts (409).
   if (await scrubUnitsAreForeign(dir))
-    throw new ForeignUnitError(`an anas-scrub unit without an X-ANAS-Schedule marker exists in ${dir} — not an ANAS unit; nothing was changed`)
+    throw new ForeignUnitError(`an anas-scrub unit without an X-ANAS-Schedule marker exists in ${dir}. It is not an ANAS unit. Nothing was changed`)
   const current = await readScrubSchedule(dir)
   const pools = current?.pools ?? []
   const cadence: ScrubCadence = opts?.cadence ?? current?.cadence ?? 'monthly'

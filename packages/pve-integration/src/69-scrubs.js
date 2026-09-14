@@ -429,14 +429,14 @@
             parts.push(t('ETA') + ' ' + eta);
         }
         var title = kind === 'ahr'
-            ? t('an md check is running — the figures cover the bands checking right now; '
-                + 'any ETA is a floor, because bands still queued behind them are not counted')
-            : t('a verify pass is running — ZFS records its progress but neither a rate nor a '
+            ? t('an md check is running. The figures cover the bands checking right now. '
+                + 'Any ETA is a floor, because bands still queued behind them are not counted')
+            : t('a verify pass is running. ZFS records its progress but neither a rate nor a '
                 + 'time-to-go, so only the percentage is shown');
         return '<span title="' + enc(title) + '" style="color:var(--anas-accent,#3468c0);">'
             + '<i class="fa fa-refresh" aria-hidden="true" style="margin-right:5px;"></i>'
             + enc(runningLabel(kind, running.function))
-            + (parts.length ? enc(' — ' + parts.join(' · ')) : '')
+            + (parts.length ? enc(': ' + parts.join(' · ')) : '')
             + '</span>';
     }
 
@@ -476,8 +476,8 @@
                 var files = (findings.result.findings || []).length;
                 spans.push('<span class="anas-scrub-findings-link" style="color:var(--anas-warn,#b06a12);'
                     + 'cursor:pointer;text-decoration:underline;" title="'
-                    + enc(t('the last AHR scrub that completed since the daemon started found checksum errors — '
-                        + 'click to see the files and their bad blocks. ANAS keeps no scrub history of its own, '
+                    + enc(t('the last AHR scrub that completed since the daemon started found checksum errors. Click '
+                        + 'to see the files and their bad blocks. ANAS keeps no scrub history of its own, '
                         + 'and md records no completion time or result for a check.')) + '">'
                     + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
                     + enc(files + ' ' + (files === 1 ? t('file with checksum errors') : t('files with checksum errors')))
@@ -506,19 +506,19 @@
                 // disabled button rather than hiding the door.
                 var parityTip = findings
                     ? t('md counted parity mismatches on these bands. The file list names what the checksum '
-                        + 'scrub attributed; a mismatch it cannot attribute is PARITY-ONLY rot — the parity (or Q) '
-                        + 'member disagrees while every file\'s checksum passes. Repair the named files first: '
-                        + 'rewriting parity now would recompute it from corrupt data.')
+                        + 'scrub attributed. A mismatch it cannot attribute is PARITY-ONLY rot: the parity (or Q) '
+                        + 'member disagrees while every file\'s checksum passes. Repair the named files first. '
+                        + 'Rewriting parity now would recompute it from corrupt data.')
                     : (rewritable
                         ? t('md counted parity mismatches on these bands, but the checksum scrub found no corrupt '
-                            + 'files — every file\'s checksum passes. On a parity band the rot is in the PARITY (or Q) '
-                            + 'member, not in the data, and at the next disk failure md would reconstruct from the '
-                            + 'wrong parity. Click to rewrite that band\'s parity from the data as it stands.')
+                            + 'files. Every file\'s checksum passes. On a parity band the rot is in the PARITY (or Q) '
+                            + 'member. At the next disk failure md would reconstruct from the wrong parity. '
+                            + 'Click to rewrite that band\'s parity from the data as it stands.')
                         : t('md counted mismatches on these bands, but the checksum scrub found no corrupt files. '
                             + 'No band here is a parity band, so there is no parity to rewrite: a RAID1 mirror\'s '
-                            + 'legs disagree with each other. Mirror mismatch — not yet repairable from ANAS '
-                            + '(selfheal.11); do not run md repair on a mirror, it copies the first in-sync leg '
-                            + 'over the others without looking at which one is right. Click for the detail.'));
+                            + 'legs disagree with each other. md\'s repair on a mirror copies the first in-sync leg '
+                            + 'over the others without looking at which one is right, so do not run md repair on a '
+                            + 'mirror: a mirror mismatch is not yet repairable from ANAS. Click for the detail.'));
                 spans.push('<span class="anas-scrub-parity-link" style="color:var(--anas-warn,#b06a12);'
                     + 'cursor:pointer;text-decoration:underline;" title="' + enc(parityTip) + '">'
                     + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
@@ -536,7 +536,7 @@
             }
             return '<span>' + spans.join(' ')
                 + ' <span style="color:var(--anas-muted,gray);">'
-                + enc(t('— last completed scrub since the daemon started')) + '</span></span>';
+                + enc(t('· last completed scrub since the daemon started')) + '</span></span>';
         }
 
         var last = rec.get('lastScrub');
@@ -555,7 +555,7 @@
                 return '<span title="' + enc(phaseTip) + '">'
                     + enc(phases + when)
                     + ' <span style="color:var(--anas-muted,gray);">'
-                    + '&mdash; ' + enc(t('(md keeps no completion record)')) + '</span></span>';
+                    + enc(t('(md keeps no completion record)')) + '</span></span>';
             }
             return '<span title="' + enc(t('ZFS reports no completed scrub or resilver for this pool')) + '">'
                 + muted(enc(t('never scrubbed'))) + '</span>';
@@ -565,7 +565,7 @@
         if (last.state === 'CANCELED') {
             return '<span title="' + enc(t('the pass was stopped before it finished, so only part of the pool was verified'))
                 + '" style="color:var(--anas-warn,#b06a12);">'
-                + enc(t('canceled') + ' — ' + when) + '</span>';
+                + enc(t('canceled') + ' · ' + when) + '</span>';
         }
 
         // ZFS keeps ONE scan record per pool — a resilver overwrites the scrub's.
@@ -581,9 +581,9 @@
             : enc(verdict);
 
         var duration = fmtDuration(last.durationSeconds);
-        var tail = '— ' + when + (duration ? ' (' + t('took') + ' ' + duration + ')' : '');
+        var tail = '· ' + when + (duration ? ' (' + t('took') + ' ' + duration + ')' : '');
         var title = resilver
-            ? t('the pool\'s last completed pass was a RESILVER, not a scrub — ZFS keeps one scan record per pool')
+            ? t('the pool\'s last completed pass was a RESILVER. ZFS keeps one scan record per pool, and a resilver overwrites the scrub\'s')
             : t('the pool\'s last completed scrub');
         return '<span title="' + enc(title) + '">' + head
             + ' <span style="color:var(--anas-muted,gray);">' + enc(tail) + '</span></span>';
@@ -706,12 +706,12 @@
                 // timer runs the whole two-phase scrub and takes mdcheck over.
                 btnSetTip(btn, !isAhr ? '' : (on
                     ? (lastEnabledAhr(scrubGrid, rec)
-                        ? t('removes this pool from the node\'s anas-scrub timer — the last one, so the units go '
-                            + 'and mdadm\'s mdcheck timers are turned back on (the distro default)')
+                        ? t('removes this pool from the node\'s anas-scrub timer. This is the last one, so the '
+                            + 'units go and mdadm\'s mdcheck timers are turned back on (the distro default)')
                         : t('removes this pool from the node\'s anas-scrub timer; the other enabled pools keep it, '
                             + 'and the mdcheck timers stay off'))
-                    : t('adds this pool to the node\'s anas-scrub timer — phase 1 md parity, '
-                        + 'then phase 2 btrfs checksums; mdadm\'s mdcheck timers are turned off')));
+                    : t('adds this pool to the node\'s anas-scrub timer: phase 1 md parity, '
+                        + 'then phase 2 btrfs checksums. mdadm\'s mdcheck timers are turned off')));
             }
         }
 
@@ -759,7 +759,7 @@
                     + '(each band\'s md parity check, then the btrfs checksum scrub) '
                     + 'with no cancel path');
             } else if (running.function === 'RESILVER') {
-                reason = t('a resilver cannot be stopped — only a scrub can');
+                reason = t('a resilver cannot be stopped. Only a scrub can');
             }
             stopBtn.setDisabled(!rec || !!reason);
             btnSetTip(stopBtn, reason);
@@ -845,16 +845,16 @@
                     t('Periodic scrub (node-level timer)'),
                     (rec.get('note') ? (enc(rec.get('note')) + '<br><br>') : '')
                         + (next ? t('Enable') : t('Disable')) + ' '
-                        + t('the ANAS scrub timer for this pool — the timer runs the whole scrub '
+                        + t('the ANAS scrub timer for this pool: the timer runs the whole scrub '
                             + '(phase 1 md parity, then phase 2 btrfs checksums) for every enabled '
                             + 'AHR pool on this node, one at a time?')
                         + (next
                             ? '<br><br>' + enc(t('mdadm\'s mdcheck timers will be turned off.'))
                                 + '<br><br>' + enc(t('The timer is persistent: if this month\'s occurrence was already '
-                                    + 'missed, enabling may START A SCRUB RIGHT AWAY — it can run for many hours.'))
+                                    + 'missed, enabling may START A SCRUB RIGHT AWAY. It can run for many hours.'))
                             : (lastEnabledAhr(scrubGrid, rec)
                                 ? '<br><br>' + enc(t('This is the last AHR pool on the timer: the units are removed and '
-                                    + 'mdadm\'s mdcheck timers are turned back on — the node goes back to the distro default.'))
+                                    + 'mdadm\'s mdcheck timers are turned back on. The node goes back to the distro default.'))
                                 : '')),
                     function (btn) {
                         if (btn === 'yes') { doToggle(); }
@@ -932,29 +932,29 @@
     function renderFindingBlocks(v, meta, rec) {
         if (rec.get('outsideMount')) {
             return '<span style="color:var(--anas-muted,gray);" title="'
-                + enc(t('the file is in a snapshot, beside the mounted subvolume — the scrub covers the '
+                + enc(t('the file is in a snapshot, beside the mounted subvolume. The scrub covers the '
                     + 'whole filesystem, and ANAS did not mount the top level to read it')) + '">'
                 + enc(t('in a snapshot, outside the mounted tree')) + '</span>';
         }
         if (rec.get('missing')) {
             return '<span style="color:var(--anas-muted,gray);" title="'
-                + enc(t('the path no longer exists — deleted since the scrub')) + '">'
+                + enc(t('the path no longer exists: deleted since the scrub')) + '">'
                 + enc(t('deleted since the scrub')) + '</span>';
         }
         if (rec.get('unidentified')) {
             var why = rec.get('reason') || '';
             return '<span style="color:var(--anas-muted,gray);" title="'
-                + enc(t('the corruption is real — the kernel named this file — but no bad block could be named')
+                + enc(t('the kernel named this file, so the corruption is real. No bad block could be named')
                     + (why ? (': ' + why) : '')) + '">'
                 + enc(t('corrupt, block not identified')) + '</span>';
         }
         if (rec.get('compressed')) {
             var n = Number(rec.get('extentCount')) || 0;
-            var tip = t('one corrupt sector of a compressed extent takes out the whole extent — its failing 4 KiB file blocks')
+            var tip = t('one corrupt sector of a compressed extent takes out the whole extent. Its failing 4 KiB file blocks')
                 + ': ' + (rec.get('blockList') || '');
             meta.tdAttr = 'data-qtip="' + enc(tip) + '"';
             return '<span style="color:var(--anas-warn,#b06a12);">'
-                + enc(t('compressed extent — ') + n + t(' blocks')) + '</span>'
+                + enc(t('compressed extent: ') + n + t(' blocks')) + '</span>'
                 + unverifiedSuffix(rec);
         }
         var n = Number(rec.get('blocks')) || 0;
@@ -991,19 +991,19 @@
 
     function repairBlockedReason(rec) {
         if (rec.get('outsideMount')) {
-            return t('this finding is inside a snapshot, outside the pool\'s mounted tree — '
-                + 'repair works on the live @data tree only');
+            return t('this finding is inside a snapshot, outside the pool\'s mounted tree. '
+                + 'Repair works on the live @data tree only');
         }
         if (rec.get('missing')) {
-            return t('the file no longer exists — it was deleted since the scrub named it');
+            return t('the file no longer exists: it was deleted since the scrub named it');
         }
         if (rec.get('unidentified')) {
             var why = rec.get('reason') || '';
             return t('no bad block could be named for this corruption')
-                + (why ? (' — ' + why) : '');
+                + (why ? (': ' + why) : '');
         }
         if (!Number(rec.get('blocks'))) {
-            return t('no block inside the reported stripe failed to read — there is nothing to repair');
+            return t('no block inside the reported stripe failed to read. There is nothing to repair');
         }
         return '';
     }
@@ -1124,7 +1124,7 @@
         btn.setDisabled(!picked.length);
         btnSetTip(btn, picked.length
             ? ''
-            : t('tick the files to repair — a finding with no live file under the mountpoint cannot be'));
+            : t('tick the files to repair. A finding with no live file under the mountpoint cannot be'));
     }
 
     // The job's answer, in the window the request was made from: the three
@@ -1202,18 +1202,18 @@
             }
             if (restoreFiles > 0 || !csumFiles.length) {
                 lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
-                    + 'those blocks — restore this file from backup.')));
+                    + 'those blocks. Restore this file from backup.')));
             }
             if (csumFiles.length) {
                 lines.push(enc(t('The checksum could not be read reliably for')
-                    + ' ' + csumFiles.join(', ') + ' — '
-                    + t('nothing about those blocks is known yet, so do NOT restore from backup: '
-                        + 're-scrub after the metadata is repaired — a btrfs scrub repairs metadata copies.')));
+                    + ' ' + csumFiles.join(', ') + '. '
+                    + t('Nothing about those blocks is known yet, so do NOT restore from backup. '
+                        + 'A btrfs scrub repairs metadata copies, so re-scrub after the metadata is repaired.')));
             }
         }
         if (Number(res.mappingAbort || 0) > 0) {
-            lines.push(enc(Number(res.mappingAbort || 0) + ' ' + t('block(s) were not corrupt at the mapped location '
-                + '— nothing was written, nothing to restore: the bytes there still pass their stored '
+            lines.push(enc(Number(res.mappingAbort || 0) + ' ' + t('block(s) were not corrupt at the mapped location. '
+                + 'Nothing was written, nothing to restore: the bytes there still pass their stored '
                 + 'checksum, so the finding no longer describes them.')));
         }
         // Seventh pass, F3 — the blocks NOBODY LOOKED AT. "Nothing was written"
@@ -1236,12 +1236,12 @@
                 }
             }
             lines.push(enc(Number(res.notExamined || 0) + ' ' + t('block(s) could not be EXAMINED')
-                + (why.length ? ' (' + why.join(', ') + ')' : '') + ' — '
-                + t('nothing was written, and nothing is known about those bytes. This is neither a clean '
-                    + 'bill of health nor a reason to restore: re-scrub once the reason no longer applies.')));
+                + (why.length ? ' (' + why.join(', ') + ')' : '') + '. '
+                + t('Nothing was written, and nothing is known about those bytes. This is neither a clean '
+                    + 'bill of health nor a reason to restore. Re-scrub once the reason no longer applies.')));
         }
         if (Number(res.aboveMd || 0) > 0) {
-            lines.push(enc(t('Above md: parity already agreed with the bad data — this implicates '
+            lines.push(enc(t('Above md: parity already agreed with the bad data. This implicates '
                 + 'something other than the disks (memory, controller, software). Nothing was written.')));
         }
         // Seventh pass, F2 — blocks that were repaired and PROVEN while md still
@@ -1254,8 +1254,8 @@
                 bands.push(residuals[r].band + ' (' + t('mismatch_cnt') + ' ' + residuals[r].mismatchCnt + ')');
             }
             lines.push(enc(t('Repaired, and md still counts mismatching stripes on') + ' ' + bands.join(', ')
-                + ' — ' + t('the data is right and the parity (or Q) member is what disagrees. '
-                    + 'Rewrite parity on that band; no fresh scrub is needed, this run measured it.')));
+                + '. ' + t('The data is right, and the parity (or Q) member is what disagrees. '
+                    + 'Rewrite parity on that band. No fresh scrub is needed, because this run measured it.')));
         }
         panel.update(lines.join('<br>'));
     }
@@ -1275,7 +1275,7 @@
                 order.push(kind);
             }
             byKind[kind] += 1;
-            detail.push(t('block') + ' ' + blocks[i].block + ': ' + kind + ' — ' + (blocks[i].reason || ''));
+            detail.push(t('block') + ' ' + blocks[i].block + ': ' + kind + '. ' + (blocks[i].reason || ''));
         }
         var parts = [];
         for (var j = 0; j < order.length; j++) {
@@ -1395,13 +1395,13 @@
     // coin flip that overwrites the good copy half the time. The daemon
     // refuses it (409 `not-a-parity-band`); the button says so first, so the
     // operator is not sent to a refusal to find out.
-    var MIRROR_BAND_REASON = 'a RAID1 mirror band has no parity to rewrite — md\'s repair on a mirror '
-        + 'copies the first in-sync leg over the others without looking at which one is right. '
-        + 'Mirror mismatch — not yet repairable from ANAS (selfheal.11); do not run md repair on a mirror';
+    var MIRROR_BAND_REASON = 'a RAID1 mirror band has no parity to rewrite. md\'s repair on a mirror '
+        + 'copies the first in-sync leg over the others without looking at which one is right, so '
+        + 'do not run md repair on a mirror: a mirror mismatch is not yet repairable from ANAS';
 
     function parityRewriteBlocked(win, hasFindings) {
         if (hasFindings) {
-            return t('the same scrub named corrupt files — repair those from parity first; rewriting parity now '
+            return t('the same scrub named corrupt files. Repair those from parity first. Rewriting parity now '
                 + 'would recompute it from the corrupt data and make the rot permanent');
         }
         var grid = win.down('#parityGrid');
@@ -1410,10 +1410,10 @@
             return t('select the band to rewrite');
         }
         if (sel.length > 1) {
-            return t('one band at a time — md repairs a whole array, and the estimate is that array\'s');
+            return t('one band at a time: md repairs a whole array, and the estimate is that array\'s');
         }
         if (!(Number(sel[0].get('bandIndex')) > 0)) {
-            return t('this scrub did not record the band number — scrub the pool again');
+            return t('this scrub did not record the band number. Scrub the pool again');
         }
         if (String(sel[0].get('level') || '') === 'raid1') {
             return t(MIRROR_BAND_REASON);
@@ -1456,8 +1456,8 @@
             lines.push(enc(t('The band\'s parity was recomputed from the data it holds, and the verifying check '
                 + 'counted 0. Nothing in the data was written.')));
         } else if (res.outcome === 'still-mismatched') {
-            lines.push(enc(t('md repaired the band and the check afterwards STILL counted mismatches — the parity '
-                + 'is not proven good. Do not treat this band as healthy; the PVE notification has the detail.')));
+            lines.push(enc(t('md repaired the band and the check afterwards STILL counted mismatches. The parity '
+                + 'is not proven good. Do not treat this band as healthy. The PVE notification has the detail.')));
         }
         if (res.reason) {
             lines.push(enc(String(res.reason)));
@@ -1540,7 +1540,7 @@
 
         var win = Ext.create('Ext.window.Window', {
             cls: 'anas-win-scrub-parity',
-            title: t('Parity mismatch') + ' — ' + pool,
+            title: t('Parity mismatch') + ': ' + pool,
             modal: true,
             width: 660,
             height: 340,
@@ -1552,19 +1552,22 @@
                     padding: '10 12 6 12',
                     html: enc(hasFindings
                         ? t('md counted parity mismatches on these bands, and the same scrub named corrupt files. '
-                            + 'Repair those from parity first — rewriting parity over corrupt data makes the rot permanent.')
+                            + 'Repair those from parity first. Rewriting parity over corrupt data makes the rot permanent.')
                         : (allMirror
                             ? t('md counted mismatches on these bands and the checksum pass found nothing. These are '
-                                + 'RAID1 mirror bands: md counted legs that disagree with each other, not parity that '
-                                + 'disagrees with the data, and there is nothing here to rewrite. Mirror mismatch — '
-                                + 'not yet repairable from ANAS (selfheal.11); do not run md repair on a mirror.')
-                            : t('md counted parity mismatches on these bands and the checksum pass found nothing: on a '
-                                + 'parity band the data is right and the parity is what is wrong. Rewriting recomputes '
-                                + 'that band\'s parity from the data as it stands — a fresh checksum scrub of the whole '
+                                + 'RAID1 mirror bands: md counted legs that disagree with each other, and there is '
+                                + 'no parity here to rewrite. md\'s repair on a mirror copies the first in-sync leg '
+                                + 'over the others without looking at which one is right, so do not run md repair '
+                                + 'on a mirror: a mirror mismatch is not yet repairable from ANAS.')
+                            : t('md counted parity mismatches on these bands and the checksum pass found nothing. On a '
+                                + 'parity band the data is right, and the parity is what is wrong. Rewriting recomputes '
+                                + 'that band\'s parity from the data as it stands. A fresh checksum scrub of the whole '
                                 + 'pool runs first (usually the longest part of the run), and any finding aborts it.')
                             + (anyMirror
-                                ? ' ' + t('A RAID1 band in this list has no parity to rewrite: mirror mismatch — not yet '
-                                    + 'repairable from ANAS (selfheal.11); do not run md repair on a mirror.')
+                                ? ' ' + t('A RAID1 band in this list has no parity to rewrite. md\'s repair on a mirror '
+                                    + 'copies the first in-sync leg over the others without looking at which one is '
+                                    + 'right, so do not run md repair on a mirror: a mirror mismatch is not yet '
+                                    + 'repairable from ANAS.')
                                 : '')))
                 },
                 {
@@ -1680,12 +1683,12 @@
         }
         var parityLine = parityBands.length
             ? '<br>' + enc(t('md counted parity mismatches on') + ' ' + parityBands.join(', ')
-                + ' — ' + t('a mismatch the checksum scrub cannot attribute is parity-only rot; the PVE notification explains it'))
+                + '. ' + t('A mismatch the checksum scrub cannot attribute is parity-only rot. The PVE notification explains it'))
             : '';
 
         var win = Ext.create('Ext.window.Window', {
             cls: 'anas-win-scrub-findings',
-            title: t('Scrub findings') + ' — ' + pool,
+            title: t('Scrub findings') + ': ' + pool,
             modal: true,
             width: 720,
             height: 420,
@@ -1922,7 +1925,7 @@
                         {
                             xtype: 'component',
                             html: enc(t('Verify pools periodically. ZFS: PVE\'s monthly cron, per-pool. '
-                                + 'AHR: the ANAS timer (monthly/quarterly) — phase 1 md parity, then '
+                                + 'AHR: the ANAS timer (monthly/quarterly): phase 1 md parity, then '
                                 + 'phase 2 btrfs checksums, pools one at a time.')),
                             style: 'color:var(--anas-muted,gray);font-size:11px;'
                         },

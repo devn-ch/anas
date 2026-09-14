@@ -87,8 +87,8 @@ export function rewriteLunWarnings(held: IscsiHeldByLun | null): string[] {
   return [
     `A guest's disk is live on this pool: iSCSI LUN ${held.index} ('${held.name}') of target ${held.targetIqn} is served from ${held.backingPath}${
       sessions > 0
-        ? `, with ${sessions} initiator${sessions === 1 ? '' : 's'} logged in right now (${held.connectedInitiators.join(', ')}). Nothing this run writes is visible to them — it reads every member of the band twice and rewrites parity, never a file — but the array will be reading flat out underneath that disk for the duration`
-        : '. No initiator is logged in right now. Nothing this run writes is visible to a guest — it reads every member of the band twice and rewrites parity, never a file'}`,
+        ? `, with ${sessions} initiator${sessions === 1 ? '' : 's'} logged in right now (${held.connectedInitiators.join(', ')}). Nothing this run writes is visible to them. It reads every member of the band twice and rewrites parity, and it writes no file. The array will be reading flat out underneath that disk for the duration`
+        : '. No initiator is logged in right now. Nothing this run writes is visible to a guest. It reads every member of the band twice and rewrites parity, and it writes no file'}`,
   ]
 }
 
@@ -112,9 +112,9 @@ export function lunSessionRefusal(path: string, held: IscsiHeldByLun) {
         + `${held.connectedInitiators.length} initiator${held.connectedInitiators.length === 1 ? ' is' : 's are'} `
         + `logged in right now (${held.connectedInitiators.join(', ')}). A repair writes a reconstructed `
         + `4 KiB block through md under that live session: the block itself is proven correct and btrfs's `
-        + `copy-on-write leaves the old extent untouched, but the initiator is holding its own cache of the `
-        + `file and has no idea the bytes changed. Log the initiator out of LUN ${held.index} (or stop the `
-        + `guest using it) and repair then. This refusal has no confirm bypass.`,
+        + `copy-on-write leaves the old extent untouched, but the initiator keeps its own cache of the file, `
+        + `and the change is invisible to it. Log the initiator out of LUN ${held.index} (or stop the `
+        + `guest using it), then repair. This refusal has no confirm bypass.`,
     },
   }
 }
@@ -130,14 +130,14 @@ export function lunSessionRefusal(path: string, held: IscsiHeldByLun) {
  * says it in the pool's own vocabulary.
  */
 const REPAIR_REFUSED_STATES: Record<string, string> = {
-  degraded: 'is degraded — a reconstruction needs every other member of the stripe',
-  building: 'is still building — the initial sync is writing the parity this repair would read',
-  rebuilding: 'is rebuilding — a recovery is writing the members this repair would read',
-  expanding: 'is expanding — the layout under the block is changing mid-reshape',
-  scrubbing: 'is scrubbing — a check re-reads every stripe, including this one',
-  offline: 'is offline — the volume is not assembled, so there is nothing to repair',
-  failed: 'has failed — there is no array left to reconstruct from',
-  readonly: 'is read-only — a repair writes the reconstructed block back through md',
+  degraded: 'is degraded: a reconstruction needs every other member of the stripe',
+  building: 'is still building: the initial sync is writing the parity this repair would read',
+  rebuilding: 'is rebuilding: a recovery is writing the members this repair would read',
+  expanding: 'is expanding: the layout under the block is changing mid-reshape',
+  scrubbing: 'is scrubbing: a check re-reads every stripe, including this one',
+  offline: 'is offline: the volume is not assembled, so there is nothing to repair',
+  failed: 'has failed: there is no array left to reconstruct from',
+  readonly: 'is read-only: a repair writes the reconstructed block back through md',
 }
 
 /**
@@ -171,7 +171,7 @@ const EXCLUSIVE_OPERATION_NAMES: Record<string, string> = {
  * re-reading. Only the scrub route used to ask; all three do now.
  */
 function runningAhrCheckMessage(label: string): string {
-  return `an md check is running on ${label} (started outside this job or by a previous daemon) — ANAS runs one parity check at a time across the node's AHR bands, and this operation reads or writes the very stripes that check is re-reading; wait for it to finish, or end it from the command line`
+  return `an md check is running on ${label} (started outside this job or by a previous daemon). ANAS runs one parity check at a time across the node's AHR bands, and this operation reads or writes the very stripes that check is re-reading. Wait for it to finish, or end it from the command line`
 }
 
 // ---- Repair path confinement (design review 2026-09-14, D12) ---------------
@@ -390,7 +390,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const existingVgs = vgsRes.exitCode === 0 ? parseVgsReport(vgsRes.stdout) : []
     if (existingVgs.some(v => v.name === req.name)) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `an LVM volume group named '${req.name}' already exists — the pool name becomes its VG name, so this would collide at vgcreate (after the disks were wiped); choose another name` } }
+      return { error: { code: 'CONFLICT', message: `an LVM volume group named '${req.name}' already exists. The pool name becomes its VG name, so vgcreate would fail after the disks were wiped. Choose another name` } }
     }
 
     // Mountpoint override (§2.6): never in PVE's namespace, never a path that
@@ -400,17 +400,17 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       const mp = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
       if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
         reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved — /mnt/pve belongs to PVE (§2.6) and / is not a pool mountpoint` } }
+        return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved. /mnt/pve belongs to PVE, and / is not a pool mountpoint` } }
       }
       const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
       const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
       if (mounts.some(m => m.target === mp)) {
         reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` } }
+        return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint. Pick an unused path` } }
       }
       if (hasMount(await readConfig(fstabPath), mp)) {
         reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
+        return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab. Pick an unused path` } }
       }
       req.mountpoint = mp
     }
@@ -468,7 +468,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'ahr.create',
       params: { name: req.name },
-      message: `Creating AHR pool '${req.name}' will WIPE ${selected.length} disk(s) — all data on them will be permanently erased`,
+      message: `Creating AHR pool '${req.name}' will WIPE ${selected.length} disk(s). All data on them will be permanently erased`,
       warnings: [
         ...selected.map(d => `${d.id} (${d.model ?? 'unknown model'}, ${fmtBytes(d.usableBytes)}) will be completely erased`),
         // Geometry advisories the planner raised — the mixed 4Kn/512e label
@@ -519,7 +519,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const mp = parsed.data.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
     if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${parsed.data.mountpoint}' is reserved — /mnt/pve belongs to PVE (§2.6) and / is not a pool mountpoint` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${parsed.data.mountpoint}' is reserved. /mnt/pve belongs to PVE, and / is not a pool mountpoint` } }
     }
     if (mp === pool.mountpoint) {
       reply.code(400)
@@ -529,11 +529,11 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
     if (mounts.some(m => m.target === mp)) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` } }
+      return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint. Pick an unused path` } }
     }
     if (hasMount(await readConfig(fstabPath), mp)) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
+      return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab. Pick an unused path` } }
     }
 
     // Story iscsi.6: moving the mountpoint UNMOUNTS the filesystem, which pulls
@@ -551,7 +551,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       message: `Moving pool '${name}' from '${pool.mountpoint}' to '${mp}' briefly unmounts it`,
       warnings: [
         `Anything serving from '${pool.mountpoint}' (shares, backups, mounts) stops working until re-pointed at '${mp}'`,
-        pool.mounted ? 'The filesystem is unmounted during the move — open files will block it (retry after closing them)' : 'The pool is currently unmounted — only fstab is rewritten, then it mounts at the new path',
+        pool.mounted ? 'The filesystem is unmounted during the move. Open files will block it (retry after closing them)' : 'The pool is currently unmounted. Only fstab is rewritten, then the filesystem mounts at the new path',
       ],
     })) {
       return reply
@@ -604,8 +604,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // Consumers under the mountpoint (submounts — shares/backups serving from
     // the pool stop with it). findmnt is the live truth.
     const warnings = [
-      `Pool '${name}' (${fmtBytes(pool.capacity.usableBytes)} usable) will be permanently destroyed — every array, partition, and all data erased`,
-      `The filesystem at '${pool.mountpoint}' will be unmounted — anything serving from it (shares, backups, mounts) stops working`,
+      `Pool '${name}' (${fmtBytes(pool.capacity.usableBytes)} usable) will be permanently destroyed. Every array, partition, and all data is erased`,
+      `The filesystem at '${pool.mountpoint}' will be unmounted: anything serving from it (shares, backups, mounts) stops working`,
     ]
     const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
     if (findmntRes.exitCode === 0) {
@@ -619,7 +619,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // like a pool holding no LUNs, and the destroy takes the image file with
     // it. Disclose; the hard 409 above is unchanged.
     if (await claimsCache.readFailed()) {
-      warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
+      warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool. The LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
     }
 
     if (!confirmGate(confirmStore, request, reply, {
@@ -665,17 +665,17 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // "is not mounted" only describes a symptom.
     if (pool.state === 'offline') {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is offline — the volume is not assembled, so there is nothing to scrub; see the Hybrid RAID view for which band arrays cannot start` } }
+      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is offline: the volume is not assembled, so there is nothing to scrub. See the Hybrid RAID view for which band arrays cannot start` } }
     }
     // Never concurrent (§4): a scrub and a resync/reshape are all full-device
     // passes — refuse while one is already running.
     if (pool.state === 'scrubbing' || pool.state === 'building' || pool.state === 'rebuilding' || pool.state === 'expanding') {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is ${pool.state} — a scrub would thrash the running operation; wait for it to finish` } }
+      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is ${pool.state}: a scrub would thrash the running operation. Wait for it to finish` } }
     }
     if (pool.mountpoint.startsWith('/dev/')) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is not mounted — btrfs scrub needs the filesystem online` } }
+      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is not mounted: btrfs scrub needs the filesystem online` } }
     }
     // The other half of the selfheal.6 pair: a scrub cannot start mid-repair —
     // the engine has md's knobs turned aside for the duration of each block and
@@ -689,8 +689,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         error: {
           code: 'CONFLICT',
           message: scrubBlocker.operation === 'ahr.scrub'
-            ? `a scrub is already in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — one scrub reads every byte of the pool and checks every band array; wait for it to finish`
-            : `${EXCLUSIVE_OPERATION_NAMES[scrubBlocker.operation] ?? 'another job'} job is in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — a check would re-read the stripes that job is writing; wait for it to finish`,
+            ? `a scrub is already in flight on AHR pool '${name}' (job ${scrubBlocker.id}). Wait for it to finish`
+            : `${EXCLUSIVE_OPERATION_NAMES[scrubBlocker.operation] ?? 'another job'} job is in flight on AHR pool '${name}' (job ${scrubBlocker.id}). Wait for it to finish`,
         },
       }
     }
@@ -730,7 +730,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const parsed = AhrRepairRequest.safeParse(request.body ?? {})
     if (!parsed.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid repair request: ${parsed.error.issues[0]?.message} — repair takes absolute paths under the pool's mountpoint with at least one 4 KiB block each; a finding inside a snapshot (@snapshots/…) is filesystem-relative and cannot be repaired in this cut` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid repair request: ${parsed.error.issues[0]?.message}. Repair takes absolute paths under the pool's mountpoint, each with at least one 4 KiB block. Findings inside a snapshot (@snapshots/…) are filesystem-relative and cannot be repaired` } }
     }
 
     const identity = requireIdentity(request, reply)
@@ -745,7 +745,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     }
     if (!pool.mounted || pool.mountpoint.startsWith('/dev/')) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is not mounted — a repair resolves the block through the live filesystem` } }
+      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is not mounted: a repair resolves the block through the live filesystem` } }
     }
 
     // Hard refusals, all of them BEFORE a confirm code is minted (Principle 14,
@@ -753,12 +753,12 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const stateRefusal = REPAIR_REFUSED_STATES[pool.state]
     if (stateRefusal) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' ${stateRefusal}; repair when the pool is healthy and idle` } }
+      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' ${stateRefusal}. Repair when the pool is healthy and idle` } }
     }
     const blocker = conflictingAhrJob(name)
     if (blocker) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `${blocker.operation === 'ahr.repair' ? 'another repair' : EXCLUSIVE_OPERATION_NAMES[blocker.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${blocker.id}) — a repair needs the array to itself; wait for it to finish` } }
+      return { error: { code: 'CONFLICT', message: `${blocker.operation === 'ahr.repair' ? 'another repair' : EXCLUSIVE_OPERATION_NAMES[blocker.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${blocker.id}). Wait for it to finish` } }
     }
     // The node-wide half of the same exclusion (N10): a check from a previous
     // daemon, or one mdcheck's timer started, survives the job queue's memory.
@@ -774,7 +774,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       const top = topLevelMountPath(pool)
       if ((await executor.exec(FINDMNT, ['--mountpoint', top])).exitCode === 0) {
         reply.code(409)
-        return { error: { code: 'CONFLICT', message: `the top-level mount for AHR pool '${name}' is already held at ${top} — a backup or snapshot job is in flight, and the repair needs that mount to take its own read-only snapshot; retry when the other job has finished` } }
+        return { error: { code: 'CONFLICT', message: `the top-level mount for AHR pool '${name}' is already held at ${top}. A backup or snapshot job is in flight, and the repair needs that mount to take its own read-only snapshot. Retry when the other job has finished` } }
       }
     }
 
@@ -794,40 +794,40 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const root = await repairRealPath(executor, lexicalRoot)
     if (!root) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `the mountpoint '${pool.mountpoint}' of AHR pool '${name}' could not be resolved on the filesystem — refusing to repair against an unresolvable root` } }
+      return { error: { code: 'CONFLICT', message: `the mountpoint '${pool.mountpoint}' of AHR pool '${name}' could not be resolved on the filesystem. Refusing to repair against an unresolvable root` } }
     }
     const lvDevice = await repairRealPath(executor, ahrLvPath(pool.name))
     if (!lvDevice) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `the LV device '${ahrLvPath(pool.name)}' of AHR pool '${name}' could not be resolved — refusing to repair against an unresolvable pool device` } }
+      return { error: { code: 'CONFLICT', message: `the LV device '${ahrLvPath(pool.name)}' of AHR pool '${name}' could not be resolved. Refusing to repair against an unresolvable pool device` } }
     }
     const files: AhrRepairFile[] = []
     for (const file of parsed.data.files) {
       const abs = resolvePath(file.path)
       if (abs === lexicalRoot || relative(lexicalRoot, abs).startsWith('..')) {
         reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `'${file.path}' is not a file under '${pool.mountpoint}' — repair works on the live @data tree only in this cut; a finding outside the mounted tree (a snapshot) cannot be repaired` } }
+        return { error: { code: 'VALIDATION_ERROR', message: `'${file.path}' is not a file under '${pool.mountpoint}'. Repair works on the live @data tree only. A finding outside the mounted tree (a snapshot) cannot be repaired` } }
       }
       if (!(await pathExists(executor, abs))) {
         reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${file.path}' does not exist — the file was deleted since the scrub named it, and there is nothing to repair` } }
+        return { error: { code: 'CONFLICT', message: `'${file.path}' does not exist. The file was deleted since the scrub named it, and there is nothing to repair` } }
       }
       const real = await repairRealPath(executor, abs)
       if (!real || real === root || relative(root, real).startsWith('..')) {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: real
-          ? `'${file.path}' resolves to '${real}', which is not a file under '${pool.mountpoint}' — repair works on the live @data tree only in this cut`
-          : `'${file.path}' could not be resolved on the filesystem (realpath -e failed) — a repair path must be a real file under '${pool.mountpoint}'` } }
+          ? `'${file.path}' resolves to '${real}', which is not a file under '${pool.mountpoint}'. Repair works on the live @data tree only`
+          : `'${file.path}' could not be resolved on the filesystem (realpath -e failed). A repair path must be a real file under '${pool.mountpoint}'` } }
       }
       const source = await repairMountSource(executor, real)
       const sourceReal = source ? await repairRealPath(executor, source) : null
       if (!source || !sourceReal) {
         reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `the filesystem holding '${file.path}' could not be determined (findmnt failed) — refusing to repair a path the pool's own device cannot be confirmed for` } }
+        return { error: { code: 'VALIDATION_ERROR', message: `the filesystem holding '${file.path}' could not be determined (findmnt failed). A repair is refused until the path's filesystem can be confirmed as the pool's own` } }
       }
       if (sourceReal !== lvDevice) {
         reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `'${file.path}' sits on ${sourceReal}, not on AHR pool '${name}'s own device (${lvDevice}) — a mount inside the pool's tree does not make its contents the pool's to write` } }
+        return { error: { code: 'VALIDATION_ERROR', message: `'${file.path}' sits on ${sourceReal}, not on AHR pool '${name}'s own device (${lvDevice}). A mount inside the pool's tree is not pool data` } }
       }
       // One attempt per block, in ascending order: the same block twice would
       // run the whole sequence twice and the second pass would abort on its own
@@ -871,10 +871,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       warnings: [
         'A read-only snapshot of the file\'s subvolume is taken for the duration and removed afterwards',
         `md's rmw_level, sync_min, sync_max and stripe_cache_size on the pool's array(s) are changed for the duration and restored afterwards`,
-        'One 4 KiB block per finding is written THROUGH md — and only after the reconstruction from the other members matches the checksum btrfs stored for it',
-        `Per block: two node-wide page-cache drops (drop_caches), two ~${sweepMiB} MiB read sweeps over the array, and${striped ? ' the band\'s stripe cache at its floor for the duration — ' : ' '}a busy node will feel it; bring latency-sensitive workloads down first`,
-        'Nothing else on the array is touched: no other file, no other block, no parity rewrite beyond the stripes these blocks live in',
-        'A block that cannot be proven is left exactly as it is — reported unrepairable, or as corruption that arrived above md, never "fixed"',
+        'One 4 KiB block per finding is written THROUGH md. The write happens only after the reconstruction from the other members matches the checksum btrfs stored for it',
+        `Per block: two node-wide page-cache drops (drop_caches), two ~${sweepMiB} MiB read sweeps over the array${striped ? ', and the band\'s stripe cache held at its floor for the duration' : ''}. A busy node will feel it. Bring latency-sensitive workloads down first`,
+        'Nothing else on the array is touched: no other file, and no parity rewrite beyond the stripes these blocks live in',
+        'A block that cannot be proven is left untouched. It is reported as unrepairable, or as corruption that arrived above md',
       ],
     })) {
       return reply
@@ -905,7 +905,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const parsed = AhrParityRewriteRequest.safeParse(request.body ?? {})
     if (!parsed.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid parity-rewrite request: ${parsed.error.issues[0]?.message} — the body names ONE band (\`{ "band": 1 }\`), because md repairs a whole array at a time` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid parity-rewrite request: ${parsed.error.issues[0]?.message}. The body names one band (\`{ "band": 1 }\`), because md repairs a whole array at a time` } }
     }
     const band = parsed.data.band
 
@@ -922,11 +922,11 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const array = parityRewriteArray(pool, band)
     if (!array) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `AHR pool '${name}' has no band r${band} — its bands are ${pool.arrays.map(a => `r${a.band}`).join(', ') || 'none'}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `AHR pool '${name}' has no band r${band}: its bands are ${pool.arrays.map(a => `r${a.band}`).join(', ') || 'none'}` } }
     }
     if (!pool.mounted || pool.mountpoint.startsWith('/dev/')) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'pool-not-mounted', message: `AHR pool '${name}' is not mounted — the fresh btrfs scrub this verb runs before it touches md needs the filesystem online` } }
+      return { error: { code: 'CONFLICT', reason: 'pool-not-mounted', message: `AHR pool '${name}' is not mounted. The parity rewrite starts with a fresh btrfs scrub, which needs the filesystem online` } }
     }
 
     // Hard refusals, every one of them BEFORE a confirm code is minted
@@ -949,7 +949,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const stateRefusal = REPAIR_REFUSED_STATES[pool.state]
     if (stateRefusal) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'array-busy', message: `AHR pool '${name}' ${stateRefusal}; rewrite parity when the pool is healthy and idle` } }
+      return { error: { code: 'CONFLICT', reason: 'array-busy', message: `AHR pool '${name}' ${stateRefusal}. Rewrite parity when the pool is healthy and idle` } }
     }
     // Set the moment the job exists, and read only from inside the handler —
     // every call there happens in a later microtask than the assignment below,
@@ -959,7 +959,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const jobConflict = () => {
       const active = conflictingAhrJob(name, selfJobId)
       return active
-        ? `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}) — a parity rewrite reads every member of a band twice and needs the array to itself; wait for it to finish`
+        ? `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}). A parity rewrite reads every member of a band twice. Wait for it to finish`
         : null
     }
     const conflict = jobConflict()

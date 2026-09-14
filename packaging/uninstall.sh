@@ -73,10 +73,10 @@ remove_schedule_units() {
     # check at all while the uninstaller said the opposite. That is the one
     # sentence an operator would act on, and it has to be true.
     if systemctl enable --now mdcheck_start.timer mdcheck_continue.timer >/dev/null 2>&1; then
-      info "ANAS periodic scrub removed. mdadm's own parity check (mdcheck_start.timer, mdcheck_continue.timer) — the distro default, which ANAS disabled when the scrub was enabled — has been RESTORED;"
+      info "ANAS periodic scrub removed. mdadm's own parity check (mdcheck_start.timer, mdcheck_continue.timer) is the distro default. ANAS disabled it when the scrub was enabled, and it has been RESTORED;"
       info "run \`systemctl disable --now mdcheck_start.timer mdcheck_continue.timer\` if you do not want a periodic md parity check on this node."
     else
-      warn "ANAS periodic scrub removed, but mdadm's own parity check (mdcheck_start.timer, mdcheck_continue.timer) could not be re-enabled (masked or not installed) — the node is left with no periodic md parity check."
+      warn "ANAS periodic scrub removed, but mdadm's own parity check (mdcheck_start.timer, mdcheck_continue.timer) could not be re-enabled (masked or not installed). The node is left with no periodic md parity check."
       warn "Run \`systemctl enable --now mdcheck_start.timer mdcheck_continue.timer\` by hand, or arrange a parity check another way."
     fi
   fi
@@ -112,7 +112,7 @@ if [ "${ANAS_UNINSTALL_LIB_ONLY:-0}" = "1" ]; then
 fi
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  err "must run as root (EUID 0) — try: sudo ./uninstall.sh"
+  err "must run as root (EUID 0). Try: sudo ./uninstall.sh"
   exit 1
 fi
 

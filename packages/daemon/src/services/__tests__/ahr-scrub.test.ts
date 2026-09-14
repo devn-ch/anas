@@ -308,8 +308,8 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     assert.equal(warns[0].args[3], 'AHR scrub: parity mismatch on t2-r1')
     assert.equal(
       warns[0].args[4],
-      'rot exists in t2-r1 — phase 2 (running now) checks every file\'s checksum; '
-      + 'if a file is affected, it will be named',
+      'rot exists in t2-r1. Phase 2 is running now and checks every file\'s checksum. '
+      + 'If a file is affected, it will be named',
     )
     assert.equal(warns[1].args[3], 'AHR scrub: parity mismatch on t2-r1')
     assert.ok(warns[1].args[4].startsWith('Parity mismatch on t2-r1 (8), but the checksum scrub found no corrupt files'), warns[1].args[4])
@@ -625,7 +625,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
 
     assert.ok(
-      progress.some(m => m.startsWith('check state unknown on t2-r1 — not counted')),
+      progress.some(m => m.startsWith('check state unknown on t2-r1. Not counted')),
       progress.join(' | '),
     )
     assert.ok(!progress.some(m => m.includes('finished before the first poll')), progress.join(' | '))
@@ -703,7 +703,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
         [],
         'no counter is read as the verdict of a band md is not checking for us',
       )
-      assert.ok(progress.includes(`t2-r1 was not checked (sync_action=${takeover}) — md is not running this scrub's check on that band`), progress.join(' | '))
+      assert.ok(progress.includes(`t2-r1 was not checked (sync_action=${takeover}). md is not running this scrub's check on that band`), progress.join(' | '))
       // D8: no rot is claimed from a stale number — but the band is SAID
       // skipped, so the only notification here is the skipped-band one.
       const skippedNotifies = executor.calls.filter(c => c.command === '/usr/bin/perl')
@@ -808,8 +808,8 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20, checkFinishCeilingMs: 5 })
 
     assert.equal(result.checkedArrays, 1, 't2-r1 was abandoned — it is not coverage')
-    assert.deepEqual(result.bandsSkipped, [{ band: 't2-r1', reason: 'still not idle after the 5ms ceiling — the check may still be running' }])
-    assert.ok(progress.some(m => m.includes('t2-r1 was not checked (sync_action=check) — still not idle after the 5ms ceiling')), progress.join(' | '))
+    assert.deepEqual(result.bandsSkipped, [{ band: 't2-r1', reason: 'still not idle after the 5ms ceiling: the check may still be running' }])
+    assert.ok(progress.some(m => m.includes('t2-r1 was not checked (sync_action=check). Still not idle after the 5ms ceiling')), progress.join(' | '))
     assert.deepEqual(
       counterReads(executor, 'md127').filter(i => i > checkIssuedAt(executor, '/dev/md/t2-r1')),
       [],
@@ -819,7 +819,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     // so idle goes in before the next band's check is issued.
     const idleAt = executor.calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle' && c.args[1] === '/dev/md/t2-r1')
     assert.ok(idleAt >= 0 && idleAt < checkIssuedAt(executor, '/dev/md/t2-r2'), 'the ceiling writes idle before moving on')
-    assert.ok(progress.includes('dropped this scrub\'s check on t2-r1 so it cannot run beside the next band\'s'), progress.join(' | '))
+    assert.ok(progress.includes('dropped this scrub\'s check on t2-r1 so it cannot run beside the next band\'s check'), progress.join(' | '))
     assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'), 'the job finishes rather than spinning')
   })
 
@@ -856,7 +856,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
 
     assert.ok(
-      progress.includes('Cannot resolve /dev/md/t2-r1 to a kernel device — not waiting on its check'),
+      progress.includes('Cannot resolve /dev/md/t2-r1 to a kernel device. Not waiting on its check'),
       progress.join(' | '),
     )
     // The check WAS issued either way — and nothing is written to take it back,
@@ -867,7 +867,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       'no idle is written to an array whose sync_action cannot be read',
     )
     assert.ok(
-      progress.some(m => m.includes('could not drop this scrub\'s check on t2-r1') && m.includes('nothing was written')),
+      progress.some(m => m.includes('could not drop this scrub\'s check on t2-r1') && m.includes('Nothing was written')),
       progress.join(' | '),
     )
     const nextCheck = checkIssuedAt(executor, '/dev/md/t2-r2')
@@ -897,7 +897,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
 
     assert.ok(
-      progress.includes('t2-r1 was not checked (md is running recover) — a parity check would fight the operation md is already running on that band'),
+      progress.includes('t2-r1 was not checked. md is running recover on that band, and a parity check would fight it'),
       progress.join(' | '),
     )
     assert.equal(checkIssuedAt(executor, '/dev/md/t2-r1'), -1, 'no check was issued into the recovery')

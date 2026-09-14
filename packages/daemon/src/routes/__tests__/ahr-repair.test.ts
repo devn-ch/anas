@@ -249,7 +249,7 @@ describe('POST /v1/ahr/:name/repair — validation', () => {
     const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [1] }]) })
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.code, 'CONFLICT')
-    assert.match(res.json().error.message, /could not be resolved on the filesystem — refusing to repair against an unresolvable root/)
+    assert.match(res.json().error.message, /could not be resolved on the filesystem. Refusing to repair against an unresolvable root/)
     assert.equal(res.headers['x-anas-confirm-code'], undefined)
     await server.close()
   })
@@ -384,7 +384,7 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
     assert.match(warnings, /written THROUGH md/)
     assert.match(warnings, /matches the checksum btrfs stored/)
     assert.match(warnings, /Nothing else on the array is touched/)
-    assert.match(warnings, /left exactly as it is/)
+    assert.match(warnings, /left untouched/)
     const code = first.headers['x-anas-confirm-code'] as string
     assert.ok(code)
     assert.ok(first.headers['x-anas-confirm-expires'])
@@ -449,8 +449,8 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
     const warnings = (first.json().error.warnings as string[]).join('\n')
     assert.match(warnings, /Per block: two node-wide page-cache drops \(drop_caches\), two ~200 MiB read sweeps over the array/)
     // ahr0's bands are striped (raid5), so the stripe-cache clause rides.
-    assert.match(warnings, /the band's stripe cache at its floor for the duration — a busy node will feel it/)
-    assert.match(warnings, /bring latency-sensitive workloads down first/)
+    assert.match(warnings, /the band's stripe cache held at its floor for the duration. A busy node will feel it/)
+    assert.match(warnings, /Bring latency-sensitive workloads down first/)
     await server.close()
   })
 })

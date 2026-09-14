@@ -785,7 +785,7 @@ describe('POST /v1/ahr/:name/parity-rewrite', () => {
     const res = await post({ band: 1 })
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.reason, 'data-findings-present')
-    assert.ok(res.json().error.message.includes('repair those files from parity first'), res.json().error.message)
+    assert.ok(res.json().error.message.includes('Repair those files from parity first'), res.json().error.message)
   })
 
   it('409 job-active while a scrub is in flight on the pool', async () => {
@@ -879,7 +879,7 @@ describe('POST /v1/ahr/:name/parity-rewrite', () => {
     const res = await post({ band: 1 })
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.reason, 'bad-blocks-present')
-    assert.ok(res.json().error.message.includes('replace the member first'), res.json().error.message)
+    assert.ok(res.json().error.message.includes('Replace the member first'), res.json().error.message)
     assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no bypass — this is not a risk to accept')
   })
 
@@ -943,6 +943,6 @@ describe('rewriteLunWarnings — the parity-rewrite LUN disclosure (F10)', () =>
   it('an idle LUN still gets the line, with the honest "no initiator" clause', () => {
     const [line] = rewriteLunWarnings(HELD)
     assert.match(line, /No initiator is logged in right now/)
-    assert.match(line, /never a file/)
+    assert.match(line, /and it writes no file/)
   })
 })

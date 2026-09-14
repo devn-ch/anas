@@ -181,7 +181,7 @@ describe('AHR repair job — the one notification', () => {
     assert.equal(exec.calls.filter(c => c.command === '/usr/bin/perl').length, 1, 'exactly one notification')
     assert.equal(notify.severity, 'info')
     assert.match(notify.body, /2 repaired, 0 unrepairable, 0 above md/)
-    assert.match(notify.body, /\/a\.bin — 2 repaired/)
+    assert.match(notify.body, /\/a\.bin: 2 repaired/)
     // Nothing to act on, so neither piece of advice appears.
     assert.doesNotMatch(notify.body, /restore this file from backup/)
     assert.doesNotMatch(notify.body, /implicates something other than the disks/)
@@ -206,7 +206,7 @@ describe('AHR repair job — the one notification', () => {
     const notify = notification(exec)!
     assert.equal(notify.severity, 'warning')
     assert.match(notify.body, /restore this file from backup/)
-    assert.match(notify.body, /parity already agreed with the bad data — this implicates something other than the disks \(memory, controller, software\)/)
+    assert.match(notify.body, /parity already agreed with the bad data. This implicates something other than the disks \(memory, controller, software\)/)
     // An implication, never a certainty.
     assert.doesNotMatch(notify.body, /proves|definitely/)
   })
@@ -224,7 +224,7 @@ describe('AHR repair job — the one notification', () => {
     // Still a warning and now counted AS ITSELF — nothing was repaired.
     assert.equal(notify.severity, 'warning')
     assert.match(notify.body, /0 repaired, 0 unrepairable, 0 above md, 2 not corrupt at the mapped location/)
-    assert.match(notify.body, /\/a\.bin — 2 mapping-abort/)
+    assert.match(notify.body, /\/a\.bin: 2 mapping-abort/)
     // But the advice is the opposite of "restore from backup", and it reads the
     // ONE number (review R9).
     assert.doesNotMatch(notify.body, /restore this file from backup/)
@@ -282,7 +282,7 @@ describe('AHR repair job — the one notification', () => {
     const notify = notification(exec)!
     assert.match(
       notify.body,
-      new RegExp(`${MOUNTPOINT.replace(/\//g, '\\/')}/lun-images\\/win\\.lun — this block backs iSCSI LUN iqn\\.2026-01\\.org\\.anas:storage\\.tank/3`),
+      new RegExp(`${MOUNTPOINT.replace(/\//g, '\\/')}/lun-images\\/win\\.lun: this block backs iSCSI LUN iqn\\.2026-01\\.org\\.anas:storage\\.tank/3`),
     )
     assert.match(notify.body, /Restore as new LUN/)
     assert.doesNotMatch(notify.body, /restore this file from backup/)
@@ -308,7 +308,7 @@ describe('AHR repair job — the one notification', () => {
       },
     )
     const notify = notification(exec)!
-    assert.match(notify.body, /\/a\.bin — the file's checksum could not be read reliably; re-scrub after the metadata is repaired/)
+    assert.match(notify.body, /\/a\.bin: the file's checksum could not be read reliably. Re-scrub after the metadata is repaired/)
     assert.doesNotMatch(notify.body, /restore this file from backup/)
   })
 
@@ -352,7 +352,7 @@ describe('AHR repair job — the one notification', () => {
     assert.doesNotMatch(notify.body, /restore the LUN image/)
     // …and the re-scrub advice stands, with the LUN identity composed in so the
     // operator still knows what the file is.
-    assert.match(notify.body, /the file's checksum could not be read reliably; re-scrub after the metadata is repaired/)
+    assert.match(notify.body, /the file's checksum could not be read reliably. Re-scrub after the metadata is repaired/)
     assert.match(notify.body, /backs iSCSI LUN iqn\.2026-01\.org\.anas:storage\.tank\/3/)
   })
 
@@ -425,7 +425,7 @@ describe('AHR repair job — the one notification', () => {
       },
     )
     const notify = notification(exec)!
-    assert.match(notify.body, /re-scrub after the metadata is repaired/)
+    assert.match(notify.body, /Re-scrub after the metadata is repaired/)
     assert.doesNotMatch(notify.body, /restore this file from backup/)
   })
 
@@ -447,7 +447,7 @@ describe('AHR repair job — the one notification', () => {
       },
     )
     const notify = notification(exec)!
-    assert.match(notify.body, /\/a\.bin — restore this file from backup/)
+    assert.match(notify.body, /\/a\.bin: restore this file from backup/)
   })
 
   it('the notification names all five counts, and they add up (review R9, seventh pass F3)', async () => {
@@ -560,7 +560,7 @@ describe('AHR repair schemas — round trips', () => {
  */
 describe('AHR repair job — the not-examined bucket (F3)', () => {
   const REASONS: [string, RegExp][] = [
-    ['inline-extent', /re-scrub after the file is rewritten/],
+    ['inline-extent', /Re-scrub after the file is rewritten/],
     ['hole', /every LUN image ANAS creates is sparse/],
     ['owner-scan-truncated', /the back-reference scan hit its bound/],
     ['band-unreadable', /the array was not answering/],
@@ -691,7 +691,7 @@ describe('AHR repair job — parity residuals (F2)', () => {
     const notify = notification(exec)!
     assert.equal(notify.severity, 'warning', 'every block repaired is not a clean run while a band still mismatches')
     assert.match(notify.body, /Run Rewrite parity on:/)
-    assert.match(notify.body, /tank-r2 \(\/dev\/md127\) — mismatch_cnt 8/)
+    assert.match(notify.body, /tank-r2 \(\/dev\/md127\): mismatch_cnt 8/)
     assert.ok(!/restore/i.test(notify.body), notify.body)
   })
 })

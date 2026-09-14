@@ -1069,7 +1069,7 @@
                 try {
                     if (typeof rb.setTooltip === 'function') {
                         rb.setTooltip(pin
-                            ? t('a transient ANAS repair pin — there is nothing to roll back to; it is deleted when the repair finishes (safe to delete by hand if no repair is running)')
+                            ? t('a transient ANAS repair pin. There is nothing to roll back to. It is deleted when the repair finishes (safe to delete by hand if no repair is running)')
                             : '');
                     }
                 } catch (eT) {
@@ -1238,7 +1238,7 @@
                                 }
                                 return enc(v)
                                     + ' <span style="color:var(--anas-muted,gray);">('
-                                    + enc(t('transient — ANAS repair pin; safe to delete if no repair is running'))
+                                    + enc(t('transient ANAS repair pin; safe to delete if no repair is running'))
                                     + ')</span>';
                             },
                         },

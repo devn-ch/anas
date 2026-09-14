@@ -220,7 +220,7 @@ describe('selfheal reconcile — a band md is already working on', () => {
     assert.equal(node.knob('md127', 'sync_max'), '6400')
     assert.equal(node.knob('md127', 'sync_action'), 'recover')
     assert.equal(report.skipped.length, 1)
-    assert.match(report.skipped[0], /^tank-r1: sync_min=6272 sync_max=6400 left as they are — md is running recover$/)
+    assert.match(report.skipped[0], /^tank-r1: sync_min=6272 sync_max=6400 left as they are: md is running recover$/)
     // The two knobs that change how md WRITES, never what it is DOING, are
     // still put back: a rebuild at rmw_level=0 is correct, only slower.
     assert.equal(node.knob('md127', 'rmw_level'), '1')

@@ -125,7 +125,7 @@ export async function reconcileSelfhealState(
     const active = options?.activeJob?.(pool.name)
     if (active) {
       report.skipped.push(
-        `${pool.name}: not reconciled — ${active.operation} job ${active.id} is in flight on this pool, and its md knobs and transient snapshot are in USE, not leftovers`,
+        `${pool.name}: not reconciled. ${active.operation} job ${active.id} is in flight on this pool, and its md knobs and transient snapshot are in use`,
       )
       continue
     }
@@ -173,14 +173,14 @@ async function reconcileBand(
       // an operation that is not ours. Say what was found; the next pass, or
       // the scrub's own pre-issue check, puts it back once md is done.
       report.skipped.push(
-        `${label}: sync_min=${syncMin ?? 'unreadable'} sync_max=${syncMax ?? 'unreadable'} left as they are — md is running ${action ?? 'an operation whose sync_action could not be read'}`,
+        `${label}: sync_min=${syncMin ?? 'unreadable'} sync_max=${syncMax ?? 'unreadable'} left as they are: md is running ${action ?? 'an operation whose sync_action could not be read'}`,
       )
     }
     else {
       await writeMdAttr(sys, 'sync_min', MD_DEFAULT_SYNC_MIN)
       await writeMdAttr(sys, 'sync_max', MD_DEFAULT_SYNC_MAX)
       report.restored.push(
-        `${label}: sync window restored to ${MD_DEFAULT_SYNC_MIN}..${MD_DEFAULT_SYNC_MAX} (was ${syncMin ?? '?'}..${syncMax ?? '?'} — a repair left it bounded to one stripe, which would have made the next parity check cover that stripe alone)`,
+        `${label}: sync window restored to ${MD_DEFAULT_SYNC_MIN}..${MD_DEFAULT_SYNC_MAX} (was ${syncMin ?? '?'}..${syncMax ?? '?'}: a repair had left it bounded to one stripe, which would have made the next parity check cover that stripe alone)`,
       )
     }
   }
