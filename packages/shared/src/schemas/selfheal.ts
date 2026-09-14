@@ -240,6 +240,18 @@ export const SelfhealDiagnostics = z.object({
   precheckMismatch: z.number().int().nonnegative().optional(),
   /** `mismatch_cnt` from the bounded md check after the write. 0 is the only pass. */
   postcheckMismatch: z.number().int().nonnegative().optional(),
+  /**
+   * md's bounded check read 0 over a parity group a DIRECT read of the members
+   * shows is inconsistent — its cached view of the stripe was stale (GT-23).
+   *
+   * On kernel 7.0.14-17 a stripe written through md moments earlier survives
+   * the engine's eviction, and a bounded check over it compares the CACHED
+   * copy. Taken alone that number reads `above-md` — "parity already agrees
+   * with the bad data" — over rot that is below md all along. The verdict is
+   * computed from the member rows instead, and this flag says md's own number
+   * was the stale one.
+   */
+  staleCache: z.boolean().optional(),
   /** On-disk sectors of the repair unit that failed their stored csum. */
   badSectors: z.array(z.number().int().nonnegative()).optional(),
   /** crc32c of the winning candidate, hex. */

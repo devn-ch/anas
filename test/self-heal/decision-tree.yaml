@@ -137,14 +137,14 @@ nodes:
     code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
     test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:parity mismatch and errors that name NO file'
     gt: GT-18
-    next: [S00, S22, S62, P00, E12a]
+    next: [S00, S22, S62, P00, E12a, E12e]
   - id: X2
     kind: decision
     label: 'btrfs scrub reports csum errors: the kernel journal names the file, the 64 KiB stripe and the subvolume'
     code: 'packages/daemon/src/services/ahr-scrub.ts:parseScrubWarning'
     test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:parses the drill's checksum-error line field for field"
     gt: GT-3
-    next: [S43, S61, P01b]
+    next: [S43, S61, P01b, E05f]
   - id: X3
     kind: decision
     label: 'two blocks of one stripe are damaged: no reconstruction can match the stored csum'
@@ -154,11 +154,11 @@ nodes:
     next: [E08a, E07r6]
   - id: X4
     kind: decision
-    label: "the block fails its stored csum while md's own bounded check over the stripe counts nothing"
+    label: "the block fails its stored csum while the parity group agrees with itself - read BOTH ways, md's own bounded check over the stripe and a direct read of every member's row"
     code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data'
     gt: GT-6
-    next: [E05b, E04f, S00]
+    next: [E05b, E05e, E04f, S00]
   - id: X5
     kind: decision
     label: a metadata node fails its own crc32c — the csum tree leaf that would arbitrate the data block is itself rotten
@@ -211,7 +211,7 @@ nodes:
     code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
     test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:every mismatching band warns; an unreadable counter warns about nothing'
     gt: GT-16
-    next: [S22, S62, U07, P03a, E04g, E04f, X9r]
+    next: [S22, S62, U07, P03a, E04g, E04f, X9r, E04f3, E04f4]
   - id: X9r
     kind: ui
     label: 'the mirror-mismatch wording names NO verb the operator cannot reach: "mirror mismatch - not yet repairable from ANAS (selfheal.11); do not run md repair on a mirror". The verb itself is story selfheal.11 - inked, not built'
@@ -1071,18 +1071,31 @@ nodes:
     next: [E04f1, E04f2]
   - id: E04f1
     kind: decision
-    label: 'mismatch_cnt = 0: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types'
+    label: 'mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types'
     code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD'
     gt: GT-16
     next: [J43]
   - id: E04f2
     kind: refusal
-    label: 'mismatch_cnt > 0: the legs disagree with each other and neither matches the stored csum - `unrepairable`, and here a restore IS the only action left'
+    label: 'mismatch_cnt > 0 AND the direct read of the legs shows they differ: the legs disagree with each other and neither matches the stored csum - `unrepairable`, and here a restore IS the only action left'
     code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE'
     gt: GT-16
     next: [J40]
+  - id: E04f3
+    kind: refusal
+    label: "mismatch_cnt = 0 while a DIRECT read of the legs shows they DIFFER: md's cached view of this stripe was stale (GT-23), so this is not the mirror's `above-md` at all - `unrepairable` with staleCache recorded, and the restore stands"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:directParityConsistent'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 over legs that DIFFER: md's cached view was stale, never above-md (GT-23)"
+    gt: GT-23
+    next: [J40]
+  - id: E04f4
+    kind: refusal
+    label: "mismatch_cnt > 0 while the legs hold the SAME bytes: md and the direct read disagree about this stripe - `unrepairable`, nothing written, and NEVER `above-md` (which md's own count denies). No restore advice: nothing here proves the file unrecoverable"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:parityAgreement'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 over legs that hold the SAME bytes: md and the direct read disagree (GT-23)'
+    gt: GT-23
   - id: E04g
     kind: action
     label: 'RAID1: each leg read at ITS OWN data offset, a torn read retried 3×; the failing leg is named as the member and the passing legs become the candidates'
@@ -1092,25 +1105,45 @@ nodes:
     next: [E05a]
   - id: E05a
     kind: action
-    label: 'evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk'
+    label: 'evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone'
     code: 'packages/daemon/src/services/selfheal-repair.ts:memberDataSectors'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array'
     gt: GT-14
+    next: [E05a2]
+  - id: E05a2
+    kind: action
+    label: "directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23)"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:directParityConsistent'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data'
+    gt: GT-23
     next: [E05]
   - id: E05
     kind: decision
-    label: 'precheck: a bounded md `check` over the TARGET stripe, and its `mismatch_cnt`'
-    code: 'packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck'
-    test: 'suite:5-sanity2'
+    label: 'precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:parityAgreement'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations'
     gt: GT-5
     next: [E06]
   - id: E05b
     kind: decision
-    label: 'mismatch_cnt = 0 while the block fails its stored csum: `above-md` — parity agrees with the bad data, which implicates something other than the disks. Nothing written.'
+    label: 'mismatch_cnt = 0 AND the direct member read says the parity group agrees with itself, while the block fails its stored csum: `above-md` — parity agrees with the bad data, which implicates something other than the disks. Nothing written.'
     code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data'
     gt: GT-6
     next: [J43]
+  - id: E05e
+    kind: refusal
+    label: "md counts the stripe while the direct member read says the row agrees with itself: `unrepairable`, \"md and the direct read disagree about this stripe; nothing written\" - and NEVER `above-md`, which md's own count denies. No restore advice: nothing here proves the file unrecoverable"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:parityAgreement'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES when md counts the stripe and the member rows agree — never above-md'
+    gt: GT-23
+  - id: E05f
+    kind: action
+    label: "mismatch_cnt = 0 while the direct member read faults the row: md answered from its stripe cache (GT-23). The rot is BELOW md after all - `staleCache: true` is recorded, the step says so in the operator's words, and the repair goes on to the reconstruction"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:directParityConsistent'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REPAIRS it anyway, and records that md's cached view was stale"
+    gt: GT-23
+    next: [E06]
   - id: E05c
     kind: refusal
     label: 'md took an operation of its own BEFORE the write: ForeignSyncOpError is raised INSTEAD of writing anything, and every knob is left as md set it'
@@ -1211,11 +1244,18 @@ nodes:
     next: [E12]
   - id: E12
     kind: decision
-    label: 'postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again'
+    label: 'postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23)'
     code: 'packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck'
     test: 'suite:7-bcheck'
     gt: GT-8
     next: [E13]
+  - id: E12e
+    kind: decision
+    label: "the post-check reads `mismatch_cnt = 0` over a row the DIRECT member read still faults: md's stale view of our OWN write, never a clean parity group. `staleCache: true` is recorded and the block takes the same cold proof a counted residual takes; the advice is the re-scrub that produces a count Rewrite parity's evidence gate will accept"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:directParityConsistent'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:is not a clean pass: the block is proven cold and the residual is reported'
+    gt: GT-23
+    next: [E12a]
   - id: E12a
     kind: decision
     label: 'postcheck still counts mismatches over a block that was WRITTEN: the block is re-read COLD and arbitrated against its stored csum again, because a non-zero post-check AFTER a write is a different verdict from one before it'

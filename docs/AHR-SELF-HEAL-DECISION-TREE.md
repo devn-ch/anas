@@ -94,22 +94,22 @@ every entry on it is a fault where a restore is the only action left.
 
 | root | fault | nodes | terminal leaves | `code: —` | `test: —` |
 |---|---|---|---|---|---|
-| R1 | md mismatch with the data intact (parity / Q rot) | 56 | 7 | 0 | 0 |
-| R2 | btrfs csum error — one data member rotted below md | 47 | 4 | 0 | 0 |
+| R1 | md mismatch with the data intact (parity / Q rot) | 57 | 7 | 0 | 0 |
+| R2 | btrfs csum error — one data member rotted below md | 49 | 4 | 0 | 0 |
 | R3 | two damaged members in one stripe (RAID5 unrepairable / RAID6 Q path) | 15 | 1 | 0 | 0 |
-| R4 | rot that arrived THROUGH md (parity agrees with the bad data) | 32 | 3 | 0 | 0 |
-| R5 | metadata rot (csum tree / fs tree) in a DUP copy | 25 | 3 | 1 | 1 |
-| R6 | compressed-extent rot | 32 | 2 | 0 | 1 |
+| R4 | rot that arrived THROUGH md (parity agrees with the bad data) | 33 | 4 | 0 | 0 |
+| R5 | metadata rot (csum tree / fs tree) in a DUP copy | 26 | 3 | 1 | 1 |
+| R6 | compressed-extent rot | 33 | 2 | 0 | 1 |
 | R7 | rot in a file without checksums (NOCOW / prealloc / nodatasum) | 7 | 2 | 0 | 0 |
 | R8 | rot in an extent referenced only by a snapshot (outsideMount) | 8 | 4 | 0 | 0 |
-| R9 | mismatch on a RAID1 band (the legs disagree) | 36 | 6 | 0 | 0 |
+| R9 | mismatch on a RAID1 band (the legs disagree) | 39 | 7 | 0 | 0 |
 | R10 | member failure / degraded array before, during or after a scrub or repair | 22 | 7 | 0 | 0 |
 | R11 | URE during a rebuild (md bad-block list) | 36 | 5 | 0 | 0 |
 | R12 | daemon SIGKILL / OOM / upgrade-restart mid-repair or mid-scrub | 14 | 7 | 0 | 0 |
 | R13 | power loss mid-repair | 10 | 4 | 1 | 2 |
 | R14 | a foreign md op (mdcheck, recovery, reshape) concurrent with ours | 25 | 7 | 0 | 0 |
-| R15 | a block in band N of a multi-band pool | 27 | 2 | 0 | 0 |
-| R16 | a block backing an iSCSI LUN image | 33 | 2 | 0 | 0 |
+| R15 | a block in band N of a multi-band pool | 28 | 2 | 0 | 0 |
+| R16 | a block backing an iSCSI LUN image | 34 | 2 | 0 | 0 |
 | R17 | check never started / state unknown / counter unreadable | 15 | 2 | 0 | 0 |
 | R18 | file changed, truncated, deleted or inode reused between scrub and repair | 16 | 5 | 0 | 0 |
 | R19 | a crc32c collision on a candidate (accepted residual) | 10 | 2 | 1 | 1 |
@@ -119,7 +119,7 @@ every entry on it is a fault where a restore is the only action left.
 | R23 | the pool's top-level mount held by a backup during a repair | 12 | 3 | 0 | 0 |
 | R24 | the operator names a path outside the pool — a symlink, a bind mount | 5 | 4 | 0 | 0 |
 
-**24 roots · 240 nodes · 55 terminal leaves · 4 with no code · 6 with no test ·
+**24 roots · 246 nodes · 57 terminal leaves · 4 with no code · 6 with no test ·
 0 orphan nodes · 54 orphan exported actions · 0 mis-applied actions.**
 
 ## The trees
@@ -134,6 +134,7 @@ flowchart TD
   S62[/"the PARITY-ONLY warning: mismatches stand and phase 2 named NO file, so the…"/]
   P00{"POST /v1/ahr/:name/parity-rewrite"}
   E12a{"postcheck still counts mismatches over a block that was WRITTEN"}
+  E12e{"the post-check reads mismatch_cnt = 0 over a row the DIRECT member read…"}
   S01(["the pool is not mounted: the job throws before md is touched"])
   S02["resolve this band's md kernel name from the /dev/md/&lt;pool&gt;-r&lt;n&gt; pin symlink…"]
   S24[/"phase-1 warning, per band: 'rot exists in &lt;band&gt;"/]
@@ -189,6 +190,7 @@ flowchart TD
   X1 --> S62
   X1 --> P00
   X1 --> E12a
+  X1 --> E12e
   S00 --> S01
   S00 --> S02
   S22 --> S24
@@ -196,6 +198,7 @@ flowchart TD
   P00 --> P01
   E12a --> E12c
   E12a --> E12d
+  E12e --> E12a
   S02 --> S04
   S24 --> S31
   U02 --> U07
@@ -259,6 +262,7 @@ flowchart TD
 | `S62` | notification | the PARITY-ONLY warning: mismatches stand and phase 2 named NO file, so the parity (or Q) member is what disagrees and md would reconstruct from it at the next disk failure | `packages/daemon/src/services/ahr-scrub.ts:parityBody` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:parity mismatch and errors that name NO file` | `GT-18` |
 | `P00` | decision | POST /v1/ahr/:name/parity-rewrite — the body names ONE band, because md repairs a whole array at a time | `packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteArray` | `packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the body names ONE band, as a number` | `GT-18` |
 | `E12a` | decision | postcheck still counts mismatches over a block that was WRITTEN: the block is re-read COLD and arbitrated against its stored csum again, because a non-zero post-check AFTER a write is a different verdict from one before it | `packages/daemon/src/services/selfheal-repair.ts:coldVerify` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:RAID6 with the target block AND Q rotten (F2)` | `GT-12` |
+| `E12e` | decision | the post-check reads `mismatch_cnt = 0` over a row the DIRECT member read still faults: md's stale view of our OWN write, never a clean parity group. `staleCache: true` is recorded and the block takes the same cold proof a counted residual takes; the advice is the re-scrub that produces a count Rewrite parity's evidence gate will accept | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:is not a clean pass: the block is proven cold and the residual is reported` | `GT-23` |
 | `S01` | refusal | the pool is not mounted: the job throws before md is touched | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:refuses an unmounted pool` | — |
 | `S02` | action | resolve this band's md kernel name from the /dev/md/<pool>-r<n> pin symlink AT POINT OF USE — md numbers re-enumerate across a reassembly | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:ignores a STALE route-time array.kernelName` | `GT-2` |
 | `S24` | notification | phase-1 warning, per band: "rot exists in <band> — phase 2 (running now) checks every file's checksum; if a file is affected, it will be named" | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:phase 1 rot: a mismatch_cnt > 0 warns before phase 2 starts — and phase 2 still runs` | `GT-5` |
@@ -318,98 +322,103 @@ flowchart TD
   S43["attributeScrub: journalctl -k -o json bounded to THIS scrub's own window…"]
   S61[/"warning 'AHR scrub found errors'"/]
   P01b(["data-findings-present: repair those files first, because rewriting parity…"])
+  E05f["mismatch_cnt = 0 while the direct member read faults the row"]
   S45["parse the kernel MESSAGE text for GT-3's shape, and keep only lines naming…"]
   U01[["the findings window: one row per finding, paths never truncated, the exact 4…"]]
+  E06["rmw_level = 0 on the TARGET's band for the write window"]
   S47["group every stripe per root:inode, resolve each subvolume id once, cap the…"]
   U04[["ONE predicate lights every Repair door"]]
   U05[["greyed with the reason ON the button, each blocked kind counted in its own words"]]
   RT00{"POST /v1/ahr/:name/repair — the body names the EXACT files and 4 KiB blocks…"}
+  E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
   S48["findingPath: the kernel's subvolume-relative path taken relative to the…"]
   RT01{"the pool exists, and is mounted"}
+  E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
   S52{"the extents owning the named 64 KiB stripe, resolved through the engine's own…"}
   RT03{"job-queue exclusion, mutual in all three directions"}
+  E08{"arbitrate: crc32c of each candidate against the stored csum, best first"}
   S53["every extent in the stripe is uncompressed: the kernel's offset IS the file offset"]
   RT04{"node-wide: an md check running on ANY AHR band of ANY pool, including one a…"}
+  E09{"read-back guard: the md offset about to be written must hold the bytes read…"}
   S50["the finding rides the result: findings[], errorsAttributed, unattributed, truncated"]
   RT06{"confinement is not lexical only"}
+  E10{"pre-write re-check at the LAST instant"}
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
   RT07{"confirm gate: 409 + X-Anas-Confirm-Code, the signature carrying the exact…"}
+  E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
   RT08["the per-block cost stated CONCRETELY"]
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   RT09["202: the ahr.repair job is submitted, and the engine is driven strictly one…"]
+  E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E00{"repairBlock: the file must resolve under the mountpoint (the engine's own…"}
+  E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E01{"gates: EVERY band of the pool, because which band the block is on is not…"}
+  E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
   E02["pin: sweep this engine's OWN anas-selfheal-* prefix first, then take a…"]
+  J50["AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort…"]
   E02a["§12 pool: createAhrSnapshot into @snapshots/anas-selfheal-&lt;ts&gt;, read cold…"]
   E02b["a file inside a NESTED subvolume is pinned by snapshotting THAT subvolume"]
   E02c["a flat pool (and the suite's loop rigs) has no @snapshots"]
+  J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
   E03{"resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own…"}
+  J52[["the outcome is rendered back into the window the request was made from"]]
   E04{"reverify: re-read the bytes AT the computed member location and require they…"}
   E05a["evictStripeCache: shrink stripe_cache_size to its floor of 17, sweep ±200…"]
-  E05{"precheck: a bounded md check over the TARGET stripe, and its mismatch_cnt"}
-  E06["rmw_level = 0 on the TARGET's band for the write window"]
-  E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
-  E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
-  E08{"arbitrate: crc32c of each candidate against the stored csum, best first"}
-  E09{"read-back guard: the md offset about to be written must hold the bytes read…"}
-  E10{"pre-write re-check at the LAST instant"}
-  E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
-  E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
-  E14["cleanup in finally, PER BAND and only the bands this run touched"]
-  E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
-  J50["AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort…"]
-  J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
-  J52[["the outcome is rendered back into the window the request was made from"]]
+  E05a2["directParityConsistent: every member's row read O_DIRECT off the MEMBER…"]
+  E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   X2 --> S43
   X2 --> S61
   X2 --> P01b
+  X2 --> E05f
   S43 --> S45
   S61 --> U01
+  E05f --> E06
   S45 --> S47
   U01 --> U04
   U01 --> U05
   U01 --> RT00
+  E06 --> E07
   S47 --> S48
   U04 --> RT00
   RT00 --> RT01
+  E07 --> E07r5
   S48 --> S52
   RT01 --> RT03
+  E07r5 --> E08
   S52 --> S53
   RT03 --> RT04
+  E08 --> E09
   S53 --> S50
   RT04 --> RT06
+  E09 --> E10
   S50 --> S60
   RT06 --> RT07
+  E10 --> E11
   S60 --> S64
   RT07 --> RT08
+  E11 --> E12
   RT08 --> RT09
+  E12 --> E13
   RT09 --> E00
+  E13 --> E14
   E00 --> E01
+  E14 --> E15
   E01 --> E02
+  E15 --> J50
   E02 --> E02a
   E02 --> E02b
   E02 --> E02c
+  J50 --> J51
   E02a --> E03
   E02b --> E03
   E02c --> E03
+  J51 --> J52
   E03 --> E04
   E04 --> E05a
-  E05a --> E05
+  E05a --> E05a2
+  E05a2 --> E05
   E05 --> E06
-  E06 --> E07
-  E07 --> E07r5
-  E07r5 --> E08
-  E08 --> E09
-  E09 --> E10
-  E10 --> E11
-  E11 --> E12
-  E12 --> E13
-  E13 --> E14
-  E14 --> E15
-  E15 --> J50
-  J50 --> J51
-  J51 --> J52
 ```
 
 | leaf | kind | what the system does | `code:` | `test:` | `gt:` |
@@ -418,49 +427,51 @@ flowchart TD
 | `S43` | action | attributeScrub: `journalctl -k -o json` bounded to THIS scrub's own window, line-capped | `packages/daemon/src/services/ahr-scrub.ts:attributeScrub` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:asks the journal for this window's error lines only, and for a bounded number of them` | `GT-3` |
 | `S61` | notification | warning "AHR scrub found errors": the summary, then up to 20 paths with their bad-block counts, then "…and N more" | `packages/daemon/src/services/ahr-scrub.ts:findingsBody` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:carries the paths in the SAME warning notification — never a second one` | `GT-3` |
 | `P01b` | refusal | `data-findings-present`: repair those files first, because rewriting parity now would recompute it from the corrupt data and make the rot permanent | `packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteEvidence` | `packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a scrub that found data corruption refuses with its own code` | `GT-18` |
+| `E05f` | action | mismatch_cnt = 0 while the direct member read faults the row: md answered from its stripe cache (GT-23). The rot is BELOW md after all - `staleCache: true` is recorded, the step says so in the operator's words, and the repair goes on to the reconstruction | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REPAIRS it anyway, and records that md's cached view was stale` | `GT-23` |
 | `S45` | action | parse the kernel MESSAGE text for GT-3's shape, and keep only lines naming THIS pool's dm device | `packages/daemon/src/services/ahr-scrub.ts:attributeScrubErrors` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:another pool scrubbing at the same time is not attributed to this one` | `GT-3` |
 | `U01` | ui | the findings window: one row per finding, paths never truncated, the exact 4 KiB blocks, and the reported-vs-attributed line above | `packages/pve-integration/src/69-scrubs.js:showScrubFindings` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the window states reported vs attributed` | — |
+| `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `S47` | action | group every stripe per root:inode, resolve each subvolume id once, cap the list at 200 FILES while the counts keep counting | `packages/daemon/src/services/ahr-scrub.ts:AHR_SCRUB_FINDINGS_CAP` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:caps the list at` | `GT-3` |
 | `U04` | ui | ONE predicate lights every Repair door: not missing, not outsideMount, not unidentified, and at least one named block | `packages/pve-integration/src/69-scrubs.js:repairableFinding` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubrepair: an AHR row with a repairable finding lights it` | — |
 | `U05` | ui | greyed with the reason ON the button, each blocked kind counted in its own words | `packages/pve-integration/src/69-scrubs.js:blockedFindingReasons` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubrepair: …and the tooltip says the findings cannot be repaired from here` | — |
 | `RT00` | decision | POST /v1/ahr/:name/repair — the body names the EXACT files and 4 KiB blocks the operator ticked; nothing is inferred | `packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes` | `packages/daemon/src/routes/__tests__/ahr-repair.test.ts:400 on a body that names no file, no block, or a path that is not absolute` | — |
+| `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
 | `S48` | action | findingPath: the kernel's subvolume-relative path taken relative to the subvolume the pool actually MOUNTS (a §12 pool mounts @data AT the mountpoint) | `packages/daemon/src/services/ahr-scrub.ts:findingPath` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:§12 layout: a NESTED subvolume keeps its remainder under the mountpoint` | `GT-3` |
 | `RT01` | decision | the pool exists, and is mounted — a repair resolves the block through the live filesystem | `packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes` | `packages/daemon/src/routes/__tests__/ahr-repair.test.ts:401 without identity headers, 404 for a pool that is not there` | — |
+| `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
 | `S52` | decision | the extents owning the named 64 KiB stripe, resolved through the engine's own mapping (extent tree backrefs, then one fs-tree hop per owner) | `packages/daemon/src/services/selfheal-map.ts:extentsForStripe` | `packages/daemon/src/services/__tests__/selfheal-map.test.ts:resolves the extents owning the named stripe, with their real file ranges` | `GT-3` |
 | `RT03` | decision | job-queue exclusion, mutual in all three directions: a scrub, another repair or a parity rewrite already in flight on this pool | `packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes` | `packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409 while a scrub job for this pool is in flight, naming the job` | — |
+| `E08` | decision | arbitrate: crc32c of each candidate against the stored csum, best first — the btrfs checksum is what decides, never md | `packages/daemon/src/services/selfheal-csum.ts:crc32c` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reconstructs it, arbitrates against the stored csum and writes it back` | `GT-11` |
 | `S53` | action | every extent in the stripe is uncompressed: the kernel's offset IS the file offset — probe its 16 blocks with O_DIRECT, a non-zero exit is a bad block | `packages/daemon/src/services/ahr-scrub.ts:probeStripe` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:names the corrupt file, its stripe, and the exact failing 4 KiB block` | `GT-3` |
 | `RT04` | decision | node-wide: an md `check` running on ANY AHR band of ANY pool, including one a previous daemon or mdcheck's timer started | `packages/daemon/src/services/ahr-scrub.ts:runningAhrCheck` | `packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409s a REPAIR while md holds a queued check on a band — the job queue cannot see that check` | — |
+| `E09` | decision | read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either) | `packages/daemon/src/services/selfheal-repair.ts:readBackGuard` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)` | — |
 | `S50` | action | the finding rides the result: findings[], errorsAttributed, unattributed, truncated | `packages/daemon/src/services/ahr-scrub.ts:attributeScrub` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:round-trips a full finding through JSON unchanged` | — |
 | `RT06` | decision | confinement is not lexical only: `realpath -e`, the containment check re-run on the canonical form, then `findmnt -T` must name the pool's OWN LV | `packages/daemon/src/routes/ahr-mutate.ts:repairRealPath` | `packages/daemon/src/routes/__tests__/ahr-repair.test.ts:400 for a symlink that resolves OUTSIDE the pool's tree, though the string is inside (D12)` | — |
+| `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
 | `RT07` | decision | confirm gate: 409 + X-Anas-Confirm-Code, the signature carrying the exact selection so a code cannot be replayed against another | `packages/daemon/src/safety/gate.ts:confirmGate` | `packages/daemon/src/routes/__tests__/ahr-repair.test.ts:a confirm code minted for one selection does not authorize another` | — |
+| `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
 | `RT08` | action | the per-block cost stated CONCRETELY: two node-wide drop_caches, two ~N MiB read sweeps, and the stripe cache at its floor for the duration | `packages/daemon/src/routes/ahr-mutate.ts:perBlockSweepMiB` | `packages/daemon/src/routes/__tests__/ahr-repair.test.ts:the confirm warnings state the per-block cost CONCRETELY (D13)` | — |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `RT09` | action | 202: the `ahr.repair` job is submitted, and the engine is driven strictly one block at a time | `packages/daemon/src/services/ahr-repair.ts:repairAhrFiles` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:runs strictly one block at a time, in the order they were asked for` | — |
+| `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E00` | decision | repairBlock: the file must resolve under the mountpoint (the engine's own lexical check, on top of the route's realpath + findmnt) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:refuses a file outside the mountpoint before doing anything at all` | — |
+| `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E01` | decision | gates: EVERY band of the pool, because which band the block is on is not known until it has been pinned and resolved | `packages/daemon/src/services/selfheal-repair.ts:arrayRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES while md is busy, reshaping, or the array is not writable` | `GT-17` |
+| `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
 | `E02` | action | pin: sweep this engine's OWN `anas-selfheal-*` prefix first, then take a read-only snapshot — the same AHR snapshot verbs a backup uses | `packages/daemon/src/services/selfheal-repair.ts:sweepSelfhealPins` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps a crashed earlier run's snapshot before taking its own` | — |
+| `J50` | action | AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort / notExamined, always summing to the blocks attempted | `packages/daemon/src/services/ahr-repair.ts:repairAhrFiles` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:the notification names all five counts, and they add up (review R9, seventh pass F3)` | — |
 | `E02a` | action | §12 pool: createAhrSnapshot into `@snapshots/anas-selfheal-<ts>`, read cold through withTopLevelMount | `packages/daemon/src/services/selfheal-repair.ts:takePin` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:snapshots @data into @snapshots and cold-reads through the top-level mount` | — |
 | `E02b` | action | a file inside a NESTED subvolume is pinned by snapshotting THAT subvolume — a read-only snapshot does not recurse | `packages/daemon/src/services/selfheal-repair.ts:nestedSubvolumeOf` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:pins the NESTED subvolume a file lives in, not @data (a ro snapshot does not recurse)` | — |
 | `E02c` | action | a flat pool (and the suite's loop rigs) has no `@snapshots`: the pin is an in-place read-only snapshot inside the mountpoint | `packages/daemon/src/services/selfheal-repair.ts:takePin` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:falls back to an in-place snapshot for a FLAT pool — which the suite's rigs are` | — |
-| `E03` | decision | resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own delta → the dm linear segment → member and offset from md geometry read live | `packages/daemon/src/services/selfheal-map.ts:resolveBlock` | `packages/daemon/src/services/__tests__/selfheal-map.test.ts:derives the block's repair unit and its logical byte from the tree, not from filefrag` | `GT-2` |
-| `E04` | decision | reverify: re-read the bytes AT the computed member location and require they FAIL the currently stored csum | `packages/daemon/src/services/selfheal-repair.ts:reverify` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:ABORTS when the bytes at the computed location still pass their csum` | `GT-11` |
-| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
-| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe, and its `mismatch_cnt` | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:5-sanity2` | `GT-5` |
-| `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
-| `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
-| `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
-| `E08` | decision | arbitrate: crc32c of each candidate against the stored csum, best first — the btrfs checksum is what decides, never md | `packages/daemon/src/services/selfheal-csum.ts:crc32c` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reconstructs it, arbitrates against the stored csum and writes it back` | `GT-11` |
-| `E09` | decision | read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either) | `packages/daemon/src/services/selfheal-repair.ts:readBackGuard` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)` | — |
-| `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
-| `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
-| `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
-| `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
-| `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
-| `J50` | action | AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort / notExamined, always summing to the blocks attempted | `packages/daemon/src/services/ahr-repair.ts:repairAhrFiles` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:the notification names all five counts, and they add up (review R9, seventh pass F3)` | — |
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
+| `E03` | decision | resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own delta → the dm linear segment → member and offset from md geometry read live | `packages/daemon/src/services/selfheal-map.ts:resolveBlock` | `packages/daemon/src/services/__tests__/selfheal-map.test.ts:derives the block's repair unit and its logical byte from the tree, not from filefrag` | `GT-2` |
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
+| `E04` | decision | reverify: re-read the bytes AT the computed member location and require they FAIL the currently stored csum | `packages/daemon/src/services/selfheal-repair.ts:reverify` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:ABORTS when the bytes at the computed location still pass their csum` | `GT-11` |
+| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
+| `E05a2` | action | directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data` | `GT-23` |
+| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 
 ### R3 — two damaged members in one stripe (RAID5 unrepairable / RAID6 Q path)
 
@@ -477,7 +488,7 @@ flowchart TD
   E10{"pre-write re-check at the LAST instant"}
   J52[["the outcome is rendered back into the window the request was made from"]]
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
@@ -511,7 +522,7 @@ flowchart TD
 | `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
@@ -520,13 +531,14 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  X4{"the block fails its stored csum while md's own bounded check over the stripe…"}
-  E05b{"mismatch_cnt = 0 while the block fails its stored csum: above-md"}
+  X4{"the block fails its stored csum while the parity group agrees with itself -…"}
+  E05b{"mismatch_cnt = 0 AND the direct member read says the parity group agrees with…"}
+  E05e(["md counts the stripe while the direct member read says the row agrees with itself"])
   E04f{"RAID1 with EVERY leg failing the stored csum"}
   S00{"scrub job starts: phase 1 md parity per band, strictly sequential, then phase…"}
   J43{"the above-md bucket: 'parity already agreed with the bad data"}
-  E04f1{"mismatch_cnt = 0: the legs AGREE and are both wrong - above-md, the same…"}
-  E04f2(["mismatch_cnt &gt; 0: the legs disagree with each other and neither matches the…"])
+  E04f1{"mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows…"}
+  E04f2(["mismatch_cnt &gt; 0 AND the direct read of the legs shows they differ"])
   S01(["the pool is not mounted: the job throws before md is touched"])
   S02["resolve this band's md kernel name from the /dev/md/&lt;pool&gt;-r&lt;n&gt; pin symlink…"]
   J50["AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort…"]
@@ -553,6 +565,7 @@ flowchart TD
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
   X4 --> E05b
+  X4 --> E05e
   X4 --> E04f
   X4 --> S00
   E05b --> J43
@@ -593,13 +606,14 @@ flowchart TD
 
 | leaf | kind | what the system does | `code:` | `test:` | `gt:` |
 |---|---|---|---|---|---|
-| `X4` | decision | the block fails its stored csum while md's own bounded check over the stripe counts nothing | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data` | `GT-6` |
-| `E05b` | decision | mismatch_cnt = 0 while the block fails its stored csum: `above-md` — parity agrees with the bad data, which implicates something other than the disks. Nothing written. | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data` | `GT-6` |
+| `X4` | decision | the block fails its stored csum while the parity group agrees with itself - read BOTH ways, md's own bounded check over the stripe and a direct read of every member's row | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data` | `GT-6` |
+| `E05b` | decision | mismatch_cnt = 0 AND the direct member read says the parity group agrees with itself, while the block fails its stored csum: `above-md` — parity agrees with the bad data, which implicates something other than the disks. Nothing written. | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data` | `GT-6` |
+| `E05e` | refusal | md counts the stripe while the direct member read says the row agrees with itself: `unrepairable`, "md and the direct read disagree about this stripe; nothing written" - and NEVER `above-md`, which md's own count denies. No restore advice: nothing here proves the file unrecoverable | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES when md counts the stripe and the member rows agree — never above-md` | `GT-23` |
 | `E04f` | decision | RAID1 with EVERY leg failing the stored csum: the bounded check is run BEFORE the verdict, because a mirror check compares the legs with each other - md's own answer to "do these legs agree?" | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:every mirror leg fails the csum (F4)` | `GT-16` |
 | `S00` | decision | scrub job starts: phase 1 md parity per band, strictly sequential, then phase 2 btrfs checksums | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-5` |
 | `J43` | decision | the `above-md` bucket: "parity already agreed with the bad data — this implicates something other than the disks (memory, controller, software)", which stays an implication | `packages/daemon/src/services/ahr-repair.ts:ABOVE_MD_SENTENCE` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words` | `GT-6` |
-| `E04f1` | decision | mismatch_cnt = 0: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD` | `GT-16` |
-| `E04f2` | refusal | mismatch_cnt > 0: the legs disagree with each other and neither matches the stored csum - `unrepairable`, and here a restore IS the only action left | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE` | `GT-16` |
+| `E04f1` | decision | mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD` | `GT-16` |
+| `E04f2` | refusal | mismatch_cnt > 0 AND the direct read of the legs shows they differ: the legs disagree with each other and neither matches the stored csum - `unrepairable`, and here a restore IS the only action left | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE` | `GT-16` |
 | `S01` | refusal | the pool is not mounted: the job throws before md is touched | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:refuses an unmounted pool` | — |
 | `S02` | action | resolve this band's md kernel name from the /dev/md/<pool>-r<n> pin symlink AT POINT OF USE — md numbers re-enumerate across a reassembly | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:ignores a STALE route-time array.kernelName` | `GT-2` |
 | `J50` | action | AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort / notExamined, always summing to the blocks attempted | `packages/daemon/src/services/ahr-repair.ts:repairAhrFiles` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:the notification names all five counts, and they add up (review R9, seventh pass F3)` | — |
@@ -638,20 +652,21 @@ flowchart TD
   E05a["evictStripeCache: shrink stripe_cache_size to its floor of 17, sweep ±200…"]
   J42(["csum-unreadable: re-scrub after the metadata is repaired (a btrfs scrub…"])
   S50["the finding rides the result: findings[], errorsAttributed, unattributed, truncated"]
-  E05{"precheck: a bounded md check over the TARGET stripe, and its mismatch_cnt"}
+  E05a2["directParityConsistent: every member's row read O_DIRECT off the MEMBER…"]
   J50["AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort…"]
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
-  E06["rmw_level = 0 on the TARGET's band for the write window"]
+  E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
-  E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
+  E06["rmw_level = 0 on the TARGET's band for the write window"]
   J52[["the outcome is rendered back into the window the request was made from"]]
+  E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
   E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
   E08{"arbitrate: crc32c of each candidate against the stored csum, best first"}
   E09{"read-back guard: the md offset about to be written must hold the bytes read…"}
   E10{"pre-write re-check at the LAST instant"}
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
@@ -662,14 +677,15 @@ flowchart TD
   E04b --> E05a
   E04c --> J42
   S46 --> S50
-  E05a --> E05
+  E05a --> E05a2
   J42 --> J50
   S50 --> S60
-  E05 --> E06
+  E05a2 --> E05
   J50 --> J51
   S60 --> S64
-  E06 --> E07
+  E05 --> E06
   J51 --> J52
+  E06 --> E07
   E07 --> E07r5
   E07r5 --> E08
   E08 --> E09
@@ -689,23 +705,24 @@ flowchart TD
 | `E04c` | refusal | both DUP copies fail: CsumUnreadableError with reason code `csum-unreadable` — nothing is known about the data block, and the words "restore from backup" are deliberately absent | `packages/daemon/src/services/selfheal-csum.ts:CsumUnreadableError` | `packages/daemon/src/services/__tests__/selfheal-csum.test.ts:REFUSES a csum leaf that fails its own node checksum, on both DUP copies` | `GT-20` |
 | `S46` | action | path-less errors (`unable to fixup`, read/super) counted as `unattributed`, deduped against the logicals already attributed | `packages/daemon/src/services/ahr-scrub.ts:parseUnattributedScrubError` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:errors with no path are counted unattributed — and never counted twice` | `GT-3` |
 | `X5r` | residual | a DUP metadata rot is repaired by the RW MOUNT's read path, not by the scrub: `btrfs scrub` reports 0 corrected and the only durable evidence is a one-time dmesg `read error corrected` line, which ANAS's attribution does not parse | — | — | `GT-20` |
-| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
+| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
 | `J42` | refusal | `csum-unreadable`: re-scrub after the metadata is repaired (a btrfs scrub repairs metadata copies), and explicitly do NOT restore | `packages/daemon/src/services/ahr-repair.ts:CSUM_UNREADABLE_SENTENCE` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:a csum-unreadable unrepairable block is told to re-scrub, not restore (D10)` | `GT-20` |
 | `S50` | action | the finding rides the result: findings[], errorsAttributed, unattributed, truncated | `packages/daemon/src/services/ahr-scrub.ts:attributeScrub` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:round-trips a full finding through JSON unchanged` | — |
-| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe, and its `mismatch_cnt` | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:5-sanity2` | `GT-5` |
+| `E05a2` | action | directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data` | `GT-23` |
 | `J50` | action | AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort / notExamined, always summing to the blocks attempted | `packages/daemon/src/services/ahr-repair.ts:repairAhrFiles` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:the notification names all five counts, and they add up (review R9, seventh pass F3)` | — |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
-| `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
+| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
-| `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
+| `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
+| `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
 | `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
 | `E08` | decision | arbitrate: crc32c of each candidate against the stored csum, best first — the btrfs checksum is what decides, never md | `packages/daemon/src/services/selfheal-csum.ts:crc32c` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reconstructs it, arbitrates against the stored csum and writes it back` | `GT-11` |
 | `E09` | decision | read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either) | `packages/daemon/src/services/selfheal-repair.ts:readBackGuard` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)` | — |
 | `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
@@ -734,7 +751,8 @@ flowchart TD
   E03{"resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own…"}
   E04{"reverify: re-read the bytes AT the computed member location and require they…"}
   E05a["evictStripeCache: shrink stripe_cache_size to its floor of 17, sweep ±200…"]
-  E05{"precheck: a bounded md check over the TARGET stripe, and its mismatch_cnt"}
+  E05a2["directParityConsistent: every member's row read O_DIRECT off the MEMBER…"]
+  E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   E06["rmw_level = 0 on the TARGET's band for the write window"]
   E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
   E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
@@ -742,7 +760,7 @@ flowchart TD
   E09{"read-back guard: the md offset about to be written must hold the bytes read…"}
   E10{"pre-write re-check at the LAST instant"}
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
@@ -768,7 +786,8 @@ flowchart TD
   E02c --> E03
   E03 --> E04
   E04 --> E05a
-  E05a --> E05
+  E05a --> E05a2
+  E05a2 --> E05
   E05 --> E06
   E06 --> E07
   E07 --> E07r5
@@ -804,8 +823,9 @@ flowchart TD
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
 | `E03` | decision | resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own delta → the dm linear segment → member and offset from md geometry read live | `packages/daemon/src/services/selfheal-map.ts:resolveBlock` | `packages/daemon/src/services/__tests__/selfheal-map.test.ts:derives the block's repair unit and its logical byte from the tree, not from filefrag` | `GT-2` |
 | `E04` | decision | reverify: re-read the bytes AT the computed member location and require they FAIL the currently stored csum | `packages/daemon/src/services/selfheal-repair.ts:reverify` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:ABORTS when the bytes at the computed location still pass their csum` | `GT-11` |
-| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
-| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe, and its `mismatch_cnt` | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:5-sanity2` | `GT-5` |
+| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
+| `E05a2` | action | directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data` | `GT-23` |
+| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 | `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
 | `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
@@ -813,7 +833,7 @@ flowchart TD
 | `E09` | decision | read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either) | `packages/daemon/src/services/selfheal-repair.ts:readBackGuard` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)` | — |
 | `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
@@ -891,31 +911,34 @@ flowchart TD
   E04g["RAID1: each leg read at ITS OWN data offset, a torn read retried 3×; the…"]
   E04f{"RAID1 with EVERY leg failing the stored csum"}
   X9r[["the mirror-mismatch wording names NO verb the operator cannot reach"]]
+  E04f3(["mismatch_cnt = 0 while a DIRECT read of the legs shows they DIFFER"])
+  E04f4(["mismatch_cnt &gt; 0 while the legs hold the SAME bytes"])
   S24[/"phase-1 warning, per band: 'rot exists in &lt;band&gt;"/]
   U02[["the parity indicator IS the door"]]
   E05a["evictStripeCache: shrink stripe_cache_size to its floor of 17, sweep ±200…"]
-  E04f1{"mismatch_cnt = 0: the legs AGREE and are both wrong - above-md, the same…"}
-  E04f2(["mismatch_cnt &gt; 0: the legs disagree with each other and neither matches the…"])
+  E04f1{"mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows…"}
+  E04f2(["mismatch_cnt &gt; 0 AND the direct read of the legs shows they differ"])
+  J40(["the unrepairable bucket, advised per file: 'restore this file from backup'"])
   S31["retireCheckIssued in the band loop's finally"]
   U08[["with corrupt files on the same scrub the verb is dark carrying the daemon's…"]]
-  E05{"precheck: a bounded md check over the TARGET stripe, and its mismatch_cnt"}
+  E05a2["directParityConsistent: every member's row read O_DIRECT off the MEMBER…"]
   J43{"the above-md bucket: 'parity already agreed with the bad data"}
-  J40(["the unrepairable bucket, advised per file: 'restore this file from backup'"])
-  S40["phase 2/2: btrfs scrub start polled to finished"]
-  E06["rmw_level = 0 on the TARGET's band for the write window"]
   J50["AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort…"]
-  S42{"Error summary clean: no journal is read and nothing is probed"}
-  E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
+  S40["phase 2/2: btrfs scrub start polled to finished"]
+  E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
-  S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
-  E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
+  S42{"Error summary clean: no journal is read and nothing is probed"}
+  E06["rmw_level = 0 on the TARGET's band for the write window"]
   J52[["the outcome is rendered back into the window the request was made from"]]
+  S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
+  E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
+  E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
   E08{"arbitrate: crc32c of each candidate against the stored csum, best first"}
   E09{"read-back guard: the md offset about to be written must hold the bytes read…"}
   E10{"pre-write re-check at the LAST instant"}
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
@@ -926,28 +949,32 @@ flowchart TD
   X9 --> E04g
   X9 --> E04f
   X9 --> X9r
+  X9 --> E04f3
+  X9 --> E04f4
   S22 --> S24
   S62 --> U02
   E04g --> E05a
   E04f --> E04f1
   E04f --> E04f2
+  E04f3 --> J40
   S24 --> S31
   U02 --> U07
   U02 --> U08
-  E05a --> E05
+  E05a --> E05a2
   E04f1 --> J43
   E04f2 --> J40
-  S31 --> S40
-  E05 --> E06
-  J43 --> J50
   J40 --> J50
-  S40 --> S42
-  E06 --> E07
+  S31 --> S40
+  E05a2 --> E05
+  J43 --> J50
   J50 --> J51
-  S42 --> S60
-  E07 --> E07r5
+  S40 --> S42
+  E05 --> E06
   J51 --> J52
+  S42 --> S60
+  E06 --> E07
   S60 --> S64
+  E07 --> E07r5
   E07r5 --> E08
   E08 --> E09
   E09 --> E10
@@ -969,31 +996,34 @@ flowchart TD
 | `E04g` | action | RAID1: each leg read at ITS OWN data offset, a torn read retried 3×; the failing leg is named as the member and the passing legs become the candidates | `packages/daemon/src/services/selfheal-map.ts:memberOffsetOn` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reports the FAILING leg as the member, at that leg's own offset` | `GT-16` |
 | `E04f` | decision | RAID1 with EVERY leg failing the stored csum: the bounded check is run BEFORE the verdict, because a mirror check compares the legs with each other - md's own answer to "do these legs agree?" | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:every mirror leg fails the csum (F4)` | `GT-16` |
 | `X9r` | ui | the mirror-mismatch wording names NO verb the operator cannot reach: "mirror mismatch - not yet repairable from ANAS (selfheal.11); do not run md repair on a mirror". The verb itself is story selfheal.11 - inked, not built | `packages/pve-integration/src/69-scrubs.js:MIRROR_BAND_REASON` | `packages/pve-integration/test/dialog-contracts.harness.mjs:it says there is no parity to rewrite, and names no verb the operator cannot reach` | `GT-16` |
+| `E04f3` | refusal | mismatch_cnt = 0 while a DIRECT read of the legs shows they DIFFER: md's cached view of this stripe was stale (GT-23), so this is not the mirror's `above-md` at all - `unrepairable` with staleCache recorded, and the restore stands | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 over legs that DIFFER: md's cached view was stale, never above-md (GT-23)` | `GT-23` |
+| `E04f4` | refusal | mismatch_cnt > 0 while the legs hold the SAME bytes: md and the direct read disagree about this stripe - `unrepairable`, nothing written, and NEVER `above-md` (which md's own count denies). No restore advice: nothing here proves the file unrecoverable | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 over legs that hold the SAME bytes: md and the direct read disagree (GT-23)` | `GT-23` |
 | `S24` | notification | phase-1 warning, per band: "rot exists in <band> — phase 2 (running now) checks every file's checksum; if a file is affected, it will be named" | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:phase 1 rot: a mismatch_cnt > 0 warns before phase 2 starts — and phase 2 still runs` | `GT-5` |
 | `U02` | ui | the parity indicator IS the door: `anas-win-scrub-parity` lists the bands md counted mismatches on and takes ONE | `packages/pve-integration/src/69-scrubs.js:showParityMismatches` | `packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the parity indicator opens the parity window` | `GT-18` |
-| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
-| `E04f1` | decision | mismatch_cnt = 0: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD` | `GT-16` |
-| `E04f2` | refusal | mismatch_cnt > 0: the legs disagree with each other and neither matches the stored csum - `unrepairable`, and here a restore IS the only action left | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE` | `GT-16` |
+| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
+| `E04f1` | decision | mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD` | `GT-16` |
+| `E04f2` | refusal | mismatch_cnt > 0 AND the direct read of the legs shows they differ: the legs disagree with each other and neither matches the stored csum - `unrepairable`, and here a restore IS the only action left | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE` | `GT-16` |
+| `J40` | refusal | the `unrepairable` bucket, advised per file: "restore this file from backup" **[restore-from-backup-advice]** | `packages/daemon/src/services/ahr-repair.ts:RESTORE_FILE_SENTENCE` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words` | — |
 | `S31` | action | retireCheckIssued in the band loop's `finally` — the token never outlives the iteration that took it (N3) | `packages/daemon/src/services/selfheal-syncop.ts:retireCheckIssued` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:retires the token on the SKIP paths too — md never started the check (N3)` | — |
 | `U08` | ui | with corrupt files on the same scrub the verb is dark carrying the daemon's own 409 sentence, and the handler refuses a click anyway | `packages/pve-integration/src/69-scrubs.js:parityRewriteBlocked` | `packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the handler itself refuses, not just the disabled state` | `GT-18` |
-| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe, and its `mismatch_cnt` | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:5-sanity2` | `GT-5` |
+| `E05a2` | action | directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data` | `GT-23` |
 | `J43` | decision | the `above-md` bucket: "parity already agreed with the bad data — this implicates something other than the disks (memory, controller, software)", which stays an implication | `packages/daemon/src/services/ahr-repair.ts:ABOVE_MD_SENTENCE` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words` | `GT-6` |
-| `J40` | refusal | the `unrepairable` bucket, advised per file: "restore this file from backup" **[restore-from-backup-advice]** | `packages/daemon/src/services/ahr-repair.ts:RESTORE_FILE_SENTENCE` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words` | — |
-| `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
-| `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `J50` | action | AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort / notExamined, always summing to the blocks attempted | `packages/daemon/src/services/ahr-repair.ts:repairAhrFiles` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:the notification names all five counts, and they add up (review R9, seventh pass F3)` | — |
-| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
-| `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
+| `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
+| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
-| `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
-| `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
+| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
+| `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
+| `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
+| `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
+| `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
 | `E08` | decision | arbitrate: crc32c of each candidate against the stored csum, best first — the btrfs checksum is what decides, never md | `packages/daemon/src/services/selfheal-csum.ts:crc32c` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reconstructs it, arbitrates against the stored csum and writes it back` | `GT-11` |
 | `E09` | decision | read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either) | `packages/daemon/src/services/selfheal-repair.ts:readBackGuard` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)` | — |
 | `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
@@ -1383,7 +1413,8 @@ flowchart TD
   E03{"resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own…"}
   E04{"reverify: re-read the bytes AT the computed member location and require they…"}
   E05a["evictStripeCache: shrink stripe_cache_size to its floor of 17, sweep ±200…"]
-  E05{"precheck: a bounded md check over the TARGET stripe, and its mismatch_cnt"}
+  E05a2["directParityConsistent: every member's row read O_DIRECT off the MEMBER…"]
+  E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   E06["rmw_level = 0 on the TARGET's band for the write window"]
   E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
   E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
@@ -1391,7 +1422,7 @@ flowchart TD
   E09{"read-back guard: the md offset about to be written must hold the bytes read…"}
   E10{"pre-write re-check at the LAST instant"}
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
@@ -1412,7 +1443,8 @@ flowchart TD
   E02c --> E03
   E03 --> E04
   E04 --> E05a
-  E05a --> E05
+  E05a --> E05a2
+  E05a2 --> E05
   E05 --> E06
   E06 --> E07
   E07 --> E07r5
@@ -1442,8 +1474,9 @@ flowchart TD
 | `E02c` | action | a flat pool (and the suite's loop rigs) has no `@snapshots`: the pin is an in-place read-only snapshot inside the mountpoint | `packages/daemon/src/services/selfheal-repair.ts:takePin` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:falls back to an in-place snapshot for a FLAT pool — which the suite's rigs are` | — |
 | `E03` | decision | resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own delta → the dm linear segment → member and offset from md geometry read live | `packages/daemon/src/services/selfheal-map.ts:resolveBlock` | `packages/daemon/src/services/__tests__/selfheal-map.test.ts:derives the block's repair unit and its logical byte from the tree, not from filefrag` | `GT-2` |
 | `E04` | decision | reverify: re-read the bytes AT the computed member location and require they FAIL the currently stored csum | `packages/daemon/src/services/selfheal-repair.ts:reverify` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:ABORTS when the bytes at the computed location still pass their csum` | `GT-11` |
-| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
-| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe, and its `mismatch_cnt` | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:5-sanity2` | `GT-5` |
+| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
+| `E05a2` | action | directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data` | `GT-23` |
+| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 | `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
 | `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
@@ -1451,7 +1484,7 @@ flowchart TD
 | `E09` | decision | read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either) | `packages/daemon/src/services/selfheal-repair.ts:readBackGuard` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)` | — |
 | `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
@@ -1484,7 +1517,8 @@ flowchart TD
   E03{"resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own…"}
   E04{"reverify: re-read the bytes AT the computed member location and require they…"}
   E05a["evictStripeCache: shrink stripe_cache_size to its floor of 17, sweep ±200…"]
-  E05{"precheck: a bounded md check over the TARGET stripe, and its mismatch_cnt"}
+  E05a2["directParityConsistent: every member's row read O_DIRECT off the MEMBER…"]
+  E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   E06["rmw_level = 0 on the TARGET's band for the write window"]
   E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
   E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
@@ -1492,7 +1526,7 @@ flowchart TD
   E09{"read-back guard: the md offset about to be written must hold the bytes read…"}
   E10{"pre-write re-check at the LAST instant"}
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
@@ -1521,7 +1555,8 @@ flowchart TD
   E02c --> E03
   E03 --> E04
   E04 --> E05a
-  E05a --> E05
+  E05a --> E05a2
+  E05a2 --> E05
   E05 --> E06
   E06 --> E07
   E07 --> E07r5
@@ -1558,8 +1593,9 @@ flowchart TD
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
 | `E03` | decision | resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own delta → the dm linear segment → member and offset from md geometry read live | `packages/daemon/src/services/selfheal-map.ts:resolveBlock` | `packages/daemon/src/services/__tests__/selfheal-map.test.ts:derives the block's repair unit and its logical byte from the tree, not from filefrag` | `GT-2` |
 | `E04` | decision | reverify: re-read the bytes AT the computed member location and require they FAIL the currently stored csum | `packages/daemon/src/services/selfheal-repair.ts:reverify` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:ABORTS when the bytes at the computed location still pass their csum` | `GT-11` |
-| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
-| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe, and its `mismatch_cnt` | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:5-sanity2` | `GT-5` |
+| `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
+| `E05a2` | action | directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data` | `GT-23` |
+| `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 | `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
 | `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
@@ -1567,7 +1603,7 @@ flowchart TD
 | `E09` | decision | read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either) | `packages/daemon/src/services/selfheal-repair.ts:readBackGuard` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)` | — |
 | `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
@@ -1693,7 +1729,7 @@ flowchart TD
   X19{"a reconstructed candidate whose crc32c equals the stored csum is accepted as…"}
   E08b>"STATED RESIDUAL — arbitration is a 32-bit equality"]
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
@@ -1716,7 +1752,7 @@ flowchart TD
 | `X19` | decision | a reconstructed candidate whose crc32c equals the stored csum is accepted as the original | `packages/daemon/src/services/selfheal-csum.ts:crc32c` | `packages/daemon/src/services/__tests__/selfheal-csum.test.ts:a single flipped bit changes the csum — the whole basis of arbitration` | `GT-11` |
 | `E08b` | residual | STATED RESIDUAL — arbitration is a 32-bit equality: a crc32c COLLISION on a reconstructed candidate is accepted as the original and written through md, and nothing downstream can tell the difference | — | — | `GT-11` |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |
@@ -1884,7 +1920,7 @@ flowchart TD
   E01e(["the pool's top-level mount is already held"])
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
   E13a{"the top-level mount is held: the read is SKIPPED after a bounded 60 s wait…"}
-  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0"}
+  E12{"postcheck: the same evicted bounded check must now read mismatch_cnt = 0…"}
   E14["cleanup in finally, PER BAND and only the bands this run touched"]
   E13{"cold read through the FRESH pin snapshot (drop_caches first; the whole…"}
   E15{"outcome repaired, with the mapping, the steps and the stored csum as its…"}
@@ -1912,7 +1948,7 @@ flowchart TD
 | `E01e` | refusal | the pool's top-level mount is already held — the engine refuses rather than queueing behind a backup with md's knobs turned aside | `packages/daemon/src/services/selfheal-repair.ts:gateRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES when the pool's top-level mount is already held (a backup is in flight)` | — |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
 | `E13a` | decision | the top-level mount is held: the read is SKIPPED after a bounded 60 s wait and says so — the block is still `repaired`, because the write and the post-check already happened | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:does not block behind a backup for the final cold read — it says the read was skipped` | — |
-| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` — the parity group is consistent again | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
+| `E12` | decision | postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck` | `suite:7-bcheck` | `GT-8` |
 | `E14` | action | cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin | `packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on — and leaves the other band alone` | `GT-13` |
 | `E13` | decision | cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything | `packages/daemon/src/services/selfheal-repair.ts:coldRead` | `suite:3-cold` | `GT-9` |
 | `E15` | decision | outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts` | `GT-8` |

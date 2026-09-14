@@ -79,15 +79,17 @@ import {
  *  resolve     re-resolve the block AFTER pinning, through the ONE mapping helper
  *  reverify    the bytes AT THE COMPUTED MEMBER LOCATION must FAIL the stored
  *              csum — otherwise "not corrupt here" and nothing is written
- *  precheck    bounded md check over the stripe; mismatch_cnt == 0 while the
- *              block is corrupt ⇒ parity agrees with the bad data ⇒ above-md
+ *  precheck    bounded md check over the stripe AND a direct read of every
+ *              member's row; both saying the parity group agrees with itself,
+ *              while the block is corrupt, ⇒ above-md (GT-23)
  *  rmw         rmw_level = 0 for the write window (GT-7/GT-14)
  *  reconstruct XOR (RAID5) / P-XOR then Q syndrome (RAID6) / the other legs (RAID1)
  *  arbitrate   crc32c(candidate) vs the stored csum — the whole claim of the epic
  *  guard       the md block at the computed offset must equal the member bytes
  *              (RAID1: ANY leg's — md serves a mirror read from either)
  *  write       the winner through md, O_DIRECT + fsync
- *  postcheck   bounded check again; anything but 0 is a failure, not a success
+ *  postcheck   bounded check again, corroborated by the same direct read;
+ *              anything but a consistent group is a failure, not a success
  *  coldread    the block through the FRESH SNAPSHOT, O_DIRECT
  *  finally     restore rmw_level / sync_min / sync_max / stripe_cache_size,
  *              destroy the snapshot
@@ -146,7 +148,11 @@ import {
  *    arbitration, which is the point of arbitrating).
  *  - Corruption that arrived THROUGH md — reported as `above-md`, never
  *    "repaired": parity agrees with the bad data, so there is no source of
- *    truth left below the csum tree.
+ *    truth left below the csum tree. That verdict is CACHE-INDEPENDENT since
+ *    GT-23: it is computed from the member rows themselves, with md's bounded
+ *    check as corroboration, because on kernel 7.0.14-17 a stripe written
+ *    moments ago survives the engine's eviction and its check answers from the
+ *    cache. See {@link directParityConsistent}.
  */
 
 /** What the caller asks to be repaired. */
@@ -303,6 +309,15 @@ function windowSectors(geo: MdGeometry): number {
  * while the cache is small, then restore. Without this a check over a
  * recently-touched stripe compares pre-corruption content and reports
  * `mismatch_cnt = 0` while the member block is junk.
+ *
+ * GT-23 (kernel 7.0.14-17, two identical runs) measured its REACH: a stripe
+ * whose last through-md touch is in the past is still evicted by this recipe
+ * and its check counts the rot; a stripe written moments earlier survives the
+ * whole thing, and so does `drop_caches` before it, `drop_caches` alone, and
+ * leaving `stripe_cache_size` at a value it did not start at. Only a
+ * whole-array check recycles it, which is hours per band. So this stays — it
+ * is what makes md's number worth having — and the verdict that used to rest
+ * on that number alone rests on {@link directParityConsistent} instead.
  */
 async function evictStripeCache(
   executor: CommandExecutor,
@@ -629,6 +644,154 @@ export function reconstructFromQ(blocks: (Buffer | null)[], q: Buffer, missing: 
 }
 
 // ---------------------------------------------------------------------------
+//  The direct parity computation (GT-23)
+// ---------------------------------------------------------------------------
+
+/** What a DIRECT read of every member's row says about one parity group. */
+export interface DirectParityCheck {
+  /**
+   * The members themselves agree: the XOR of the data rows IS the P row (and
+   * the Q syndrome IS the Q row on RAID6); on RAID1, every leg holds the same
+   * bytes. Nothing about md's cache takes part in the answer.
+   */
+  consistent: boolean
+  /** What was compared and what came back — the step's audit line. */
+  detail: string
+}
+
+/**
+ * Is the parity group under this block consistent, read STRAIGHT OFF THE
+ * MEMBERS? (GT-23)
+ *
+ * The engine's `above-md` verdict used to rest on one number: a bounded md
+ * `check` over the stripe reading `mismatch_cnt = 0` while the block fails its
+ * stored csum, which says parity already agrees with the bad data. GT-14
+ * established that md serves a recently-touched stripe out of its stripe cache,
+ * and `evictStripeCache` was what made that check read the disks. GT-23 (kernel
+ * 7.0.14-17, two identical runs) found that the eviction no longer reaches a
+ * stripe written moments before: rot on the member, the engine's own eviction,
+ * the bounded check reads 0 — while a direct read of the members says the XOR
+ * is not the parity row at all. A real below-md rot in a recently written
+ * stripe would be reported `above-md`: nothing written, false assurance, and
+ * the rot left in place and misdescribed. No cheap knob changed it —
+ * `drop_caches` before the eviction, `drop_caches` alone, and leaving
+ * `stripe_cache_size` at a different value all read 0 too; only a whole-array
+ * check recycled the cache, and that is hours per band.
+ *
+ * So the question is asked of the disks. The engine already reads every
+ * member's row directly to reconstruct the block; this computes the same
+ * arithmetic md's check would, one row wide, with no cache between it and the
+ * platters. Reads go through {@link readDirect} (O_DIRECT off the MEMBER
+ * devices, never through md) at each member's OWN data offset — `--grow
+ * --data-offset` is allowed to leave them differing.
+ *
+ * It answers about ONE 4 KiB row; md's bounded check answers about a whole
+ * chunk window. Both readings are kept, and {@link parityAgreement} says what
+ * the pair means.
+ */
+export async function directParityConsistent(
+  executor: CommandExecutor,
+  geo: MdGeometry,
+  location: MemberLocation,
+): Promise<DirectParityCheck> {
+  const row = (role: number): Promise<Buffer> =>
+    readDirect(executor, geo.members[role] as string, memberOffsetOn(geo, location, role), BLOCK_BYTES)
+
+  if (geo.raid1) {
+    const legs = location.mirrors.filter(leg => geo.members[leg] !== null)
+    if (legs.length < 2) {
+      // Not reachable through `repairBlock` — the gates refuse an array with a
+      // missing member — but a one-legged mirror has nothing to compare, and
+      // saying so is the only honest answer.
+      return {
+        consistent: true,
+        detail: `${geo.device} has one readable leg for this block, so a direct read has nothing to compare it with`,
+      }
+    }
+    const first = await row(legs[0])
+    for (const leg of legs.slice(1)) {
+      if (!first.equals(await row(leg))) {
+        return {
+          consistent: false,
+          detail: `a direct read of the mirror legs at their own offsets: ${geo.members[legs[0]]} and ${geo.members[leg]} DIFFER over this block`,
+        }
+      }
+    }
+    return {
+      consistent: true,
+      detail: `a direct read of all ${legs.length} mirror legs at their own offsets: every leg holds the same bytes`,
+    }
+  }
+
+  const stripe = location.stripe as number
+  const parityRole = location.parityIndex as number
+  const order = stripeDataOrder(geo, stripe)
+  const rows: Buffer[] = []
+  for (let role = 0; role < geo.raidDisks; role++)
+    rows.push(await row(role))
+
+  const computedP = Buffer.alloc(BLOCK_BYTES)
+  for (const role of order)
+    xorInto(computedP, rows[role])
+  const pOk = computedP.equals(rows[parityRole])
+  const where = `a direct read of all ${geo.raidDisks} member rows of stripe ${stripe}`
+
+  if (!geo.raid6) {
+    return {
+      consistent: pOk,
+      detail: pOk
+        ? `${where}: the XOR of the ${order.length} data rows IS the P row on ${geo.members[parityRole]}`
+        : `${where}: the XOR of the ${order.length} data rows is NOT the P row on ${geo.members[parityRole]}`,
+    }
+  }
+
+  const qRole = location.qIndex as number
+  const computedQ = Buffer.alloc(BLOCK_BYTES)
+  for (let d = 0; d < order.length; d++) {
+    const coefficient = gfPow2(d)
+    const block = rows[order[d]]
+    for (let i = 0; i < BLOCK_BYTES; i++)
+      computedQ[i] ^= gfMul(coefficient, block[i])
+  }
+  const qOk = computedQ.equals(rows[qRole])
+  return {
+    consistent: pOk && qOk,
+    detail: `${where}: P on ${geo.members[parityRole]} ${pOk ? 'IS' : 'is NOT'} the XOR of the data rows, `
+      + `Q on ${geo.members[qRole]} ${qOk ? 'IS' : 'is NOT'} their syndrome`,
+  }
+}
+
+/**
+ * What the two readings of one parity group say TOGETHER (GT-23).
+ *
+ *  - `consistent`   both say the group agrees with itself. With a block that
+ *                   fails its stored csum, that is `above-md`: parity already
+ *                   agrees with the bad data.
+ *  - `stale-cache`  md counts nothing while the members disagree — md answered
+ *                   from a cached copy of the stripe. The rot is below md and
+ *                   the repair goes ahead.
+ *  - `inconsistent` both say the group disagrees with itself: the ordinary
+ *                   below-md rot the engine exists for.
+ *  - `disagree`     md counts a mismatch while the members' own row agrees.
+ *                   The two readings are not about the same thing — md's
+ *                   window is a whole chunk and this row is one page of it —
+ *                   so BEFORE a write it is not a fault this engine can act on
+ *                   (and never `above-md`), and after one it is the parity
+ *                   residual F2 describes.
+ *
+ * `mdMismatch` is null when the bounded check could not be taken at all; the
+ * direct reading then decides on its own.
+ */
+export type SelfhealParityAgreement = 'consistent' | 'stale-cache' | 'inconsistent' | 'disagree'
+
+/** @see SelfhealParityAgreement */
+export function parityAgreement(directConsistent: boolean, mdMismatch: number | null): SelfhealParityAgreement {
+  if (directConsistent)
+    return mdMismatch === null || mdMismatch === 0 ? 'consistent' : 'disagree'
+  return mdMismatch === 0 ? 'stale-cache' : 'inconsistent'
+}
+
+// ---------------------------------------------------------------------------
 //  The sequence
 // ---------------------------------------------------------------------------
 
@@ -808,11 +971,24 @@ export async function repairBlock(
       ;(await touchBand(mirrorGeo)).syncKnobs = true
       const legs = await boundedWindowCheck(executor, mirrorGeo, mirrorStripe, options)
       diagnostics.precheckMismatch = legs
-      note(`mismatch_cnt=${legs}`)
-      if (legs === 0) {
-        fail('above-md', `${verdict.abort.reason} md's own bounded check over ${mirrorGeo.device} reports mismatch_cnt=0, so the legs AGREE with each other and are both wrong — parity already agreed with the bad data, which implicates something other than the disks (memory, controller, software). Nothing was written.`)
+      // GT-23 — md's number alone cannot carry this verdict either. A mirror
+      // check compares the legs THROUGH md, so a cached copy of the block
+      // answers "the legs agree" over legs that differ on the platters. The
+      // legs are read directly and the pair decides.
+      const mirrorDirect = await directParityConsistent(executor, mirrorGeo, mirrorTarget)
+      const mirrorAgreement = parityAgreement(mirrorDirect.consistent, legs)
+      note(`mismatch_cnt=${legs}; ${mirrorDirect.detail}`)
+      if (mirrorAgreement === 'consistent') {
+        fail('above-md', `${verdict.abort.reason} md's own bounded check over ${mirrorGeo.device} reports mismatch_cnt=0 and ${mirrorDirect.detail}, so the legs AGREE with each other and are both wrong — parity already agreed with the bad data, which implicates something other than the disks (memory, controller, software). Nothing was written.`)
       }
-      fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es), so the legs disagree with each other and neither matches the stored csum. Restore ${file} from backup.`)
+      if (mirrorAgreement === 'disagree') {
+        fail('unrepairable', `md and the direct read disagree about this stripe; nothing written. md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es) while ${mirrorDirect.detail}.`)
+      }
+      if (mirrorAgreement === 'stale-cache') {
+        diagnostics.staleCache = true
+        fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} reports mismatch_cnt=0, but md's cached view of this stripe was stale; the direct member read shows the mismatch — ${mirrorDirect.detail}. The legs disagree with each other and neither matches the stored csum. Restore ${file} from backup.`)
+      }
+      fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es) and ${mirrorDirect.detail}, so the legs disagree with each other and neither matches the stored csum. Restore ${file} from backup.`)
     }
     if (verdict.abort)
       fail(verdict.abort.kind, verdict.abort.reason, verdict.abort.code)
@@ -839,9 +1015,30 @@ export async function repairBlock(
     ;(await touchBand(geo)).syncKnobs = true
     const before = await boundedWindowCheck(executor, geo, stripe, options)
     diagnostics.precheckMismatch = before
-    note(`mismatch_cnt=${before}`)
-    if (before === 0) {
-      fail('above-md', `the bounded md check over stripe ${stripe} reports mismatch_cnt=0 while the block fails its stored csum — parity agrees with the bad data, which implicates something other than the disks. Nothing was written.`)
+    // GT-23 — the `above-md` verdict is CACHE-INDEPENDENT. md's bounded check
+    // over a stripe written moments ago reads md's own cached copy of it on
+    // kernel 7.0.14-17 and reports 0 over rot that is sitting on the member, so
+    // the parity group is computed from DIRECT member reads and md's number is
+    // corroboration. Only both readings together say `above-md`.
+    const direct = await directParityConsistent(executor, geo, target)
+    const agreement = parityAgreement(direct.consistent, before)
+    note(`mismatch_cnt=${before}; ${direct.detail}`)
+    if (agreement === 'consistent') {
+      fail('above-md', `the bounded md check over stripe ${stripe} reports mismatch_cnt=${before} and ${direct.detail}, while the block fails its stored csum — parity agrees with the bad data, which implicates something other than the disks. Nothing was written.`)
+    }
+    if (agreement === 'disagree') {
+      // md counts the chunk window while the members' own row agrees with
+      // itself. The two are not the same question and neither answer can be
+      // acted on here: a reconstruction from a row whose parity already agrees
+      // would just rebuild the bad bytes, and `above-md` is a claim md's own
+      // count contradicts.
+      fail('unrepairable', `md and the direct read disagree about this stripe; nothing written. md's bounded check over stripe ${stripe} counts ${before} mismatch(es) while ${direct.detail}.`)
+    }
+    if (agreement === 'stale-cache') {
+      // Exactly GT-23's shape: md answered from its cache, the members say
+      // otherwise, and the rot is below md after all. The repair goes ahead.
+      diagnostics.staleCache = true
+      note(`mismatch_cnt=${before}; md's cached view of this stripe was stale; the direct member read shows the mismatch — ${direct.detail}`)
     }
 
     // ---- rmw ------------------------------------------------------------
@@ -939,8 +1136,30 @@ export async function repairBlock(
     await step('postcheck')
     const after = await boundedWindowCheck(executor, geo, stripe, options)
     diagnostics.postcheckMismatch = after
-    note(`mismatch_cnt=${after}`)
-    if (after !== 0) {
+    // GT-23 — the post-check is corroborated the same way the pre-check is, and
+    // for the same reason: the stripe was written through md moments ago, which
+    // is precisely the state in which its bounded check answers from the cache.
+    // `mismatch_cnt = 0` over a row the members say is inconsistent is md's
+    // stale view of our own write, not a clean parity group.
+    const directAfter = await directParityConsistent(executor, geo, target)
+    note(`mismatch_cnt=${after}; ${directAfter.detail}`)
+    if (after === 0 && !directAfter.consistent)
+      diagnostics.staleCache = true
+    // What the residual sentence calls the evidence. md counting the window
+    // while the written row reads consistent is not a stale cache — md's window
+    // is a whole chunk and the direct read is one page of it, so the mismatch is
+    // elsewhere in the band, which is exactly F2's residual.
+    const residualNote = after !== 0
+      ? `md's bounded check over stripe ${stripe} reports mismatch_cnt=${after}`
+      : `md's bounded check over stripe ${stripe} reports mismatch_cnt=0, but md's cached view of this stripe was stale; the direct member read shows the mismatch — ${directAfter.detail}`
+    // A residual md counted is one Rewrite parity's evidence gate accepts; one
+    // only the direct read saw carries no count md will stand behind, and that
+    // gate refuses a zero. So the advice is the scrub that produces the count,
+    // not a verb that would be turned away.
+    const residualAdvice = (band: string): string => after !== 0
+      ? `Run Rewrite parity on ${band}.`
+      : `Re-scrub the pool so the band's mismatch is counted, then run Rewrite parity on ${band}.`
+    if (after !== 0 || !directAfter.consistent) {
       // F2 — a non-zero post-check AFTER a successful write is a different
       // verdict from one before it. The RAID6 shape that produces it: rot in
       // the target block AND in Q. P-XOR wins arbitration, the block goes
@@ -952,16 +1171,16 @@ export async function repairBlock(
       // backup loses data that was recoverable.
       const proof = await coldVerify(executor, pin, resolved, verdict.badSectors[0], storedCsum)
       if (proof.ok) {
-        note(`mismatch_cnt=${after}; the block itself re-reads clean cold — the residual is parity`)
+        note(`mismatch_cnt=${after}; ${directAfter.detail}; the block itself re-reads clean cold — the residual is parity`)
         const residual = parityResidualOf(geo, after, request.pool ?? null)
         return outcome(
           'repaired',
-          `${repaired}; ${proof.detail}. The block is repaired; the band still has a parity/Q mismatch — md's bounded check over stripe ${stripe} reports mismatch_cnt=${after}, which is the parity (or Q) member disagreeing and not this file. Run Rewrite parity on ${residual.band}.`,
+          `${repaired}; ${proof.detail}. The block is repaired; the band still has a parity/Q mismatch — ${residualNote}, which is the parity (or Q) member disagreeing and not this file. ${residualAdvice(residual.band)}`,
           undefined,
           { parityResidual: residual },
         )
       }
-      fail('unrepairable', `the block was written back, the bounded md check over stripe ${stripe} still reports mismatch_cnt=${after}, AND ${proof.detail} — the parity group is not consistent and the block cannot be proven either. Restore ${file} from backup.`)
+      fail('unrepairable', `the block was written back, ${residualNote}, AND ${proof.detail} — the parity group is not consistent and the block cannot be proven either. Restore ${file} from backup.`)
     }
 
     // ---- coldread -------------------------------------------------------

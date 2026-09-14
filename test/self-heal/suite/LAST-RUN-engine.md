@@ -1,6 +1,6 @@
 # AHR self-heal loop-device suite — report
 
-- date: 2026-09-14 19:15:54  node: anas-pve  kernel: 7.0.14-17-pve
+- date: 2026-09-14 19:51:15  node: anas-pve  kernel: 7.0.14-17-pve
 - mdadm: 4.4  btrfs-progs: 6.14
 - REPAIR_CMD: `node /opt/anas/packages/daemon/dist/bin/selfheal-repair.js`
 - PARITY_CMD: `python3 /root/gtsh/suite/parity-ref.py`
@@ -29,11 +29,11 @@
 | 4-postcheck | REPAIR_FAIL_AT=postcheck: exit 70, knobs restored, no transient pin survives (subvolume set unchanged) | PASS | rc=70 (expected 70) knobs={'rmw_level': '1', 'sync_min': '0', 'sync_max': 'max', 'sync_action': 'idle'} subvolumes=unchanged |
 | 4-coldread | REPAIR_FAIL_AT=coldread: exit 70, knobs restored, no transient pin survives (subvolume set unchanged) | PASS | rc=70 (expected 70) knobs={'rmw_level': '1', 'sync_min': '0', 'sync_max': 'max', 'sync_action': 'idle'} subvolumes=unchanged |
 | 4-endcheck | bounded check suspends one stripe short of the array end (coverage 0..end-1 stripe proven) | PASS | suspended=True completed=201600/201728 (stripe=128 sectors) mismatch_cnt=8 |
-| 4-fullcheck | full md check (sync_max=max) reaches idle — the whole array is covered again | PASS | final=idle sampled_completed=331240/407552 mismatch_cnt=8 |
+| 4-fullcheck | full md check (sync_max=max) reaches idle — the whole array is covered again | PASS | final=idle sampled_completed=382200/407552 mismatch_cnt=8 |
 | 5-scan | md-device scan located the through-md rot — LOAD-BEARING: every later assertion is about the block the scan found, so a wrong hit stops the case here | PASS | scan md@153665536 vs mapped 153665536 |
 | 5-sanity | bounded check over the stripe sees mismatch_cnt==0 (rot arrived through md) | PASS | mismatch_cnt=0 (expected 0) |
-| 5-diag | repair diagnoses above-md corruption (exit 3, mismatch_cnt==0 in pre-check) | PASS | rc=3 precheck_mismatch=0 outcome=above-md steps=4 reason=the bounded md check over stripe 468 reports mismatch_cnt=0 while the block fails its stored csum — parity agrees with the bad data, which i |
-| 5-disk | nothing was written: the rot's bytes are exactly the injector's (undisturbed) and every changed member sector is btrfs housekeeping (measured mirrors + non-DATA chunks) | PASS | rot at md@153665536 unchanged=True; changed sectors classified: housekeeping=61 data=0 content=0 |
+| 5-diag | repair diagnoses above-md corruption (exit 3, mismatch_cnt==0 in pre-check) | PASS | rc=3 precheck_mismatch=0 outcome=above-md steps=4 reason=the bounded md check over stripe 468 reports mismatch_cnt=0 and a direct read of all 6 member rows of stripe 468: the XOR of the 5 data rows |
+| 5-disk | nothing was written: the rot's bytes are exactly the injector's (undisturbed) and every changed member sector is btrfs housekeeping (measured mirrors + non-DATA chunks) | PASS | rot at md@153665536 unchanged=True; changed sectors classified: housekeeping=64 data=0 content=0 |
 | 5-sanity2 | below-md rot shows mismatch_cnt>0 in its own stripe | PASS | stripe 473: mismatch_cnt=8 |
 | 1r6-a | parity trap repair (RAID6, block 300) | PASS | rc=0 precheck_mismatch=8 postcheck=0 disk=m2 stripe=49 reason=/mnt/gtsh/@data/r1.bin block 300 reconstructed from the P parity of stripe 49 and its other data members and verified ag |
 | 1r6-a2 | sibling blocks correct with m1 failed (RAID6) | PASS | stripe 49: 0 wrong of 80 4K blocks — chunk 0: 0 wrong of 16; chunk 1: 0 wrong of 16; chunk 2: 0 wrong of 16; chunk 3: 0 wrong of 16; chunk 4: 0 wrong of 16 |
@@ -45,19 +45,19 @@
 | 6-repair | repair of a one-leg corruption (RAID1, block 300) | PASS | rc=0 postcheck=0 disk=m0 good_legs=None reason=/mnt/gtsh/@data/l1.bin block 300 reconstructed from the copy on /dev/loop1 and verified against the stored csum 0x2835f5 |
 | 6-legs | block reads back correct on BOTH legs after repair (md wrote every leg) | PASS | rot was on m0; now: m0=ok m1=ok |
 | 6-cold | post-repair cold snapshot read of the block matches the original | PASS | eio=[] content_match=True |
-| 8-inject | parity member's stripe row corrupted behind md (data members untouched) — the row on disk actually changed | PASS | data m0(loop0) scan-located at 4308992; rot injected on PARITY m4(loop4)@4308992, stripe 49; parity row 7763ca990ce3 -> 12704d6d98de |
+| 8-inject | parity member's stripe row corrupted behind md (data members untouched) — the row on disk actually changed | PASS | data m0(loop0) scan-located at 4308992; rot injected on PARITY m4(loop4)@4308992, stripe 49; parity row 7763ca990ce3 -> 642a98b3dfff |
 | 8-md-sees-it | bounded md check over the stripe counts mismatches | PASS | mismatch_cnt=8 (expected > 0) |
 | 8-data-intact | the file still reads correctly through btrfs (parity rot is invisible above md) — against the regen ground truth | PASS | cold read MATCH |
 | 8-rewrite | the verb rewrites the band's parity (exit 0, mismatch_cnt 0 afterwards) | PASS | rc=0 outcome=rewritten before=8 after=0 reason= |
 | 8-clean | an independent bounded check over the stripe reads 0 | PASS | mismatch_cnt=0 |
 | 8-match | the file still reads MATCH after the rewrite — against the regen ground truth | PASS | cold read MATCH |
 | 8-xor | the parity row is the XOR of the data rows again | PASS | parity row == XOR(data rows): True — m0[data]=082b369d784f m1[data]=8cc9526e950d m2[data]=697c8ae2b18a m3[data]=19991ea19396 m4[PARITY]=7763ca990ce3 m5[data]=284b6a2abfb2 |
-| 7-txprobe | the tx-probe transaction touched no DATA chunk (the measured housekeeping set has no blind spot for the R1 assertion) | PASS | 52 band-A blocks measured, 0 in a data chunk |
-| 7-scan | oracle scan (members of both arrays) located the segment-2 block on a band-B member | PASS | hit m1 of band B (loop7); verification-side map: m1 of /dev/md126, stripe 59, member offset 33419264 |
-| 7-bandA-untouched | no DATA write on band A: every changed band-A sector is btrfs superblock/metadata housekeeping, and none is a copy of the repair's candidate (the R1 assertion, incl. the F6 content check) | PASS | changed sectors: 104 — housekeeping=104 data=0 content=0 |
-| 7-repair | two-band: REPAIR_CMD of the segment-2 (band B) marker block exits 0 using band B's geometry | PASS | rc=0 postcheck=0 n=4 (band B n=4) disk=m1 stripe=59 reason=/mnt/gtsh/@data/b1.bin block 120000 reconstructed from the XOR of the other 3 members of stripe 59 and verified against  |
-| 7-member | band-B member block equals the original after repair | PASS | loop7@33419264 match=True |
-| 7-bcheck | evicted bounded check over band B's stripe reads 0 | PASS | stripe 59 of md126: mismatch_cnt=0 |
+| 7-txprobe | the tx-probe transaction touched no DATA chunk (the measured housekeeping set has no blind spot for the R1 assertion) | PASS | 26 band-A blocks measured, 0 in a data chunk |
+| 7-scan | oracle scan (members of both arrays) located the segment-2 block on a band-B member | PASS | hit m0 of band B (loop6); verification-side map: m0 of /dev/md126, stripe 52, member offset 29536256 |
+| 7-bandA-untouched | no DATA write on band A: every changed band-A sector is btrfs superblock/metadata housekeeping, and none is a copy of the repair's candidate (the R1 assertion, incl. the F6 content check) | PASS | changed sectors: 124 — housekeeping=124 data=0 content=0 |
+| 7-repair | two-band: REPAIR_CMD of the segment-2 (band B) marker block exits 0 using band B's geometry | PASS | rc=0 postcheck=0 n=4 (band B n=4) disk=m0 stripe=52 reason=/mnt/gtsh/@data/b1.bin block 80000 reconstructed from the XOR of the other 3 members of stripe 52 and verified against t |
+| 7-member | band-B member block equals the original after repair | PASS | loop6@29536256 match=True |
+| 7-bcheck | evicted bounded check over band B's stripe reads 0 | PASS | stripe 52 of md126: mismatch_cnt=0 |
 | 7-cold | post-repair cold snapshot read of the segment-2 block matches the original | PASS | eio=[] content_match=True |
 
 ## Negative controls
@@ -80,7 +80,7 @@
 | 8-neg-inject | data-member rot injected below md | PASS | m4(loop4)@5160960 stripe 62: mismatch_cnt=8 |
 | 8-neg | the verb REFUSES data rot (exit 3, data-corruption-found) instead of blessing it | PASS | rc=3 outcome=refused code=data-corruption-found reason=refused: data corruption found; repair data first (selfheal.6) — the fresh btrfs scrub reported: csum=1 |
 | 8-neg-no-repair | md never ran a repair on the band — on disk: the stripe still counts the mismatch and the parity row is byte-identical to its pre-refusal digest | PASS | last_sync_action check -> check; bounded check mismatch_cnt=8 (expected >0); parity row unchanged=True |
-| 7-neg | segment-1 (band A) marker repairs normally (both segments reachable) | PASS | rc=0 postcheck=0 scan hit band A m0 (band A expected), disk=m0 stripe=1797 reason=/mnt/gtsh/@data/b1.bin block 300 reconstructed from the XOR of the other 5 members of stripe 1797 and verified against t |
+| 7-neg | segment-1 (band A) marker repairs normally (both segments reachable) | PASS | rc=0 postcheck=0 scan hit band A m2 (band A expected), disk=m2 stripe=2168 reason=/mnt/gtsh/@data/b1.bin block 300 reconstructed from the XOR of the other 5 members of stripe 2168 and verified against t |
 | 7-neg2 | post-repair cold snapshot read of the segment-1 block matches the original | PASS | eio=[] content_match=True |
 
 ## Notes

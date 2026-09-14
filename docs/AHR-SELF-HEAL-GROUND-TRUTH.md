@@ -8,14 +8,18 @@ GT-18..21 (2026-09-14, follow-up to the self-heal design review) add stages
 `11-gt20-followup.sh`), `12-gt21.sh`; raw outputs under `out/gt18..gt21/`, `out/gt20f/`.
 GT-22 (2026-09-14, story selfheal.11) adds `13-gt22.sh`(+`13-gt22.py`); raw outputs
 under `out/gt22/`; each arm ran on its own freshly built 2 × 200 MiB RAID1 rig.
+GT-23 (2026-09-14, story selfheal.12) adds `14-gt23.sh`(+`14-gt23.py`); raw outputs
+under `out/gt23/`; it builds a BARE RAID5 rig (no LVM, no btrfs — the question is
+md's stripe cache alone) and ran twice with byte-identical output.
 Rig: 7 × 200 MiB loop files under `/root/gtsh/`, `md/gtsh5` (RAID5, 6 members),
 `md/gtsh6` (RAID6, 7 members), VG `gtsh` → `gtsh/data`, btrfs `-m dup -d single`,
 subvolume `@data`. Marker files carry a 33-byte ASCII signature at file block 300.
 
 - Node: `anas-pve` (192.168.200.50), Debian PVE 9
-- Kernel: `7.0.14-12-pve` (GT-1..21), `7.0.14-17-pve` (GT-22, after the stunt-node
-  point-release upgrade); mdadm `v4.4 - 2024-11-07`; btrfs-progs `v6.14`; python 3.13.5
-- Date: 2026-09-11 (GT-1..21), 2026-09-14 (GT-22)
+- Kernel: `7.0.14-12-pve` (GT-1..21), `7.0.14-17-pve` (GT-22, GT-23, after the
+  stunt-node point-release upgrade); mdadm `v4.4 - 2024-11-07`; btrfs-progs `v6.14`;
+  python 3.13.5
+- Date: 2026-09-11 (GT-1..21), 2026-09-14 (GT-22, GT-23)
 
 Verdicts are per the drill brief; `UNEXPECTED` carries the verbatim lines. Where the
 kernel's own report differs from the brief's assumption, the fact is recorded — not
@@ -912,6 +916,91 @@ degraded window is real and the confirm gate's estimate is ≈6–7.5 s/GiB of b
 md's default sync throttle. `mdadm --action=repair` on a mirror is confirmed dangerous
 in both directions (copies leg 0 blindly) — the parity-only notification wording is
 justified.
+
+## GT-23 — The engine's stripe-cache eviction no longer reaches a recently written stripe on kernel 7.0.14-17; only a direct member read (or a whole-array check) sees the rot — PROVEN (probe, two identical runs)
+
+The engine's `above-md` verdict rests on ONE number: a bounded md `check` over the
+target stripe reading `mismatch_cnt=0` while the block fails its stored csum, which
+says parity already agrees with the bad data. GT-14 established that md serves a
+recently touched stripe out of its stripe cache, and `evictStripeCache`
+(`stripe_cache_size` → 17, sweep ±200 stripes while small, restore) is what was
+supposed to make that check read the disks. The selfheal.2 suite re-run on
+7.0.14-17 found the recipe no longer reaching a stripe written moments before. This
+is that fact measured, against the truth read straight off the members.
+
+Rig: BARE RAID5, six 200 MiB loops, chunk 64K, `--assume-clean`, members zeroed so
+parity starts correct — no LVM, no btrfs (`14-gt23.sh` + `14-gt23.py`; raw output
+`out/gt23/`). Six rounds, each on its own stripe 500 apart so no round's ±200 sweep
+touches another's target, each self-contained: a CLEAN write through md
+(`rmw_level=0`, so md rebuilds the whole parity group and the stripe is consistent
+on disk AND cached), then 4 KiB of junk written DIRECT to the data member behind
+md's back, then one reading method. Round 6's stripe is written FIRST and probed
+LAST, so its last through-md touch is long past — the control that says the
+eviction is not simply broken.
+
+```
+[rig] /dev/md127 level=raid5 n=6 chunk=65536 data_disks=5 member_sectors=407552 stripes=3184
+[rig] kernel=7.0.14-17-pve stripe_cache_size=256 rmw_level=1
+[1-setup] stripe 500 written clean through md; direct member XOR == P row: True (the parity group really is consistent on disk)
+[1-rot] 4 KiB of 0xAB written DIRECT to /dev/loop4 @33816576 (role 4, data slot 0 of stripe 500) -- md was not told
+[1-evicted-check] engine eviction (shrink to 17, sweep +/-200, restore) then bounded check over stripe 500: mismatch_cnt=0
+[1-direct-xor] O_DIRECT read of all 6 member rows of stripe 500: XOR(data rows) == P row: False (computed abababababababab..., P row 1111111111111111...)
+[1-whole-array] whole-array check: mismatch_cnt=8
+[1-verdict] bounded=0 direct_consistent=False whole_array=8
+```
+
+**(a) The engine's own eviction leaves the check reading the CACHE — PROVEN.** The
+rot is on the member (`[1-rot]`), the direct XOR of the six member rows proves the
+parity group inconsistent (`[1-direct-xor]`: the data-row XOR is the junk 0xAB, the
+P row is still the pre-rot 0x11), and md's evicted bounded check over that stripe
+counts **0**. Taken alone that number is the `above-md` verdict, on rot that is
+below md all along.
+
+**(b) A whole-array check reveals it — PROVEN.** `mismatch_cnt=8` over the same
+array, the RAID5 unit for one rotted 4 KiB block (GT-18's number). It recycles the
+cache deterministically and is the one cache-buster that worked in every probed
+state — and it is hours per band, not a per-block option.
+
+**(c) No cheap alternative changes the outcome — PROVEN (three of them).**
+
+```
+[2-drop+evict] stripe 1000: drop_caches then the engine eviction, bounded check mismatch_cnt=0 (direct XOR consistent: False)
+[3-drop-only] stripe 1500: drop_caches alone (no shrink, no sweep), bounded check mismatch_cnt=0 (direct XOR consistent: False)
+[4-different-size] stripe 2000: shrink to 17, sweep, then size left at 512 (was 256), bounded check mismatch_cnt=0 (direct XOR consistent: False)
+[5-no-evict] stripe 2500: no eviction at all, bounded check mismatch_cnt=0 (direct XOR consistent: False)
+```
+
+`echo 3 > /proc/sys/vm/drop_caches` does nothing here in either position — md's
+stripe cache is not the page cache. Writing `stripe_cache_size` to a value it did
+not start at (256 → 17 → 512) does not evict the target either. And the evicted
+check reads exactly what the un-evicted one does (round 5), which is the measure of
+how far the eviction gets on this kernel: nowhere, for this stripe.
+
+**(d) The eviction still works where the last touch is OLD — PROVEN (the control).**
+
+```
+[6-old-stripe] stripe 3000 (written through md before every other round): engine eviction then bounded check mismatch_cnt=8 (direct XOR consistent: False)
+```
+
+Same recipe, same rot, same array — `mismatch_cnt=8`. So the fault is not "the
+eviction is broken"; it is bounded to stripes whose last through-md touch is
+recent, which is precisely the state a self-heal repair meets (it writes the block
+through md and then checks that stripe) and the state GT-14's canary describes.
+
+```
+[summary] evicted=0 drop+evict=0 drop-only=0 different-size=0 no-evict=0 old-stripe=8 whole-array=8
+```
+
+Two runs on freshly built rigs, byte-identical output.
+
+**Verdict: PROVEN.** On kernel 7.0.14-17 md's bounded check cannot be trusted alone
+over a recently written stripe, in either direction: it reports 0 over real
+below-md rot (a) and no cheap knob fixes that (c). The parity group is computed
+from DIRECT member reads instead — XOR of the data rows against P, the Q syndrome
+against Q on RAID6, the legs against each other on RAID1 — and md's number is kept
+as corroboration for the whole chunk window it actually covers. `above-md` needs
+both readings to agree; md alone counting 0 over disagreeing rows is a stale cache,
+recorded as `staleCache: true` and repaired as the below-md rot it is.
 
 ## Drill notes (factual, no recommendations)
 

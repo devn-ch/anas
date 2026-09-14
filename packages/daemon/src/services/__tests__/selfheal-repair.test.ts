@@ -23,6 +23,7 @@ import {
   gfInv,
   gfMul,
   gfPow2,
+  parityAgreement,
   reconstructFromQ,
   reconstructionPlan,
   repairBlock,
@@ -155,7 +156,7 @@ class FakeNode implements CommandExecutor {
   /** What `mismatch_cnt` reads before anything is written. */
   precheckMismatch = '8'
 
-  constructor(options?: { corrupt?: boolean }) {
+  constructor(options?: { corrupt?: boolean, aboveMd?: boolean }) {
     this.root = mkdtempSync(join(tmpdir(), 'anas-selfheal-'))
     this.mountpoint = join(this.root, 'mnt')
     this.file = join(this.mountpoint, 'f1.bin')
@@ -198,11 +199,18 @@ class FakeNode implements CommandExecutor {
     this.members.set(MEMBERS[2], siblings[1])
     this.members.set(MEMBERS[3], siblings[2])
     this.members.set(MEMBERS[5], siblings[3])
-    // P = XOR of every data member of the stripe (data order 5,0,1,2,3).
-    this.members.set(MEMBERS[4], xor(HEALTHY, ...siblings))
     const corrupt = options?.corrupt !== false
     const junk = Buffer.alloc(BS, 0xAB)
-    this.members.set(MEMBERS[0], corrupt ? junk : HEALTHY)
+    const target = corrupt ? junk : HEALTHY
+    // P = XOR of every data member of the stripe (data order 5,0,1,2,3).
+    //
+    // GT-23: what `above-md` means ON THE DISKS is that md recomputed parity
+    // over the bad bytes, so the group agrees with itself and a direct read of
+    // the members cannot tell the difference. `aboveMd` builds exactly that;
+    // the default builds below-md rot, where the P row still belongs to the
+    // HEALTHY block and the members disagree.
+    this.members.set(MEMBERS[4], xor(options?.aboveMd ? target : HEALTHY, ...siblings))
+    this.members.set(MEMBERS[0], target)
     this.mdBlock = this.members.get(MEMBERS[0]) as Buffer
   }
 
@@ -334,6 +342,32 @@ class FakeNode implements CommandExecutor {
 }
 
 /**
+ * GT-23's POST-check shape: the write lands on the member, md's counter reads
+ * 0 — from its cache, which holds the stripe this very write put there — and
+ * the P row is left belonging to the pre-write content, so a DIRECT read of the
+ * rows still says the parity group disagrees with itself.
+ *
+ * Nothing but the direct read can tell this from a clean post-check.
+ */
+class StalePostcheckNode extends FakeNode {
+  override async exec(command: string, args: string[]): Promise<ExecResult> {
+    if (command === '/usr/bin/dd') {
+      const target = args.find(a => a.startsWith('of='))?.slice(3) ?? ''
+      if (target !== '' && target !== '/dev/null') {
+        this.calls.push({ command, args })
+        this.wroteThroughMd = readFileSync(args.find(a => a.startsWith('if='))?.slice(3) ?? '')
+        this.mdBlock = this.wroteThroughMd
+        this.members.set(MEMBERS[TARGET_ROLE], this.wroteThroughMd)
+        this.members.set(MEMBERS[4], Buffer.alloc(BS, 0x5A)) // P left as it was
+        this.setKnob('mismatch_cnt', '0')
+        return { stdout: '', stderr: '', exitCode: 0 }
+      }
+    }
+    return super.exec(command, args)
+  }
+}
+
+/**
  * A fake RAID1 BAND, with the two legs at DIFFERENT data offsets.
  *
  * md does not require a mirror's legs to share `rd<n>/offset` (`--grow
@@ -362,7 +396,7 @@ class FakeMirror implements CommandExecutor {
   static readonly OFFSETS = [1048576, 4194304]
   static readonly LEGS = ['/dev/loop0', '/dev/loop1']
 
-  constructor(options?: { corruptLeg?: number, mdServes?: 'good' | 'bad' | 'neither', bothLegsBad?: boolean }) {
+  constructor(options?: { corruptLeg?: number, mdServes?: 'good' | 'bad' | 'neither', bothLegsBad?: boolean, legsDiffer?: boolean }) {
     this.root = mkdtempSync(join(tmpdir(), 'anas-selfheal-r1-'))
     this.mountpoint = join(this.root, 'mnt')
     this.file = join(this.mountpoint, 'f1.bin')
@@ -391,8 +425,14 @@ class FakeMirror implements CommandExecutor {
     const bad = options?.corruptLeg ?? 0
     for (const [role, device] of FakeMirror.LEGS.entries()) {
       // `bothLegsBad` is rot that arrived THROUGH md: the same wrong bytes on
-      // every leg (F4).
-      const content = options?.bothLegsBad || role === bad ? junk : HEALTHY
+      // every leg (F4), which is what makes a DIRECT read of the legs say they
+      // agree. `legsDiffer` is the other fault with the same csum outcome —
+      // each leg rotted on its own, so no copy is right and the legs do not
+      // even match each other (GT-23: only the direct read separates the two,
+      // because md's counter can be answering from its cache).
+      const content = options?.legsDiffer
+        ? Buffer.alloc(BS, role === 0 ? 0xAB : 0xCD)
+        : options?.bothLegsBad || role === bad ? junk : HEALTHY
       this.legs.set(device, new Map([[FakeMirror.OFFSETS[role] + MD_BYTE, content]]))
     }
     this.mdBytes = options?.mdServes === 'bad'
@@ -581,6 +621,22 @@ describe('selfheal repair — reconstruction arithmetic', () => {
       const survivors = data.map((b, d) => (d === missing ? null : b))
       assert.ok(reconstructFromQ(survivors, q, missing).equals(data[missing]), `missing ${missing}`)
     }
+  })
+})
+
+/**
+ * GT-23 — the rule that turns the two readings of a parity group into one
+ * verdict, on its own. `null` is the bounded check that could not be taken at
+ * all; the direct reading then decides without it.
+ */
+describe('selfheal repair — the parity-agreement rule (GT-23)', () => {
+  it('names each of the four combinations', () => {
+    assert.equal(parityAgreement(true, 0), 'consistent')
+    assert.equal(parityAgreement(true, null), 'consistent')
+    assert.equal(parityAgreement(true, 8), 'disagree')
+    assert.equal(parityAgreement(false, 0), 'stale-cache')
+    assert.equal(parityAgreement(false, 8), 'inconsistent')
+    assert.equal(parityAgreement(false, null), 'inconsistent')
   })
 })
 
@@ -1012,15 +1068,6 @@ describe('selfheal repair — the verdicts that write nothing', () => {
     assert.equal(node.deleted.length, 1)
   })
 
-  it('diagnoses ABOVE MD when parity agrees with the bad data', async () => {
-    node.setKnob('mismatch_cnt', '0')
-    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
-    assert.equal(outcome.outcome, 'above-md')
-    assert.match(outcome.reason, /implicates something other than the disks/)
-    assert.equal(node.wroteThroughMd, null)
-    assertKnobsRestored()
-  })
-
   it('is UNREPAIRABLE when no reconstruction matches the stored csum', async () => {
     node.members.set(MEMBERS[4], Buffer.alloc(BS, 0x5A)) // a second damaged block
     const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
@@ -1336,6 +1383,107 @@ describe('selfheal repair — evicting the stripe cache near the end of the arra
       .filter(c => c.command === '/usr/bin/dd' && c.args.includes('of=/dev/null'))
       .map(c => Number(c.args.find(a => a.startsWith('skip='))?.slice(5)) / 80)
     assert.deepEqual(swept, [3178, 3179, 3180, 3181, 3182])
+  })
+})
+
+/**
+ * GT-23 — the `above-md` verdict is CACHE-INDEPENDENT.
+ *
+ * On kernel 7.0.14-17 a stripe written through md moments earlier survives the
+ * engine's own eviction, and a bounded check over it compares md's CACHED copy:
+ * `mismatch_cnt = 0` while the rot sits on the member. Taken alone that number
+ * says "parity already agrees with the bad data" — `above-md` — over rot that
+ * is below md all along, so nothing is written, the operator is told the disks
+ * are not at fault, and the rot stays.
+ *
+ * The verdict is computed from a DIRECT read of the member rows instead, with
+ * md's number as corroboration. These four cases are the two readings crossed
+ * both ways, on a RAID5 band; the RAID6 and RAID1 shapes are below.
+ */
+describe('selfheal repair — md\'s cached view versus the member rows (GT-23)', () => {
+  describe('with the members AGREEING with the bad data (through-md rot)', () => {
+    useNode(() => new FakeNode({ aboveMd: true }))
+
+    it('diagnoses ABOVE MD when parity agrees with the bad data', async () => {
+      node.setKnob('mismatch_cnt', '0')
+      const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'above-md')
+      assert.match(outcome.reason, /implicates something other than the disks/)
+      // The claim now names both readings, not just md's counter.
+      assert.match(outcome.reason, /the XOR of the 5 data rows IS the P row/)
+      assert.equal(outcome.diagnostics?.staleCache, undefined, 'nothing stale here')
+      assert.equal(node.wroteThroughMd, null)
+      assertKnobsRestored()
+    })
+
+    it('REFUSES when md counts the stripe and the member rows agree — never above-md', async () => {
+      // md's default fake count is 8. The rows say the parity group agrees with
+      // itself, so neither verdict can be claimed: a reconstruction would just
+      // rebuild the bad bytes, and `above-md` is a claim md's own count denies.
+      const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'unrepairable')
+      assert.match(outcome.reason, /md and the direct read disagree about this stripe; nothing written/)
+      assert.match(outcome.reason, /counts 8 mismatch\(es\)/)
+      assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+      assert.equal(node.wroteThroughMd, null)
+      assertKnobsRestored()
+    })
+  })
+
+  describe('with the members DISAGREEING (below-md rot) and md reading 0', () => {
+    useNode(() => new FakeNode())
+
+    it('REPAIRS it anyway, and records that md\'s cached view was stale', async () => {
+      node.setKnob('mismatch_cnt', '0')
+      const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'repaired', outcome.reason)
+      assert.ok(node.wroteThroughMd?.equals(HEALTHY), 'the healthy block was written through md')
+      assert.equal(outcome.diagnostics?.staleCache, true)
+      assert.equal(outcome.diagnostics?.precheckMismatch, 0)
+      const precheck = outcome.steps.find(s => s.name === 'precheck')
+      assert.match(precheck?.detail ?? '', /md's cached view of this stripe was stale; the direct member read shows the mismatch/)
+      assert.equal(precheck?.ok, true, 'a stale cache is not a failed step')
+      assertKnobsRestored()
+    })
+
+    it('does not call a POST-check clean when md reads 0 over rows that still disagree', async () => {
+      // The fake's write fixes the target member and sets mismatch_cnt to 0.
+      // Leave the P row belonging to the OLD content, so the rows still
+      // disagree after the write while md's cached view reads clean.
+      node.setKnob('mismatch_cnt', '0')
+      node.members.set(MEMBERS[4], Buffer.alloc(BS, 0x5A))
+      const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+      // The XOR candidate cannot match the stored csum with a junk P row, so
+      // this run never reaches the write — which is the point of arbitrating.
+      assert.equal(outcome.outcome, 'unrepairable')
+      assert.match(outcome.reason, /more than one block of this stripe is damaged/)
+      assert.equal(node.wroteThroughMd, null)
+    })
+  })
+})
+
+/**
+ * GT-23 on the POST-check: after the write, md's number is corroborated by the
+ * same direct read, and a `mismatch_cnt = 0` over rows that still disagree is
+ * md's stale view of our own write — never a clean parity group.
+ */
+describe('selfheal repair — a post-check md reads clean over disagreeing rows (GT-23)', () => {
+  useNode(() => new StalePostcheckNode())
+
+  it('is not a clean pass: the block is proven cold and the residual is reported', async () => {
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.ok(node.wroteThroughMd?.equals(HEALTHY), 'the block really was written')
+    assert.equal(outcome.diagnostics?.postcheckMismatch, 0)
+    assert.equal(outcome.diagnostics?.staleCache, true)
+    assert.match(outcome.reason, /reports mismatch_cnt=0, but md's cached view of this stripe was stale/)
+    // The count md will stand behind is the one Rewrite parity's evidence gate
+    // reads, and md counted nothing here — so the advice is the scrub first.
+    assert.match(outcome.reason, /Re-scrub the pool so the band's mismatch is counted, then run Rewrite parity on/)
+    assert.equal(outcome.parityResidual?.mismatchCnt, 0)
+    assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+    const postcheck = outcome.steps.find(s => s.name === 'postcheck')
+    assert.match(postcheck?.detail ?? '', /is NOT the P row/)
   })
 })
 
@@ -1680,6 +1828,17 @@ const R6_Q_ROLE = 5
 /** The data roles of that stripe, in md's order: anchor Q+1 … Q+4. */
 const R6_DATA_ROLES = [0, 1, 2, 3]
 
+/** md's Q syndrome over the data rows in stripe order — `Σ gᵈ · Dᵈ` (GT-15). */
+function syndrome(rows: Buffer[]): Buffer {
+  const q = Buffer.alloc(BS)
+  for (let d = 0; d < rows.length; d++) {
+    const coefficient = gfPow2(d)
+    for (let i = 0; i < BS; i++)
+      q[i] ^= gfMul(coefficient, rows[d][i])
+  }
+  return q
+}
+
 /**
  * The SAME rig as {@link FakeNode}, told it is a RAID6 (F2).
  *
@@ -1695,17 +1854,28 @@ class FakeRaid6Node extends FakeNode {
   /** Set to make the cold read through the pin EIO. */
   coldReadFails = false
 
-  constructor() {
+  constructor(options?: { aboveMd?: boolean }) {
     super()
     this.setKnob('level', 'raid6')
     this.members.clear()
     const others = R6_DATA_ROLES.filter(r => r !== R6_TARGET_ROLE).map(r => [r, filler(r + 1)] as const)
     for (const [role, bytes] of others)
       this.members.set(MEMBERS[role], bytes)
-    this.members.set(MEMBERS[R6_P_ROLE], xor(HEALTHY, ...others.map(([, b]) => b)))
-    // Q rotten: the syndrome solve cannot produce the block, P-XOR can.
-    this.members.set(MEMBERS[R6_Q_ROLE], Buffer.alloc(BS, 0x5A))
-    this.members.set(MEMBERS[R6_TARGET_ROLE], Buffer.alloc(BS, 0xAB))
+    const junk = Buffer.alloc(BS, 0xAB)
+    this.members.set(MEMBERS[R6_TARGET_ROLE], junk)
+    if (options?.aboveMd) {
+      // GT-23 on a RAID6 band: the rot arrived THROUGH md, so md recomputed
+      // BOTH syndromes over the bad bytes. P and Q agree with the junk and a
+      // direct read of the rows cannot fault the group.
+      const rows = R6_DATA_ROLES.map(role => this.members.get(MEMBERS[role]) as Buffer)
+      this.members.set(MEMBERS[R6_P_ROLE], xor(...rows))
+      this.members.set(MEMBERS[R6_Q_ROLE], syndrome(rows))
+    }
+    else {
+      this.members.set(MEMBERS[R6_P_ROLE], xor(HEALTHY, ...others.map(([, b]) => b)))
+      // Q rotten: the syndrome solve cannot produce the block, P-XOR can.
+      this.members.set(MEMBERS[R6_Q_ROLE], Buffer.alloc(BS, 0x5A))
+    }
     this.mdBlock = this.members.get(MEMBERS[R6_TARGET_ROLE]) as Buffer
   }
 
@@ -1867,6 +2037,42 @@ describe('selfheal repair — a foreign md op AFTER the write (F5)', () => {
 })
 
 /**
+ * GT-23 on a RAID6 band — P AND Q are both computed from the member rows, so
+ * `above-md` there means md recomputed both syndromes over the bad bytes.
+ */
+describe('selfheal repair — RAID6 with both syndromes agreeing with the rot (GT-23)', () => {
+  let r6: FakeRaid6Node
+  beforeEach(() => {
+    forgetIssuedChecks()
+    r6 = new FakeRaid6Node({ aboveMd: true })
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = r6.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(r6.root, 'run')
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    r6.cleanup()
+  })
+
+  it('diagnoses ABOVE MD when P and Q both agree with the bad data', async () => {
+    r6.setKnob('mismatch_cnt', '0')
+    const outcome = await repairBlock(r6, { mountpoint: r6.mountpoint, file: r6.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'above-md', outcome.reason)
+    assert.match(outcome.reason, /P on \/dev\/loop4 IS the XOR of the data rows, Q on \/dev\/loop5 IS their syndrome/)
+    assert.equal(outcome.diagnostics?.staleCache, undefined)
+    assert.equal(r6.wroteThroughMd, null)
+  })
+
+  it('REFUSES rather than claiming above-md when md counts the stripe anyway', async () => {
+    const outcome = await repairBlock(r6, { mountpoint: r6.mountpoint, file: r6.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    assert.match(outcome.reason, /md and the direct read disagree about this stripe; nothing written/)
+    assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+    assert.equal(r6.wroteThroughMd, null)
+  })
+})
+
+/**
  * F4 — through-md rot on a MIRROR reads as `above-md`, exactly as it does on a
  * parity band.
  *
@@ -1878,35 +2084,68 @@ describe('selfheal repair — a foreign md op AFTER the write (F5)', () => {
  */
 describe('selfheal repair — every mirror leg fails the csum (F4)', () => {
   let mirror: FakeMirror
-  beforeEach(() => {
-    forgetIssuedChecks()
-    mirror = new FakeMirror({ bothLegsBad: true })
-    process.env.ANAS_SELFHEAL_KERNEL_ROOT = mirror.root
-    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(mirror.root, 'run')
-  })
-  afterEach(() => {
-    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
-    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
-    mirror.cleanup()
+
+  function use(options: { bothLegsBad?: boolean, legsDiffer?: boolean }): void {
+    beforeEach(() => {
+      forgetIssuedChecks()
+      mirror = new FakeMirror(options)
+      process.env.ANAS_SELFHEAL_KERNEL_ROOT = mirror.root
+      process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(mirror.root, 'run')
+    })
+    afterEach(() => {
+      delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+      delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+      mirror.cleanup()
+    })
+  }
+
+  describe('with the same wrong bytes on every leg', () => {
+    use({ bothLegsBad: true })
+
+    it('mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD', async () => {
+      mirror.setKnob('mismatch_cnt', '0')
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'above-md', outcome.reason)
+      assert.match(outcome.reason, /the legs AGREE with each other and are both wrong/)
+      assert.match(outcome.reason, /every leg holds the same bytes/)
+      assert.match(outcome.reason, /implicates something other than the disks/)
+      assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+      assert.equal(outcome.diagnostics?.staleCache, undefined)
+      assert.equal(mirror.wroteThroughMd, null)
+    })
+
+    it('mismatch_cnt > 0 over legs that hold the SAME bytes: md and the direct read disagree (GT-23)', async () => {
+      mirror.setKnob('mismatch_cnt', '6')
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+      assert.match(outcome.reason, /md and the direct read disagree about this stripe; nothing written/)
+      assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+      assert.equal(mirror.wroteThroughMd, null)
+    })
   })
 
-  it('mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD', async () => {
-    mirror.setKnob('mismatch_cnt', '0')
-    const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
-    assert.equal(outcome.outcome, 'above-md', outcome.reason)
-    assert.match(outcome.reason, /the legs AGREE with each other and are both wrong/)
-    assert.match(outcome.reason, /implicates something other than the disks/)
-    assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
-    assert.equal(mirror.wroteThroughMd, null)
-  })
+  describe('with each leg rotted on its own', () => {
+    use({ legsDiffer: true })
 
-  it('mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE', async () => {
-    mirror.setKnob('mismatch_cnt', '6')
-    const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
-    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
-    assert.match(outcome.reason, /counts 6 mismatch\(es\), so the legs disagree with each other/)
-    assert.match(outcome.reason, /Restore /)
-    assert.equal(mirror.wroteThroughMd, null)
+    it('mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE', async () => {
+      mirror.setKnob('mismatch_cnt', '6')
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+      assert.match(outcome.reason, /counts 6 mismatch\(es\).*so the legs disagree with each other/)
+      assert.match(outcome.reason, /Restore /)
+      assert.equal(mirror.wroteThroughMd, null)
+    })
+
+    it('mismatch_cnt 0 over legs that DIFFER: md\'s cached view was stale, never above-md (GT-23)', async () => {
+      mirror.setKnob('mismatch_cnt', '0')
+      const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+      assert.match(outcome.reason, /md's cached view of this stripe was stale; the direct member read shows the mismatch/)
+      assert.match(outcome.reason, /DIFFER over this block/)
+      assert.equal(outcome.diagnostics?.staleCache, true)
+      assert.match(outcome.reason, /Restore /)
+      assert.equal(mirror.wroteThroughMd, null)
+    })
   })
 })
 

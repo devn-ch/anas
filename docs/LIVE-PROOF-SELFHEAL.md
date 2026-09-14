@@ -1463,3 +1463,11 @@ parses) and **F7** (`systemctl preset` re-enabling the mdcheck timers). Both are
 `test/self-heal/render-trees.mjs` — hand-keeping them is how the same node came to carry two
 different truncations of its label in two places. `render-trees.mjs --check` rides the same unit
 test as the structural check, so the drawing cannot drift from its data again.
+
+### GT-23 (2026-09-14, kernel 7.0.14-17-pve)
+
+The `above-md` and post-check verdicts are cache-independent as of GT-23 — md's bounded check over a
+recently written stripe reads its own cache on this kernel and reported `mismatch_cnt=0` over rot on
+the member, so the parity group is computed from direct member-row reads with md's number as
+corroboration; the engine re-ran the selfheal.2 suite on the node afterwards at **49/49 cases, 18/18
+negative controls** (`test/self-heal/suite/LAST-RUN-engine.md`).
