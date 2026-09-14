@@ -73,6 +73,53 @@ export function ahrHeldByLunConflict(what: string, action: string, held: IscsiHe
 }
 
 /**
+ * The parity-rewrite confirm gate's LUN disclosure (seventh pass, F10), or no
+ * line at all when nothing is served from the pool.
+ *
+ * A rewrite writes no file byte, so this is not a refusal — it is the fact an
+ * operator being asked to agree to hours of whole-band reading cannot discover
+ * from anywhere else on this screen.
+ */
+export function rewriteLunWarnings(held: IscsiHeldByLun | null): string[] {
+  if (!held)
+    return []
+  const sessions = held.connectedInitiators.length
+  return [
+    `A guest's disk is live on this pool: iSCSI LUN ${held.index} ('${held.name}') of target ${held.targetIqn} is served from ${held.backingPath}${
+      sessions > 0
+        ? `, with ${sessions} initiator${sessions === 1 ? '' : 's'} logged in right now (${held.connectedInitiators.join(', ')}). Nothing this run writes is visible to them — it reads every member of the band twice and rewrites parity, never a file — but the array will be reading flat out underneath that disk for the duration`
+        : '. No initiator is logged in right now. Nothing this run writes is visible to a guest — it reads every member of the band twice and rewrites parity, never a file'}`,
+  ]
+}
+
+/**
+ * The repair route's LUN-session refusal (seventh pass, F10).
+ *
+ * A repair writes 4 KiB it has PROVEN correct, and the CoW ruling says the old
+ * extent is harmless — so this is not the "corrupt what the initiator sees"
+ * hazard `heldByLunRefusal` exists for. What it is is a write into a file a
+ * guest has open at the block layer: the initiator's own cache still holds the
+ * old bytes, its filesystem is mid-transaction, and nothing about the repair is
+ * visible to it. So the refusal is scoped to a LIVE SESSION and says what to do
+ * about it, rather than refusing every LUN-backed file forever.
+ */
+export function lunSessionRefusal(path: string, held: IscsiHeldByLun) {
+  return {
+    error: {
+      code: 'CONFLICT',
+      reason: 'lun-session-active',
+      message: `'${path}' backs iSCSI LUN ${held.targetIqn}/${held.index} ('${held.name}') and `
+        + `${held.connectedInitiators.length} initiator${held.connectedInitiators.length === 1 ? ' is' : 's are'} `
+        + `logged in right now (${held.connectedInitiators.join(', ')}). A repair writes a reconstructed `
+        + `4 KiB block through md under that live session: the block itself is proven correct and btrfs's `
+        + `copy-on-write leaves the old extent untouched, but the initiator is holding its own cache of the `
+        + `file and has no idea the bytes changed. Log the initiator out of LUN ${held.index} (or stop the `
+        + `guest using it) and repair then. This refusal has no confirm bypass.`,
+    },
+  }
+}
+
+/**
  * Why a pool in this state cannot be repaired (story selfheal.6).
  *
  * A repair reconstructs one block from every OTHER member of its stripe and
@@ -787,9 +834,24 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       // repair ("not corrupt here").
       const unique = [...new Set(file.blocks)]
       unique.sort((a, b) => a - b)
-      files.push({ path: real, blocks: unique })
+      files.push({ path: real, blocks: unique, ...(file.inode !== undefined ? { inode: file.inode } : {}) })
     }
     const blocks = files.reduce((n, f) => n + f.blocks.length, 0)
+
+    // LUN awareness, UP FRONT (seventh pass, F10). `heldByLunOnce` was already
+    // called by the repair JOB, but only after the fact, to word the advice on
+    // a block that could not be repaired. A file that backs a LUN with a LIVE
+    // initiator session is refused here instead — before a confirm code is
+    // minted, in the same tier as every other "unsafe now" (Principle 14).
+    // ONE claims read for the whole request, shared across every file.
+    const repairClaims = createIscsiClaimCache(executor, iscsiPaths)
+    for (const file of files) {
+      const held = await heldByLun(repairClaims, { path: file.path })
+      if (held && held.connectedInitiators.length > 0) {
+        reply.code(409)
+        return lunSessionRefusal(file.path, held)
+      }
+    }
 
     // Confirm gate: what actually happens to the array, in the operator's terms.
     // The signature carries the exact selection, so a confirm code cannot be
@@ -870,7 +932,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // Hard refusals, every one of them BEFORE a confirm code is minted
     // (Principle 14: "unsafe now" has no bypass, and none of these is a risk
     // the operator can accept — they are states in which the verb is wrong).
-    const evidence = () => parityRewriteEvidence(name, jobQueue.findLastCompleted('ahr.scrub', name), band)
+    // The proof may come from the pool's last completed SCRUB or from its last
+    // completed REPAIR, whichever is newer (seventh pass, F2): a repair that
+    // wrote a proven block and saw md still counting mismatches has measured
+    // the residual, and making the operator sit through a fresh multi-hour
+    // two-phase scrub to rediscover that number is the gap F2 names.
+    const evidence = () => parityRewriteEvidence(name, [
+      jobQueue.findLastCompleted('ahr.scrub', name),
+      jobQueue.findLastCompleted('ahr.repair', name),
+    ], band)
     const proof = evidence()
     if (!proof.ok) {
       reply.code(409)
@@ -923,6 +993,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       reply.code(409)
       return { error: { code: 'CONFLICT', reason: bandRefusal.code, message: bandRefusal.reason } }
     }
+    // Is a guest's disk live on this pool (F10)? Disclosed, never refused.
+    const rewriteHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
 
     // Confirm gate: what md is about to do, in the operator's terms. The
     // signature carries the band, so a code minted for r1 cannot rewrite r2.
@@ -933,7 +1005,14 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       // The estimate includes phase 1's full-pool checksum scrub (N8) — on a
       // pool with real data in it that pass is usually the dominant term, and
       // a gate that quoted only the two md passes understated the wait.
-      warnings: parityRewriteWarnings(name, array, pool.capacity.usedBytes),
+      //
+      // The LUN disclosure (seventh pass, F10) is a WARNING here and a refusal
+      // on Repair, and the difference is what each verb writes. A rewrite reads
+      // every member of the band twice and writes parity: no guest-visible byte
+      // changes, so there is nothing for an initiator to be surprised by — but
+      // the operator is agreeing to hours of the array reading flat out under a
+      // guest's live disk, and that is theirs to weigh.
+      warnings: [...parityRewriteWarnings(name, array, pool.capacity.usedBytes), ...rewriteLunWarnings(rewriteHeld)],
     })) {
       return reply
     }

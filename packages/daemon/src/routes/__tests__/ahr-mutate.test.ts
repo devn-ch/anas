@@ -20,7 +20,7 @@ import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
-import { ahrMutationRoutes } from '../ahr-mutate.js'
+import { ahrMutationRoutes, rewriteLunWarnings } from '../ahr-mutate.js'
 import { jobRoutes } from '../jobs.js'
 
 /** Where the shipped md/lvm captures live — `mdstat-check.txt` among them. */
@@ -831,6 +831,58 @@ describe('POST /v1/ahr/:name/parity-rewrite', () => {
     assert.notEqual(other.statusCode, 202)
   })
 
+  // --- Seventh pass -------------------------------------------------------
+
+  it('F2: a completed REPAIR\'s parity residual is proof enough — no fresh scrub needed', async () => {
+    // No scrub on record at all, and the operator still gets the verb: the
+    // repair wrote a block, proved it cold against its stored checksum, and saw
+    // md still counting the stripe. That IS the measurement.
+    jobQueue.submit('ahr.repair', { user: 'u', uid: 0, params: { name: 'ahr0' } }, async () => ({
+      pool: 'ahr0',
+      files: [],
+      repaired: 1,
+      unrepairable: 0,
+      aboveMd: 0,
+      mappingAbort: 0,
+      notExamined: 0,
+      parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+      blocks: 1,
+    }))
+    await new Promise(resolve => setImmediate(resolve))
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.json().error.message.includes('8 mismatch'), res.json().error.message)
+  })
+
+  it('F2: …but not from a repair that left blocks unrepaired', async () => {
+    jobQueue.submit('ahr.repair', { user: 'u', uid: 0, params: { name: 'ahr0' } }, async () => ({
+      pool: 'ahr0',
+      files: [],
+      repaired: 1,
+      unrepairable: 1,
+      aboveMd: 0,
+      mappingAbort: 0,
+      notExamined: 0,
+      parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8 }],
+      blocks: 2,
+    }))
+    await new Promise(resolve => setImmediate(resolve))
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'data-findings-present')
+  })
+
+  it('F8: 409 bad-blocks-present when a member of the band has recorded bad blocks', async () => {
+    await completedScrub(CLEAN_WITH_MISMATCH)
+    await writeFile(join(sys, 'rd1/bad_blocks'), '6368 8\n')
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'bad-blocks-present')
+    assert.ok(res.json().error.message.includes('replace the member first'), res.json().error.message)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no bypass — this is not a risk to accept')
+  })
+
   it('the exclusion is mutual: a rewrite blocks a scrub and a repair, and they block it', async () => {
     await completedScrub(CLEAN_WITH_MISMATCH)
     const rewrite = inFlight('ahr.parity-rewrite', 'ahr0')
@@ -852,5 +904,45 @@ describe('POST /v1/ahr/:name/parity-rewrite', () => {
     const blocked = await post({ band: 1 })
     assert.equal(blocked.statusCode, 409)
     assert.equal(blocked.json().error.reason, 'job-active')
+  })
+})
+
+/**
+ * Seventh pass, F10 — the LUN disclosure on the parity-rewrite confirm gate.
+ *
+ * A rewrite writes no file byte, so a guest's live disk is not a refusal here —
+ * it is the fact an operator being asked to agree to hours of whole-band
+ * reading cannot discover anywhere else on the screen. (The repair route's
+ * matching REFUSAL is in `routes/__tests__/ahr-repair.test.ts`.)
+ */
+describe('rewriteLunWarnings — the parity-rewrite LUN disclosure (F10)', () => {
+  const HELD = {
+    targetIqn: 'iqn.2026-08.dev.anas.ahr0:target1',
+    index: 1,
+    name: 'ahr0_lun1',
+    backingPath: '/mnt/anas-ahr/ahr0/images/lun1.raw',
+    connectedInitiators: [] as string[],
+    detail: 'held by LUN 1',
+  }
+
+  it('says nothing when nothing is served from the pool', () => {
+    assert.deepEqual(rewriteLunWarnings(null), [])
+  })
+
+  it('names the LUN and its live sessions, and says the guest sees nothing this run writes', () => {
+    const [line] = rewriteLunWarnings({ ...HELD, connectedInitiators: ['iqn.1993-08.org.debian:01:abc'] })
+    assert.match(line, /A guest's disk is live on this pool/)
+    assert.match(line, /LUN 1 \('ahr0_lun1'\)/)
+    assert.match(line, /1 initiator logged in right now/)
+    assert.match(line, /Nothing this run writes is visible to them/)
+    assert.match(line, /reading flat out underneath that disk/)
+    // It is a disclosure, not a refusal: no verb telling the operator to stop.
+    assert.ok(!/refused/i.test(line), line)
+  })
+
+  it('an idle LUN still gets the line, with the honest "no initiator" clause', () => {
+    const [line] = rewriteLunWarnings(HELD)
+    assert.match(line, /No initiator is logged in right now/)
+    assert.match(line, /never a file/)
   })
 })

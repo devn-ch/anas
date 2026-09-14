@@ -4,6 +4,7 @@ import type {
   SelfhealMapping,
   SelfhealOutcome,
   SelfhealOutcomeKind,
+  SelfhealParityResidual,
   SelfhealReasonCode,
   SelfhealReconstruction,
   SelfhealStep,
@@ -12,8 +13,9 @@ import type {
 import type { CommandExecutor } from '../executor/types.js'
 import type { AhrSnapshotOptions } from './ahr-snapshots.js'
 import type { MdGeometry, MemberLocation, ResolvedBlock, SelfhealContext } from './selfheal-map.js'
-import { readdir } from 'node:fs/promises'
+import { readdir, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
+import { SELFHEAL_BAD_BLOCKS_PRESENT } from '@anas/shared'
 import {
   createAhrSnapshot,
   deleteAhrSnapshot,
@@ -39,6 +41,7 @@ import {
   writeMdAttr,
 } from './selfheal-io.js'
 import {
+  memberHasBadBlock,
   memberOffsetOn,
   parseDmTable,
   resolveBlock,
@@ -114,9 +117,23 @@ import {
  * `dump-tree -t 7` on an 80 TB pool is tens of gigabytes; through the
  * executor's buffer it is not a slow path, it is no path at all.
  *
- * **Why a failed post-check is `unrepairable`.** A repaired data block over a
- * stripe md still disagrees with is worse than an unrepaired one: it reads
- * correct today and reconstructs wrong the day a disk dies. The engine says so.
+ * **What a failed post-check means, and what it does not.** A repaired data
+ * block over a stripe md still disagrees with reads correct today and
+ * reconstructs wrong the day a disk dies, so the engine never calls it clean.
+ * But it is not the same verdict as a block that could not be repaired at all
+ * (seventh pass, F2): on RAID6 with rot in the target block AND in Q, P-XOR
+ * wins arbitration and md still counts the stripe because Q is wrong. The block
+ * is then re-read COLD and arbitrated again; if it passes, it is `repaired` and
+ * the leftover is a PARITY residual on the band — carried out on the outcome so
+ * Rewrite parity can act on it, and never as advice to restore a file that was
+ * just proven correct.
+ *
+ * **Four things the engine refuses to call an answer about the bytes.** An
+ * inline extent, a hole, a truncated owner scan, a band whose geometry went
+ * unreadable — plus a read-back guard failure and a path whose inode is not the
+ * one the scrub examined — are blocks NOBODY LOOKED AT. They are `not-examined`
+ * with the reason, never `mapping-abort` (which asserts the bytes passed their
+ * checksum) and never `unrepairable` (which advises a restore).
  *
  * ## What this cut does NOT repair (by design, all `unrepairable`)
  *
@@ -140,6 +157,15 @@ export interface SelfhealRepairRequest {
   file: string
   /** 4 KiB file block index. */
   block: number
+  /**
+   * The inode the SCRUB examined, when the caller knows it (seventh pass, F11).
+   *
+   * A path is not an identity. The finding carries an inode; when it rides in,
+   * the engine `stat`s the path at the gates — before it pins anything — and
+   * refuses a mismatch by name rather than leaving the re-verify to notice by
+   * accident. Omitted, nothing changes.
+   */
+  inode?: number
   /**
    * The AHR pool, when the caller has it (selfheal.6 does; the dev entry point
    * resolves it from the topology). A §12 pool — `subvolLayout` — pins through
@@ -661,6 +687,13 @@ export async function repairBlock(
    * back, and nothing else is written to at all.
    */
   const touched = new Map<string, TouchedBand>()
+  /**
+   * The repaired-block sentence, set the moment `writeDirect` returns (F5).
+   *
+   * Null until then, which is what makes "nothing written" a checkable claim
+   * rather than a hopeful one.
+   */
+  let written: string | null = null
 
   /** Register a band as touched, snapshotting the knobs before they move. */
   async function touchBand(geo: MdGeometry): Promise<TouchedBand> {
@@ -707,6 +740,22 @@ export async function repairBlock(
     // between the two), and a pool with any band degraded or busy is one the
     // route already refuses as a whole.
     await step('gates')
+    // F11 — identity, before anything is pinned or read. `reverify` catches a
+    // re-created path by accident (the new bytes pass their own checksum, so
+    // the run aborts "not corrupt here"); that is a coincidence, not a check,
+    // and it says the wrong thing about a file nobody examined.
+    if (request.inode !== undefined) {
+      let live: number | null
+      try {
+        live = (await stat(file)).ino
+      }
+      catch (error) {
+        fail('not-examined', `${file} could not be stat'ed to confirm it is the file the scrub examined (inode ${request.inode}): ${errorText(error)}. Nothing was written.`, 'inode-changed')
+      }
+      if (live !== request.inode) {
+        fail('not-examined', `the file at ${file} is inode ${live}, not the inode ${request.inode} the scrub examined — this is not the file the finding describes. Nothing was written, and nothing is known about this file's bytes.`, 'inode-changed')
+      }
+    }
     const context = await resolveContext(executor, mountpoint)
     const refusal = await gateRefusal(executor, context, request.pool ?? null, options)
     if (refusal)
@@ -740,6 +789,31 @@ export async function repairBlock(
     await step('reverify')
     const verdict = await reverify(executor, pinned, resolved)
     diagnostics.badSectors = verdict.badSectors
+    if (verdict.abort?.mirrorAllLegsFail) {
+      // F4 — parallel construction with the parity band. Every leg holding the
+      // SAME bad bytes is what through-md rot looks like on a mirror, and md's
+      // own bounded check is the thing that can tell it from two legs that rot
+      // independently: a mirror check compares the legs with each other, so
+      // `mismatch_cnt == 0` means they AGREE. Agreeing-and-wrong is `above-md`
+      // — the diagnosis a parity band gets from the identical evidence, and the
+      // one a node with failing memory needs to see. The advice happens to be
+      // the same; the diagnosis is not, and only one of the two is recorded in
+      // `aboveMd` or said in the notification.
+      const mirrorTarget = resolved.sectors[verdict.badSectors[0]]
+      const mirrorGeo = mirrorTarget.geometry
+      outcomeBand = mirrorGeo
+      diagnostics.mapping = mappingOf(resolved, verdict.badSectors[0])
+      await step('precheck')
+      const mirrorStripe = Math.floor(mirrorTarget.mdByte / (windowSectors(mirrorGeo) * 512))
+      ;(await touchBand(mirrorGeo)).syncKnobs = true
+      const legs = await boundedWindowCheck(executor, mirrorGeo, mirrorStripe, options)
+      diagnostics.precheckMismatch = legs
+      note(`mismatch_cnt=${legs}`)
+      if (legs === 0) {
+        fail('above-md', `${verdict.abort.reason} md's own bounded check over ${mirrorGeo.device} reports mismatch_cnt=0, so the legs AGREE with each other and are both wrong — parity already agreed with the bad data, which implicates something other than the disks (memory, controller, software). Nothing was written.`)
+      }
+      fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es), so the legs disagree with each other and neither matches the stored csum. Restore ${file} from backup.`)
+    }
     if (verdict.abort)
       fail(verdict.abort.kind, verdict.abort.reason, verdict.abort.code)
     const target = resolved.sectors[verdict.badSectors[0]]
@@ -786,9 +860,26 @@ export async function repairBlock(
     // Re-read `degraded` and ask sysfs which roles are actually still in.
     await step('reconstruct')
     const absent = await absentRoles(geo)
-    const plan = reconstructionPlan(geo, target, absent, verdict.goodMirrors)
-    if (plan.refusal)
-      fail('unrepairable', plan.refusal)
+    // F8 — md's bad-block list is the OTHER way a member stops being a source
+    // of truth. A recorded range is a span md returned a URE on during a
+    // rebuild and never reconstructed: md serves EIO for it, and XORing what a
+    // read of it returns produces a candidate that is wrong in a way
+    // arbitration might not catch on RAID6 (the Q solve would be fed the wrong
+    // syndrome). Such a member is ABSENT for this row, exactly as a kicked one
+    // is — RAID5 then has nothing left, RAID6 still has the other syndrome.
+    const badBlocked = badBlockRoles(geo, target)
+    const plan = reconstructionPlan(geo, target, [...new Set([...absent, ...badBlocked])], verdict.goodMirrors)
+    if (plan.refusal) {
+      fail(
+        'unrepairable',
+        badBlocked.length > 0
+          ? `${plan.refusal} ${badBlockNote(geo, badBlocked)}`
+          : plan.refusal,
+        badBlocked.length > 0 ? SELFHEAL_BAD_BLOCKS_PRESENT : undefined,
+      )
+    }
+    if (badBlocked.length > 0)
+      note(badBlockNote(geo, badBlocked))
     const candidates = await reconstruct(executor, geo, target, plan)
     if (candidates.length === 0)
       fail('unrepairable', `no candidate could be reconstructed for ${file} block ${request.block}`)
@@ -817,8 +908,13 @@ export async function repairBlock(
     await step('guard')
     const guard = await readBackGuard(executor, geo, target, corruptBytes)
     note(guard.detail)
+    // F9 — the guard fires exactly when NOTHING about this file has been
+    // established: the md offset and the member offset do not describe the same
+    // bytes, so the sector the re-verify read may not even belong to this file.
+    // "Restore from backup" over that is advice to overwrite a file on no
+    // evidence at all.
     if (!guard.ok)
-      fail('unrepairable', guard.detail)
+      fail('not-examined', guard.detail, 'unresolvable')
 
     // ---- write ----------------------------------------------------------
     // The gates are a re-check, not a one-time test (D2). Everything between
@@ -831,6 +927,13 @@ export async function repairBlock(
     if (changed)
       fail('unrepairable', `array state changed mid-repair: ${changed}, nothing written`)
     await writeDirect(executor, geo.device, target.mdByte, winner.bytes)
+    const repaired = `${file} block ${request.block} reconstructed from ${winner.detail} and verified against the stored csum ${csumHex(storedCsum)}`
+    // F5 — from here on, "nothing written" is a FALSE sentence. The post-check
+    // is a bounded md check over a 20 TB band's stripe: minutes, during which a
+    // member can fail and put md into `recover`. `boundedWindowCheck` raises
+    // `ForeignSyncOpError` for that, and the single global catch below used to
+    // answer it with the same words the PRE-write catch uses.
+    written = repaired
 
     // ---- postcheck ------------------------------------------------------
     await step('postcheck')
@@ -838,7 +941,27 @@ export async function repairBlock(
     diagnostics.postcheckMismatch = after
     note(`mismatch_cnt=${after}`)
     if (after !== 0) {
-      fail('unrepairable', `the block was written back but the bounded md check over stripe ${stripe} still reports mismatch_cnt=${after} — the parity group is not consistent. Restore ${file} from backup.`)
+      // F2 — a non-zero post-check AFTER a successful write is a different
+      // verdict from one before it. The RAID6 shape that produces it: rot in
+      // the target block AND in Q. P-XOR wins arbitration, the block goes
+      // through md, and md still counts the stripe because Q is wrong. Prove
+      // the BLOCK first — cold, through the pin, against the checksum btrfs
+      // stored for it — and if it passes, the block is repaired and what is
+      // left is a PARITY residual on the band. Telling the operator to restore
+      // a file that was just proven correct is how a restore from an older
+      // backup loses data that was recoverable.
+      const proof = await coldVerify(executor, pin, resolved, verdict.badSectors[0], storedCsum)
+      if (proof.ok) {
+        note(`mismatch_cnt=${after}; the block itself re-reads clean cold — the residual is parity`)
+        const residual = parityResidualOf(geo, after, request.pool ?? null)
+        return outcome(
+          'repaired',
+          `${repaired}; ${proof.detail}. The block is repaired; the band still has a parity/Q mismatch — md's bounded check over stripe ${stripe} reports mismatch_cnt=${after}, which is the parity (or Q) member disagreeing and not this file. Run Rewrite parity on ${residual.band}.`,
+          undefined,
+          { parityResidual: residual },
+        )
+      }
+      fail('unrepairable', `the block was written back, the bounded md check over stripe ${stripe} still reports mismatch_cnt=${after}, AND ${proof.detail} — the parity group is not consistent and the block cannot be proven either. Restore ${file} from backup.`)
     }
 
     // ---- coldread -------------------------------------------------------
@@ -849,7 +972,6 @@ export async function repairBlock(
     // leave `rmw_level=0` set on a live array for the duration of the backup.
     // Bounded wait, then say plainly that the confirmation did not run (S2).
     await step('coldread')
-    const repaired = `${file} block ${request.block} reconstructed from ${winner.detail} and verified against the stored csum ${csumHex(storedCsum)}`
     const cold = await coldRead(executor, pin, resolved)
     if (!cold.ran) {
       note(`skipped: ${cold.reason}`)
@@ -868,16 +990,29 @@ export async function repairBlock(
     if (error instanceof SelfhealRunError)
       throw error
     if (error instanceof ForeignSyncOpError) {
-      // Raised from inside a step by the bounded check, with nothing written.
       const stopped = steps.at(-1)
       if (stopped) {
         stopped.ok = false
         stopped.detail = error.message
       }
+      // F5 — the same exception means two different things either side of the
+      // write, and only one of them is "nothing written".
+      if (written !== null) {
+        return outcome(
+          'repaired',
+          `${written} — the block was written and matches its checksum; the post-check could not run (${error.message}). Re-scrub to confirm parity.`,
+          undefined,
+          { postcheckSkipped: error.message },
+        )
+      }
       return outcome('unrepairable', `array state changed mid-repair: ${error.message}, nothing written`)
     }
-    if (error instanceof SelfhealMapError)
-      return outcome('mapping-abort', error.message)
+    if (error instanceof SelfhealMapError) {
+      // F3 — a map failure is a block NOBODY LOOKED AT. `mapping-abort` asserts
+      // the opposite (the bytes there were read and passed their checksum), and
+      // it is raised in exactly one place: the re-verify, which established it.
+      return outcome('not-examined', error.message, error.reasonCode)
+    }
     throw new SelfhealRunError(errorText(error), steps, diagnostics, { cause: error })
   }
   finally {
@@ -886,12 +1021,19 @@ export async function repairBlock(
 
   // -- helpers that close over the run's state -----------------------------
 
-  function outcome(kind: SelfhealOutcomeKind, reason: string, code?: SelfhealReasonCode): SelfhealOutcome {
+  function outcome(
+    kind: SelfhealOutcomeKind,
+    reason: string,
+    code?: SelfhealReasonCode,
+    extra?: { parityResidual?: SelfhealParityResidual, postcheckSkipped?: string },
+  ): SelfhealOutcome {
     const map = diagnostics.mapping
     return {
       outcome: kind,
       reason,
       ...(code ? { reasonCode: code } : {}),
+      ...(extra?.parityResidual ? { parityResidual: extra.parityResidual } : {}),
+      ...(extra?.postcheckSkipped ? { postcheckSkipped: extra.postcheckSkipped } : {}),
       file,
       block: request.block,
       pool: request.pool?.name ?? null,
@@ -1365,7 +1507,21 @@ interface Reverified {
   /** RAID1: legs that still pass their csum — the candidate source. */
   goodMirrors: number[]
   /** Set when the sequence must stop here. */
-  abort: { kind: SelfhealOutcomeKind, reason: string, code?: SelfhealReasonCode } | null
+  abort: {
+    kind: SelfhealOutcomeKind
+    reason: string
+    code?: SelfhealReasonCode
+    /**
+     * RAID1 with EVERY leg failing the stored csum (seventh pass, F4).
+     *
+     * The verdict is NOT decided here: the same bad bytes on both legs is what
+     * rot that arrived THROUGH md looks like on a mirror, and on a parity band
+     * that fault is diagnosed `above-md` by the bounded check. Parallel
+     * construction says it must read the same way on a mirror, so the caller
+     * runs the check before it answers.
+     */
+    mirrorAllLegsFail?: true
+  } | null
 }
 
 /**
@@ -1496,7 +1652,8 @@ async function reverify(
       goodMirrors,
       abort: {
         kind: 'unrepairable',
-        reason: `every mirror leg fails the stored csum for ${resolved.file} block ${resolved.block} — there is no good copy left. Restore from backup.`,
+        reason: `every mirror leg fails the stored csum for ${resolved.file} block ${resolved.block} — there is no good copy left.`,
+        mirrorAllLegsFail: true,
       },
     }
   }
@@ -1530,7 +1687,7 @@ async function readBackGuard(
       ? { ok: true, detail: `the md block at ${target.mdByte} is the bytes read from ${target.memberDevice}` }
       : {
           ok: false,
-          detail: `read-back guard failed: the md block at ${target.mdByte} does not match the bytes read from ${target.memberDevice} at ${target.memberOffset}. The mapping and the array disagree; nothing was written.`,
+          detail: `read-back guard failed: the md block at ${target.mdByte} does not match the bytes read from ${target.memberDevice} at ${target.memberOffset}. The mapping and the array disagree; nothing was written, and nothing is known about this file's bytes.`,
         }
   }
   for (const leg of target.mirrors) {
@@ -1543,7 +1700,7 @@ async function readBackGuard(
   }
   return {
     ok: false,
-    detail: `read-back guard failed: the md block at ${target.mdByte} matches NO leg of this mirror at its own offset. The mapping and the array disagree; nothing was written.`,
+    detail: `read-back guard failed: the md block at ${target.mdByte} matches NO leg of this mirror at its own offset. The mapping and the array disagree; nothing was written, and nothing is known about this file's bytes.`,
   }
 }
 
@@ -1655,6 +1812,97 @@ async function reconstruct(
   }
 
   return out
+}
+
+/**
+ * The roles whose recorded md bad-block list covers the ROW the target block
+ * sits in (seventh pass, F8).
+ *
+ * The row is the same per-member span on every role of a parity stripe, so the
+ * question is asked at each role's OWN offset (`memberOffsetOn` — data offsets
+ * are allowed to differ). On RAID1 the legs are the roles, and the same test
+ * answers for them.
+ */
+function badBlockRoles(geo: MdGeometry, target: MemberLocation): number[] {
+  const out: number[] = []
+  for (let role = 0; role < geo.raidDisks; role++) {
+    if (geo.members[role] === null)
+      continue
+    if (memberHasBadBlock(geo, role, memberOffsetOn(geo, target, role)))
+      out.push(role)
+  }
+  return out
+}
+
+/** What to say about the bad-blocked members — the operator's own sentence. */
+function badBlockNote(geo: MdGeometry, roles: number[]): string {
+  const names = roles.map(role => geo.members[role] ?? `role ${role}`).join(', ')
+  return `md has recorded bad blocks over this row on ${names} — md reconstructs nothing from a member's recorded bad-block range, so it counts as absent here. Replace that member.`
+}
+
+/**
+ * The parity residual a repaired block left behind (F2), named the way the
+ * Scrubs screen names bands.
+ *
+ * The band INDEX is what a `parityMismatches` row is keyed on, and it comes
+ * from the pool's own topology by kernel name — `AhrArray.kernelName` is the
+ * transient `mdN` sysfs key, which is exactly what the engine resolved the band
+ * to through the dm table. It is deliberately not persisted anywhere: both
+ * sides read it live, in the same run.
+ */
+function parityResidualOf(geo: MdGeometry, mismatchCnt: number, pool: AhrPool | null): SelfhealParityResidual {
+  const array = pool?.arrays.find(a => a.kernelName === geo.kernel || a.device === geo.device)
+  return {
+    array: geo.device,
+    band: array && pool ? `${pool.name}-r${array.band}` : geo.kernel,
+    bandIndex: array ? array.band : null,
+    mismatchCnt,
+  }
+}
+
+/**
+ * Re-read the REPAIRED block cold and check it against the checksum btrfs
+ * stored for it (F2).
+ *
+ * This is the proof that separates "the block is fine and the band's parity is
+ * not" from "neither is", and it is asked only after a post-check came back
+ * non-zero over a block that was already written.
+ *
+ * TWO readings, and the first one that can run is the answer:
+ *
+ *  - through the PIN, which is the strongest form of the question — a fresh
+ *    snapshot's inodes have no page cache behind them, btrfs verifies the
+ *    stored csum on every read, and an EIO from it IS a checksum failure
+ *    (GT-9a). Same reading the clean path takes, so one mechanism decides.
+ *  - failing that (a §12 pool whose top-level mount a backup is holding, S2),
+ *    the MEMBER is read directly at the repaired offset and the bytes are
+ *    arbitrated against the stored csum — the same arbitration the candidate
+ *    won, taken again off the disk after `drop_caches`.
+ *
+ * What it must never do is answer "proven" on a read it could not take.
+ */
+async function coldVerify(
+  executor: CommandExecutor,
+  pin: Pin,
+  resolved: ResolvedBlock,
+  sector: number,
+  storedCsum: number,
+): Promise<{ ok: boolean, detail: string }> {
+  const cold = await coldRead(executor, pin, resolved)
+  if (cold.ran) {
+    return cold.bad.length === 0
+      ? { ok: true, detail: 'the block reads back clean through a fresh snapshot, so btrfs verifies its stored checksum' }
+      : { ok: false, detail: `the block still reads back with an error through a fresh snapshot (blocks ${cold.bad.join(', ')})` }
+  }
+  const location = resolved.sectors[sector]
+  const geo = location.geometry
+  const leg = geo.raid1 ? location.mirrors[0] ?? location.memberIndex : location.memberIndex
+  const device = geo.members[leg] ?? location.memberDevice
+  const bytes = await readDirect(executor, device, memberOffsetOn(geo, location, leg), BLOCK_BYTES)
+  const value = crc32c(bytes)
+  return value === storedCsum
+    ? { ok: true, detail: `the cold read through the snapshot could not run (${cold.reason}), so the block was re-read straight off ${device} and matches the stored csum ${csumHex(storedCsum)}` }
+    : { ok: false, detail: `the cold read through the snapshot could not run (${cold.reason}) and the block re-read straight off ${device} does NOT match the stored csum ${csumHex(storedCsum)} (read ${csumHex(value)})` }
 }
 
 /**

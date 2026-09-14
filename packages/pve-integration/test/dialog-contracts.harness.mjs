@@ -7591,8 +7591,15 @@ async function rewriteParityMirrorChecks() {
   const cell = scrubCell(grid, rowFor(grid, 'ahr0'));
   ok('rewrite: a mirror-only mismatch row does NOT offer "click to rewrite"',
     !/Click to rewrite/.test(cell), cell)
-  ok('rewrite: …it says there is no parity to rewrite, and names the verb that does arbitrate',
-    /no parity to rewrite/.test(cell) && /Repair from parity/.test(cell), cell)
+  // Seventh pass, F1 — the tooltip must NOT name Repair from parity as the
+  // path: that verb needs a finding with named blocks, phase 2 named none, and
+  // the mirror verb is story selfheal.11 (inked, not built). What it must say
+  // instead is what the operator must not do.
+  ok('rewrite: …it says there is no parity to rewrite, and names no verb the operator cannot reach',
+    /no parity to rewrite/.test(cell)
+      && /not yet repairable from ANAS \(selfheal\.11\)/.test(cell)
+      && /do not run md repair on a mirror/.test(cell)
+      && !/Repair from parity/.test(cell), cell)
 
   grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
   await settle()
@@ -7603,6 +7610,10 @@ async function rewriteParityMirrorChecks() {
     !/the parity is what is wrong/.test((win.items.getAt(0) || {}).html || '')
       && /RAID1 mirror bands/.test((win.items.getAt(0) || {}).html || ''),
     (win.items.getAt(0) || {}).html)
+  ok('rewrite: …and it names no verb the operator cannot reach either (F1)',
+    /not yet repairable from ANAS \(selfheal\.11\)/.test((win.items.getAt(0) || {}).html || '')
+      && !/Repair from parity/.test((win.items.getAt(0) || {}).html || ''),
+    (win.items.getAt(0) || {}).html)
 
   const pGrid = win.down('#parityGrid')
   const btn = win.down('#rewriteParity')
@@ -7612,13 +7623,68 @@ async function rewriteParityMirrorChecks() {
   ok('rewrite: a ticked mirror band leaves the verb dark', btn.disabled === true)
   ok('rewrite: …with the reason the daemon would 409 with',
     /no parity to rewrite/.test(btn.tooltip || '')
-      && /never by md repair/.test(btn.tooltip || ''), btn.tooltip)
+      && /not yet repairable from ANAS \(selfheal\.11\)/.test(btn.tooltip || '')
+      && !/Repair from parity/.test(btn.tooltip || ''), btn.tooltip)
 
   let sent = null
   ANAS.confirmAndRun = (cfg) => { sent = cfg }
   btn.handler(btn)
   await settle()
   ok('rewrite: and the handler refuses it too — nothing is submitted for a mirror band', sent === null)
+}
+
+// Seventh pass, F2 — the parity indicator can be fed by a completed REPAIR.
+//
+// A repair that wrote a block, proved it cold against its stored checksum and
+// then saw md still counting the stripe has MEASURED a parity residual on that
+// band. It rides the repair result in the SAME row shape a scrub's
+// `parityMismatches` uses, so the door on the Scrubs row opens without waiting
+// hours for a fresh two-phase scrub to rediscover the number.
+async function parityResidualFromRepairChecks() {
+  const REPAIR_RESIDUAL = {
+    data: [{
+      id: 'jrep',
+      operation: 'ahr.repair',
+      status: 'completed',
+      createdAt: '2026-09-12T14:00:00.000Z',
+      completedAt: '2026-09-12T14:30:00.000Z',
+      result: {
+        pool: 'ahr0',
+        files: [],
+        repaired: 1,
+        unrepairable: 0,
+        aboveMd: 0,
+        mappingAbort: 0,
+        notExamined: 0,
+        parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+        blocks: 1,
+      },
+    }],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': REPAIR_RESIDUAL })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  const cell = scrubCell(grid, rowFor(grid, 'ahr0'))
+  ok('residual: the Scrubs row shows the parity indicator from the REPAIR job (F2)',
+    /parity mismatch on ahr0-r1 \(8\)/.test(cell), cell)
+  ok('residual: and it offers the rewrite, because the band is a parity band',
+    /Click to rewrite/.test(cell), cell)
+
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('residual: the parity window opens on it', !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+  const pGrid = win.down('#parityGrid')
+  eq('residual: the band is the row', pGrid.getStore().getAt(0).get('band'), 'ahr0-r1')
+  eq('residual: with the band number Rewrite parity is keyed on', pGrid.getStore().getAt(0).get('bandIndex'), 1)
+  pGrid.selectRows([0])
+  await settle()
+  eq('residual: the verb is reachable', win.down('#rewriteParity').disabled, false)
 }
 
 // Design review 2026-09-14, D15 + S8 — the AHR Snapshots manager meets the
@@ -7918,6 +7984,10 @@ async function repairFromParityChecks() {
     sent.body.files.map(f => f.path), [FINDING_A.path, FINDING_D.path, FINDING_E.path])
   eq('repair: …and the exact 4 KiB blocks the scrub probed',
     sent.body.files.map(f => f.blocks), [[300], [12, 13], [32]])
+  // Seventh pass, F11 — a path is not an identity. The finding's inode rides
+  // along so the daemon can refuse a file that is not the one the scrub read.
+  eq('repair: …and the finding\'s INODE, so the daemon can check identity (F11)',
+    sent.body.files.map(f => f.inode), [FINDING_A.inode, FINDING_D.inode, FINDING_E.inode])
   ok('repair: …the compressed extent rides as ONE block — its first, not 32 copies of the blob',
     sent.body.files[2].blocks.length === 1 && sent.body.files[2].blocks[0] === FINDING_E.extentBlocks.first,
     JSON.stringify(sent.body.files[2]))
@@ -7973,6 +8043,55 @@ async function repairFromParityChecks() {
     /1 block\(s\) were not corrupt at the mapped location — nothing was written, nothing to restore/.test(panel.html), panel.html)
   ok('repair: …and the restore advice stays reserved for the TRUE unrepairable',
     !/restore this file from backup/.test(panel.html), panel.html)
+
+  // --- Seventh pass, F3 — the NOT-EXAMINED bucket ---------------------------
+  // A block the mapping could not reach was never looked at. It used to borrow
+  // the mapping-abort sentence, which asserts the bytes still pass their stored
+  // checksum — a reassurance about blocks nobody read.
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'not-examined', reason: 'block 300 is a hole', reasonCode: 'hole' }] },
+    ],
+    repaired: 0,
+    unrepairable: 0,
+    aboveMd: 0,
+    mappingAbort: 0,
+    notExamined: 1,
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: the not-examined count rides the headline as its OWN number (F3)',
+    /0 repaired · 0 unrepairable · 0 above md · 0 not corrupt at the mapped location · 1 not examined/.test(panel.html), panel.html)
+  ok('repair: …with the reason code, and nothing is known about the bytes',
+    /could not be EXAMINED \(hole\)/.test(panel.html)
+      && /nothing is known about those bytes/.test(panel.html), panel.html)
+  ok('repair: …neither a clean bill of health nor a reason to restore',
+    /neither a clean bill of health nor a reason to restore/.test(panel.html)
+      && !/restore this file from backup/.test(panel.html)
+      && !/need no restore/.test(panel.html), panel.html)
+
+  // --- Seventh pass, F2 — a repaired block that left a PARITY residual ------
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'repaired', reason: 'repaired; the band still has a parity/Q mismatch' }] },
+    ],
+    repaired: 1,
+    unrepairable: 0,
+    aboveMd: 0,
+    mappingAbort: 0,
+    notExamined: 0,
+    parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: a parity residual is reported, naming the band and md\'s count (F2)',
+    /Repaired, and md still counts mismatching stripes on ahr0-r1 \(mismatch_cnt 8\)/.test(panel.html), panel.html)
+  ok('repair: …and points at Rewrite parity, never a restore',
+    /Rewrite parity on that band/.test(panel.html)
+      && /no fresh scrub is needed/.test(panel.html)
+      && !/restore/i.test(panel.html), panel.html)
 
   // --- D3/D10 — the csum-unreadable verdict does NOT say restore -------------
   sent.onComplete(repairJob({
@@ -8352,6 +8471,7 @@ warnings.length = 0
 created.windows.length = 0
 await rewriteParityRefusedChecks()
 await rewriteParityMirrorChecks()
+await parityResidualFromRepairChecks()
 warnings.length = 0
 created.windows.length = 0
 await ahrSnapshotPinChecks()

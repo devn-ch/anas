@@ -15,7 +15,7 @@ import {
 } from './ahr-scrub.js'
 import { pveNotify } from './pve-notify.js'
 import { MD_DEFAULT_SYNC_MAX, MD_DEFAULT_SYNC_MIN, readMdAttrOrNull, sleep } from './selfheal-io.js'
-import { readMdGeometry } from './selfheal-map.js'
+import { bandBadBlocks, readMdGeometry } from './selfheal-map.js'
 import { arrayRefusal, preWriteRefusal, restoreSyncKnobs } from './selfheal-repair.js'
 import { foreignOpNote, isIdleSyncAction, markCheckIssued, ownsSyncOp, retireCheckIssued } from './selfheal-syncop.js'
 
@@ -240,6 +240,32 @@ export function scrubParityMismatches(result: unknown): z.infer<typeof ParityMis
 }
 
 /**
+ * The same reading, of a REPAIR job's result (seventh pass, F2).
+ *
+ * A repair that wrote a block, proved it against its stored checksum and then
+ * saw md still counting mismatching stripes has MEASURED a parity residual on
+ * that band. Making the operator wait hours for a fresh two-phase scrub to
+ * rediscover a number this node already has is the gap F2 names, so the same
+ * row shape rides the repair result and is read here.
+ *
+ * The other half of the proof is read from the repair's own counts rather than
+ * from a checksum pass: a run that left blocks unrepaired, above md or
+ * unexamined is a run with KNOWN data rot on the pool, and md repair would
+ * bless it exactly as it would bless a scrub's findings.
+ */
+const RepairEvidenceShape = z.object({
+  unrepairable: z.number().int().nonnegative().optional(),
+  aboveMd: z.number().int().nonnegative().optional(),
+  notExamined: z.number().int().nonnegative().optional(),
+  parityResiduals: z.array(ParityMismatchRow).optional(),
+})
+
+export function repairParityResiduals(result: unknown): z.infer<typeof ParityMismatchRow>[] | null {
+  const parsed = RepairEvidenceShape.safeParse(result)
+  return parsed.success ? parsed.data.parityResiduals ?? null : null
+}
+
+/**
  * Read the proof out of the pool's last COMPLETED scrub job (precondition 1).
  *
  * Both halves have to hold, and they are two different statements:
@@ -250,7 +276,20 @@ export function scrubParityMismatches(result: unknown): z.infer<typeof ParityMis
  *    could bless, and the band a finding sits on is not always the band the
  *    mismatch was counted on.
  */
-export function parityRewriteEvidence(poolName: string, job: Job | undefined, band: number): ParityRewriteEvidence {
+export function parityRewriteEvidence(
+  poolName: string,
+  source: Job | undefined | readonly (Job | undefined)[],
+  band: number,
+): ParityRewriteEvidence {
+  // The proof may come from a scrub OR from a repair (seventh pass, F2), and
+  // the NEWER of the two is the one that describes the band as it is now: a
+  // repair run after a scrub has moved the data the scrub measured parity
+  // against, and a scrub run after a repair has re-measured everything.
+  const job = Array.isArray(source)
+    ? [...source].filter((j): j is Job => !!j).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0]
+    : (source as Job | undefined)
+  if (job?.operation === 'ahr.repair')
+    return repairEvidence(poolName, job, band)
   if (!job) {
     return {
       ok: false,
@@ -292,6 +331,50 @@ export function parityRewriteEvidence(poolName: string, job: Job | undefined, ba
   return { ok: true, mismatchCnt: row.mismatchCnt, jobId: job.id }
 }
 
+/**
+ * The proof, read out of a completed REPAIR job instead (F2).
+ *
+ * Both halves still have to hold, and they are the same two statements said
+ * about a different run:
+ *  - a repaired-and-proven block on THIS band left md still counting mismatches
+ *    there, which is a parity residual and nothing else — the block itself was
+ *    re-read cold and matched the checksum btrfs stored for it;
+ *  - the run left NO block unrepaired, above md or unexamined: any of those is
+ *    known data rot on the pool, and md repair would make it permanent.
+ *
+ * The rewrite job's own phase 1 — a fresh full-pool checksum scrub that aborts
+ * on any finding — is what makes "the data is intact" a statement about NOW,
+ * exactly as it is for a scrub-sourced proof. This gate is the filter in front
+ * of it, not a substitute for it.
+ */
+function repairEvidence(poolName: string, job: Job, band: number): ParityRewriteEvidence {
+  const parsed = RepairEvidenceShape.safeParse(job.result)
+  if (!parsed.success) {
+    return {
+      ok: false,
+      code: 'no-parity-mismatch',
+      reason: `the last completed repair on AHR pool '${poolName}' (job ${job.id}) did not report a result this verb can read`,
+    }
+  }
+  const unrepaired = (parsed.data.unrepairable ?? 0) + (parsed.data.aboveMd ?? 0) + (parsed.data.notExamined ?? 0)
+  if (unrepaired > 0) {
+    return {
+      ok: false,
+      code: 'data-findings-present',
+      reason: `the last repair on AHR pool '${poolName}' (job ${job.id}) left ${unrepaired} block(s) unrepaired, above md or unexamined — repair or restore those first. Rewriting parity now would recompute it from data this node cannot vouch for`,
+    }
+  }
+  const row = (parsed.data.parityResiduals ?? []).find(r => r.bandIndex === band)
+  if (!row || row.mismatchCnt <= 0) {
+    return {
+      ok: false,
+      code: 'no-parity-mismatch',
+      reason: `the last repair on AHR pool '${poolName}' (job ${job.id}) recorded no leftover parity mismatch on band r${band} — there is nothing here to rewrite`,
+    }
+  }
+  return { ok: true, mismatchCnt: row.mismatchCnt, jobId: job.id }
+}
+
 /** A refusal with the code a parser keys on, or null when the band may be rewritten. */
 export interface ParityRewriteRefusal {
   reason: string
@@ -317,12 +400,34 @@ export function mirrorBandRefusal(device: string): string {
   return `${device} is a RAID1 mirror band — there is no parity on it to rewrite. md's repair on a mirror copies the first in-sync leg over the others without looking at which one is right, so on a band whose legs disagree it overwrites the good copy half the time. A mirror mismatch is arbitrated by Repair from parity per block, never by md repair`
 }
 
+/**
+ * The sentence a band with recorded md bad blocks is refused with (seventh
+ * pass, F8).
+ *
+ * A bad-block range is a span md returned a URE on during a rebuild and never
+ * reconstructed: md serves EIO for it and holds no correct copy of it. A
+ * whole-band `mdadm --action=repair` walks every stripe of the array and
+ * recomputes parity from what it reads — including rows it cannot read at all.
+ * That is the data-rot case with the rot hidden inside md rather than on a
+ * member, and the same rule applies: the member is replaced first.
+ */
+export function badBlocksRefusal(geo: MdGeometry): string {
+  const carriers = bandBadBlocks(geo)
+  const named = carriers.map(c => `${c.device} (${c.ranges.length} range${c.ranges.length === 1 ? '' : 's'})`).join(', ')
+  return `${geo.device} has members with recorded bad blocks: ${named}. md cannot reconstruct from a member with recorded bad blocks — replace the member first. A whole-band repair would recompute this band's parity from rows md cannot read`
+}
+
 /** Why this band cannot be rewritten right now (precondition 2), or null. */
 export async function parityRewriteArrayRefusal(geo: MdGeometry): Promise<ParityRewriteRefusal | null> {
   // FIRST, and not a state that can pass: every other refusal here is "not
   // now", this one is "not this band, ever".
   if (geo.raid1)
     return { reason: mirrorBandRefusal(geo.device), code: 'not-a-parity-band' }
+  // Also not a wait-and-retry state: a member with recorded bad blocks is a
+  // member to replace, and until it is replaced this band has rows md cannot
+  // reconstruct (F8).
+  if (bandBadBlocks(geo).length > 0)
+    return { reason: badBlocksRefusal(geo), code: 'bad-blocks-present' }
   const refusal = await arrayRefusal(geo)
   if (refusal)
     return { reason: refusal, code: 'array-busy' }

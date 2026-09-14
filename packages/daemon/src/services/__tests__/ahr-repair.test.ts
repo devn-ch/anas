@@ -450,12 +450,12 @@ describe('AHR repair job — the one notification', () => {
     assert.match(notify.body, /\/a\.bin — restore this file from backup/)
   })
 
-  it('the notification names all four counts, and they add up (review R9)', async () => {
+  it('the notification names all five counts, and they add up (review R9, seventh pass F3)', async () => {
     const exec = executor()
     const result = await repairAhrFiles(
       exec,
       pool(),
-      [{ path: '/a.bin', blocks: [1, 2, 3, 4] }],
+      [{ path: '/a.bin', blocks: [1, 2, 3, 4, 5] }],
       () => {},
       {
         repair: async (_e, req) => outcome(req.file, req.block, ({
@@ -463,12 +463,16 @@ describe('AHR repair job — the one notification', () => {
           2: 'unrepairable',
           3: 'above-md',
           4: 'mapping-abort',
+          5: 'not-examined',
         } as Record<number, SelfhealOutcomeKind>)[req.block], 'because'),
       },
     )
-    assert.equal(result.repaired + result.unrepairable + result.aboveMd + result.mappingAbort, result.blocks)
+    assert.equal(
+      result.repaired + result.unrepairable + result.aboveMd + result.mappingAbort + result.notExamined,
+      result.blocks,
+    )
     const notify = notification(exec)!
-    assert.match(notify.body, /1 repaired, 1 unrepairable, 1 above md, 1 not corrupt at the mapped location, of 4 block\(s\)/)
+    assert.match(notify.body, /1 repaired, 1 unrepairable, 1 above md, 1 not corrupt at the mapped location, 1 not examined, of 5 block\(s\)/)
   })
 
   it('caps the file list at 20 and says how many more', async () => {
@@ -523,6 +527,8 @@ describe('AHR repair schemas — round trips', () => {
       unrepairable: 0,
       aboveMd: 0,
       mappingAbort: 1,
+      notExamined: 0,
+      parityResiduals: [],
       blocks: 1,
     }
     assert.deepEqual(AhrRepairResult.parse(value), value)
@@ -540,5 +546,177 @@ describe('AHR repair schemas — round trips', () => {
     }
     const parsed = AhrRepairResult.parse(legacy)
     assert.equal(parsed.mappingAbort, 0, 'the new count defaults to 0, never undefined')
+    assert.equal(parsed.notExamined, 0, 'and so does the seventh pass\'s')
+    assert.deepEqual(parsed.parityResiduals, [], 'and the residual rows are a list, never undefined')
+  })
+})
+
+/**
+ * Seventh pass, F3 — the `not-examined` bucket.
+ *
+ * Every map failure used to land in `mappingAbort`, whose notification sentence
+ * says the bytes still pass their stored checksum and need no restore. That is
+ * a reassurance about blocks nobody looked at.
+ */
+describe('AHR repair job — the not-examined bucket (F3)', () => {
+  const REASONS: [string, RegExp][] = [
+    ['inline-extent', /re-scrub after the file is rewritten/],
+    ['hole', /every LUN image ANAS creates is sparse/],
+    ['owner-scan-truncated', /the back-reference scan hit its bound/],
+    ['band-unreadable', /the array was not answering/],
+    ['unresolvable', /the mapping and the array agree again/],
+    ['inode-changed', /a fresh scrub has named the file that is at this path now/],
+  ]
+
+  for (const [code, advice] of REASONS) {
+    it(`counts a '${code}' block as not-examined and gives it its own advice`, async () => {
+      const exec = executor()
+      const result = await repairAhrFiles(
+        exec,
+        pool(),
+        [{ path: '/a.bin', blocks: [1] }],
+        () => {},
+        { repair: async (_e, req) => outcome(req.file, req.block, 'not-examined', 'the chain stopped here.', code as SelfhealReasonCode) },
+      )
+      assert.equal(result.notExamined, 1)
+      assert.equal(result.mappingAbort, 0, 'never folded into the bucket that says the bytes are fine')
+      assert.equal(result.unrepairable, 0, 'and never into the bucket that advises a restore')
+      const body = notification(exec)!.body
+      assert.match(body, /could not be EXAMINED/)
+      assert.match(body, new RegExp(`could not be examined: ${code}`))
+      assert.match(body, advice)
+      assert.ok(!/need no restore/.test(body), body)
+    })
+  }
+
+  it('a not-examined block never carries restore advice, and keeps the run a warning', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1] }],
+      () => {},
+      { repair: async (_e, req) => outcome(req.file, req.block, 'not-examined', 'the chain stopped here.', 'hole') },
+    )
+    assert.equal(result.repaired, 0)
+    const notify = notification(exec)!
+    assert.equal(notify.severity, 'warning')
+    assert.ok(!/restore this file from backup/.test(notify.body), notify.body)
+    assert.match(notify.body, /nothing is known about this file's bytes/)
+  })
+
+  it('one file with two different reasons gets both sentences', async () => {
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1, 2] }],
+      () => {},
+      { repair: async (_e, req) => outcome(req.file, req.block, 'not-examined', 'stopped.', req.block === 1 ? 'hole' : 'inline-extent') },
+    )
+    const body = notification(exec)!.body
+    assert.match(body, /could not be examined: hole/)
+    assert.match(body, /could not be examined: inline-extent/)
+  })
+})
+
+/**
+ * Seventh pass, F2 — a repaired block that left a parity residual on its band.
+ *
+ * The block is right; the band's parity is not. It rides out in the SAME row
+ * shape a scrub's `parityMismatches` uses, so Rewrite parity can act on it
+ * without a fresh multi-hour two-phase scrub.
+ */
+describe('AHR repair job — parity residuals (F2)', () => {
+  function withResidual(bandIndex: number | null, mismatchCnt: number) {
+    return async (_e: unknown, req: { file: string, block: number }): Promise<SelfhealOutcome> => ({
+      ...outcome(req.file, req.block, 'repaired', 'repaired, band still mismatching'),
+      parityResidual: { array: '/dev/md127', band: bandIndex === null ? 'md127' : `tank-r${bandIndex}`, bandIndex, mismatchCnt },
+    })
+  }
+
+  const BANDED = pool({ arrays: [{ band: 2, device: '/dev/md/tank-r2', level: 'raid6', kernelName: 'md127' }] as unknown as AhrPool['arrays'] })
+
+  it('rolls the residual up into a parityMismatches-shaped row, with the band level', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(
+      exec,
+      BANDED,
+      [{ path: '/a.bin', blocks: [1, 2] }],
+      () => {},
+      { repair: withResidual(2, 8) as never },
+    )
+    assert.equal(result.repaired, 2)
+    assert.deepEqual(result.parityResiduals, [
+      { band: 'tank-r2', bandIndex: 2, array: '/dev/md127', mismatchCnt: 8, level: 'raid6' },
+    ])
+  })
+
+  it('one row per band, carrying the highest count seen', async () => {
+    const exec = executor()
+    let n = 0
+    const result = await repairAhrFiles(
+      exec,
+      BANDED,
+      [{ path: '/a.bin', blocks: [1, 2, 3] }],
+      () => {},
+      { repair: (async (_e: unknown, req: { file: string, block: number }) => {
+        n += 1
+        return {
+          ...outcome(req.file, req.block, 'repaired', 'ok'),
+          parityResidual: { array: '/dev/md127', band: 'tank-r2', bandIndex: 2, mismatchCnt: n * 4 },
+        }
+      }) as never },
+    )
+    assert.equal(result.parityResiduals.length, 1)
+    assert.equal(result.parityResiduals[0].mismatchCnt, 12)
+  })
+
+  it('a residual with no band number is NOT promoted to a row — it would name nothing', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1] }],
+      () => {},
+      { repair: withResidual(null, 8) as never },
+    )
+    assert.deepEqual(result.parityResiduals, [])
+    assert.equal(result.files[0].blocks[0].parityResidual?.mismatchCnt, 8, 'the per-block fact is still reported')
+  })
+
+  it('a residual keeps the notification a WARNING and names Rewrite parity, not a restore', async () => {
+    const exec = executor()
+    await repairAhrFiles(exec, BANDED, [{ path: '/a.bin', blocks: [1] }], () => {}, { repair: withResidual(2, 8) as never })
+    const notify = notification(exec)!
+    assert.equal(notify.severity, 'warning', 'every block repaired is not a clean run while a band still mismatches')
+    assert.match(notify.body, /Run Rewrite parity on:/)
+    assert.match(notify.body, /tank-r2 \(\/dev\/md127\) — mismatch_cnt 8/)
+    assert.ok(!/restore/i.test(notify.body), notify.body)
+  })
+})
+
+/**
+ * Seventh pass, F11 — the finding's inode rides into the engine.
+ */
+describe('AHR repair job — the finding\'s inode (F11)', () => {
+  it('passes it through when the caller has it, and omits it when it does not', async () => {
+    const seen: (number | undefined)[] = []
+    await repairAhrFiles(
+      executor(),
+      pool(),
+      [{ path: '/a.bin', blocks: [1], inode: 257 }, { path: '/b.bin', blocks: [1] }],
+      () => {},
+      { repair: async (_e, req) => {
+        seen.push(req.inode)
+        return outcome(req.file, req.block, 'repaired', 'ok')
+      } },
+    )
+    assert.deepEqual(seen, [257, undefined])
+  })
+
+  it('the request schema takes it, and it is optional', () => {
+    assert.equal(AhrRepairRequest.parse({ files: [{ path: '/mnt/a.bin', blocks: [1], inode: 257 }] }).files[0].inode, 257)
+    assert.equal(AhrRepairRequest.parse({ files: [{ path: '/mnt/a.bin', blocks: [1] }] }).files[0].inode, undefined)
   })
 })

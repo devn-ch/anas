@@ -180,6 +180,7 @@ describe('selfheal csum — reading it off the LV', () => {
       layout: 'left-symmetric',
       members: ['/dev/loop0'],
       dataOffsets: [1048576],
+      badBlocks: [null],
     })),
     roots: { chunk: 22052864, csum: 30834688, extent: 32505856, bySubvolume: new Map([[256, 30851072]]) },
     chunks: parseChunkItems(fixture('dump-tree-chunk.txt')),

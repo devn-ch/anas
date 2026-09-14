@@ -1,3 +1,4 @@
+import type { SelfhealNotExaminedReason } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { TreeRoots } from './selfheal-btree.js'
 import type { CsumItem } from './selfheal-csum.js'
@@ -120,8 +121,97 @@ const EXTENT_INLINE_RE = /inline extent data size \d+ ram_bytes (\d+) compressio
 /** `Subvolume ID: <n>` from `btrfs subvolume show`. */
 const SUBVOLUME_ID_RE = /Subvolume ID:\s*(\d+)/
 
-/** Raised when the chain cannot be followed. The message IS the operator's reason. */
-export class SelfhealMapError extends Error {}
+/**
+ * Raised when the chain cannot be followed. The message IS the operator's
+ * reason; `reasonCode` is what a parser keys on.
+ *
+ * The code exists because every one of these used to become the SAME verdict —
+ * `mapping-abort`, whose sentence asserts that the bytes at the mapped location
+ * still pass their stored checksum (seventh pass, F3). That is true of exactly
+ * one case, and it is not raised here at all: the re-verify establishes it by
+ * READING the block. Everything thrown from this module is a block nobody
+ * looked at, so it carries the reason it could not be looked at and lands in
+ * the `not-examined` bucket. `unresolvable` is the honest default.
+ */
+export class SelfhealMapError extends Error {
+  constructor(
+    message: string,
+    readonly reasonCode: SelfhealNotExaminedReason = 'unresolvable',
+  ) {
+    super(message)
+    this.name = 'SelfhealMapError'
+  }
+}
+
+/** One recorded range of a member's md bad-block list, in 512-byte sectors. */
+export interface BadBlockRange {
+  /** First sector of the range, as the member's own `bad_blocks` file prints it. */
+  startSector: number
+  lengthSectors: number
+}
+
+/**
+ * Parse one member's `bad_blocks` file (seventh pass, F8).
+ *
+ * The kernel prints ONE RANGE PER LINE as `<start> <length>` in 512-byte
+ * sectors, with an optional trailing `-` on a range that is not yet
+ * acknowledged. An empty file is the common case and means the member has no
+ * recorded unreadable ranges; an UNREADABLE file (the attribute is absent on a
+ * kernel without bad-block support, or the read failed) is `null` here and is
+ * NOT the same as empty — the caller is told it does not know, and a band ANAS
+ * cannot ask about is not a band it claims is clean.
+ */
+export function parseBadBlocks(text: string | null): BadBlockRange[] | null {
+  if (text === null)
+    return null
+  const out: BadBlockRange[] = []
+  for (const line of text.split('\n')) {
+    const parts = line.trim().split(WHITESPACE_RE)
+    if (parts.length < 2 || !INTEGER_RE.test(parts[0]) || !INTEGER_RE.test(parts[1]))
+      continue
+    out.push({ startSector: Number(parts[0]), lengthSectors: Number(parts[1]) })
+  }
+  return out
+}
+
+/**
+ * Does the member in `role` carry a recorded bad-block range over the byte span
+ * `[offset, offset + length)` of its own device?
+ *
+ * The member's `bad_blocks` are recorded in sectors RELATIVE TO ITS DATA
+ * OFFSET — md's own `rdev->badblocks` are in the data area's coordinates, which
+ * is why the member's `rd<n>/offset` comes off before the comparison.
+ *
+ * An unreadable list answers FALSE: refusing every repair on a kernel that does
+ * not publish the file would be worse than the gap it closes, and the two
+ * places that act on this (the reconstruction plan and the parity-rewrite
+ * refusal) each say what they did and did not know.
+ */
+export function memberHasBadBlock(
+  geo: MdGeometry,
+  role: number,
+  memberOffset: number,
+  lengthBytes: number = BLOCK_BYTES,
+): boolean {
+  const ranges = geo.badBlocks[role]
+  if (!ranges || ranges.length === 0)
+    return false
+  const dataOffset = geo.dataOffsets[role] ?? 0
+  const first = Math.floor((memberOffset - dataOffset) / 512)
+  const last = Math.floor((memberOffset - dataOffset + lengthBytes - 1) / 512)
+  return ranges.some(r => first <= r.startSector + r.lengthSectors - 1 && last >= r.startSector)
+}
+
+/** Every role whose bad-block list is non-empty, with the ranges it holds. */
+export function bandBadBlocks(geo: MdGeometry): { role: number, device: string, ranges: BadBlockRange[] }[] {
+  const out: { role: number, device: string, ranges: BadBlockRange[] }[] = []
+  for (let role = 0; role < geo.raidDisks; role++) {
+    const ranges = geo.badBlocks[role]
+    if (ranges && ranges.length > 0)
+      out.push({ role, device: geo.members[role] ?? `role ${role}`, ranges })
+  }
+  return out
+}
 
 /** sysfs `layout` → md's name for it. RAID5/6 only; RAID1 reports 0 and means nothing by it. */
 export const MD_LAYOUT_NAMES: Record<number, string> = {
@@ -156,6 +246,17 @@ export interface MdGeometry {
   members: (string | null)[]
   /** Role index → that member's own data offset in bytes (`rd<n>/offset` × 512). */
   dataOffsets: number[]
+  /**
+   * Role index → the member's recorded md bad-block ranges (seventh pass, F8),
+   * or null where the list could not be read.
+   *
+   * A range here is a span md returned a URE on during a rebuild and could not
+   * reconstruct: md serves EIO for it and reconstructs nothing from it. The
+   * repair engine treats such a member as ABSENT over the row it covers, and
+   * Rewrite parity refuses the band outright — a whole-band `mdadm
+   * --action=repair` would recompute parity from rows md cannot read.
+   */
+  badBlocks: (BadBlockRange[] | null)[]
 }
 
 /** One `linear` segment of a dm table. */
@@ -390,7 +491,7 @@ export function bandForLvByte(bands: SelfhealBand[], lvByte: number): SelfhealBa
   const segment = segmentForLvByte(bands.map(b => b.segment), lvByte)
   const band = bands.find(b => b.segment === segment)
   if (!band)
-    throw new SelfhealMapError(`no md array is resolved for the dm segment covering LV byte ${lvByte}`)
+    throw new SelfhealMapError(`no md array is resolved for the dm segment covering LV byte ${lvByte}`, 'band-unreadable')
   return band
 }
 
@@ -706,6 +807,7 @@ async function extentsReferencing(
   if (!complete) {
     throw new SelfhealMapError(
       `owner scan truncated at ${MAX_OWNER_LEAVES} leaves — the items referencing extent ${extentLogical} for inode ${inode} do not end within the bound, so the ${found.length} found so far are a prefix, not this file's extents in that stripe`,
+      'owner-scan-truncated',
     )
   }
   return found
@@ -889,12 +991,19 @@ export async function readMdGeometry(executor: CommandExecutor, mdDevice: string
     attributes[key] = await readMdAttrOrNull(sys, key)
 
   const raidDisks = Number(attributes.raid_disks ?? '0')
-  for (let i = 0; i < raidDisks; i++)
+  for (let i = 0; i < raidDisks; i++) {
     attributes[`rd${i}/offset`] = await readMdAttrOrNull(sys, `rd${i}/offset`)
+    // md's bad-block list, per member (seventh pass, F8). `rd<n>` is the
+    // kernel's own symlink to `dev-<name>`, so this reads exactly the file the
+    // packaging hook counts ranges in (`md/dev-*/bad_blocks`) while staying
+    // indexed by ROLE, which is what the placement formula and the
+    // reconstruction plan speak.
+    attributes[`rd${i}/bad_blocks`] = await readMdAttrOrNull(sys, `rd${i}/bad_blocks`)
+  }
 
   const detail = await executor.exec(MDADM, mdadmDetailExportArgs(mdDevice))
   if (detail.exitCode !== 0)
-    throw new SelfhealMapError(`mdadm --detail --export ${mdDevice} failed: ${detail.stderr.trim()}`)
+    throw new SelfhealMapError(`mdadm --detail --export ${mdDevice} failed: ${detail.stderr.trim()}`, 'band-unreadable')
 
   return geometryFromAttributes(mdDevice, kernel, sys, attributes, parseMdDetailExport(detail.stdout, raidDisks))
 }
@@ -943,11 +1052,11 @@ export function geometryFromAttributes(
   const raid6 = level === 'raid6'
   const raid1 = level === 'raid1'
   if (!raid1 && level !== 'raid5' && !raid6)
-    throw new SelfhealMapError(`md level '${level}' is not a self-heal band type (raid1, raid5, raid6)`)
+    throw new SelfhealMapError(`md level '${level}' is not a self-heal band type (raid1, raid5, raid6)`, 'band-unreadable')
 
   const raidDisks = Number(attributes.raid_disks ?? '0')
   if (!Number.isInteger(raidDisks) || raidDisks <= 0)
-    throw new SelfhealMapError(`md reports raid_disks '${attributes.raid_disks}'`)
+    throw new SelfhealMapError(`md reports raid_disks '${attributes.raid_disks}'`, 'band-unreadable')
 
   const chunkBytes = Number(attributes.chunk_size ?? '0')
   // RAID1 reports layout 0 and means nothing by it — do not decode it as a
@@ -956,12 +1065,17 @@ export function geometryFromAttributes(
   const layout = raid1 || raw === null ? null : (MD_LAYOUT_NAMES[Number(raw)] ?? `layout ${raw}`)
 
   const dataOffsets: number[] = []
+  const badBlocks: (BadBlockRange[] | null)[] = []
   for (let i = 0; i < raidDisks; i++) {
     const offset = attributes[`rd${i}/offset`]
     dataOffsets.push(offset === null || offset === undefined ? 0 : Number(offset) * 512)
+    // `undefined` (the caller never read the attribute) and `null` (it read and
+    // found nothing there) are both "this node does not know", and neither is
+    // "the member is clean" — see {@link parseBadBlocks}.
+    badBlocks.push(parseBadBlocks(attributes[`rd${i}/bad_blocks`] ?? null))
   }
 
-  return { device, kernel, sys, level, raid6, raid1, raidDisks, chunkBytes, layout, members, dataOffsets }
+  return { device, kernel, sys, level, raid6, raid1, raidDisks, chunkBytes, layout, members, dataOffsets, badBlocks }
 }
 
 /** The btrfs device behind a mountpoint (the LV). */
@@ -1045,6 +1159,7 @@ async function readBandGeometry(
   if ((await readMdAttrOrNull(mdSysPath(kernel), 'level')) === null) {
     throw new SelfhealMapError(
       `the dm segment at sector ${segment.startSector} maps onto ${device}, which is not an md array (no /sys/block/${kernel}/md) — this engine maps AHR bands, and refuses rather than guessing where the bytes are`,
+      'band-unreadable',
     )
   }
   return readMdGeometry(executor, device)
@@ -1099,7 +1214,7 @@ export function locateLogicalIn(
   // The band's geometry is resolved lazily (F6): a byte on an unreadable band
   // is refused HERE, naming that band — every other band still maps.
   if (band.geometry === null)
-    throw new SelfhealMapError(`LV byte ${lvByte} is on ${band.device}, whose geometry could not be read: ${band.error ?? 'no reason recorded'}`)
+    throw new SelfhealMapError(`LV byte ${lvByte} is on ${band.device}, whose geometry could not be read: ${band.error ?? 'no reason recorded'}`, 'band-unreadable')
   const seg = band.segment
   const mdByte = lvByte - seg.startSector * 512 + seg.offsetSector * 512
   const placed = placeMdByte(mdByte, band.geometry)
@@ -1232,9 +1347,9 @@ export async function resolveBlock(
 
   const extent = extentForFileOffset(extents, fileOffset)
   if (extent.type === 'inline' || extent.diskByte === undefined || extent.diskLength === undefined)
-    throw new SelfhealMapError(`block ${block} of ${file} is an inline extent — its bytes live in the metadata tree, not in a data chunk`)
+    throw new SelfhealMapError(`block ${block} of ${file} is an inline extent — its bytes live in the metadata tree, not in a data chunk`, 'inline-extent')
   if (extent.diskByte === 0)
-    throw new SelfhealMapError(`block ${block} of ${file} is a hole — there is nothing on disk to repair`)
+    throw new SelfhealMapError(`block ${block} of ${file} is a hole — there is nothing on disk to repair`, 'hole')
 
   const { compressed, blobLogical, blobSectors, logicalByte } = repairUnitFor(extent, block)
 

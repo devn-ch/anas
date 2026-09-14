@@ -3,9 +3,15 @@ import type { MockFixture } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { describe, it } from 'node:test'
+import { readFileSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
+import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
@@ -27,6 +33,8 @@ import { jobRoutes } from '../jobs.js'
  * the job around it by `services/__tests__/ahr-repair.test.ts`; what is
  * asserted here is the door.
  */
+
+const ISCSI_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/iscsi')
 
 const MOUNTPOINT = '/mnt/anas-ahr/ahr0'
 const FILE = `${MOUNTPOINT}/movies/a very long name.mkv`
@@ -394,13 +402,18 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
     // block that cannot be proven is never reported as repaired, and a failing
     // engine never fails the JOB.
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    const result = job.result as { pool: string, repaired: number, unrepairable: number, aboveMd: number, mappingAbort: number, blocks: number, files: { path: string, blocks: { block: number }[] }[] }
+    const result = job.result as { pool: string, repaired: number, unrepairable: number, aboveMd: number, mappingAbort: number, notExamined: number, blocks: number, files: { path: string, blocks: { block: number }[] }[] }
     assert.equal(result.pool, 'ahr0')
     assert.equal(result.blocks, 2)
     assert.equal(result.repaired, 0)
-    // review R9 — the buckets sum WITH the mapping-abort count (blocks the
-    // mock read layer found not corrupt at the mapped location).
-    assert.equal(result.repaired + result.unrepairable + result.aboveMd + (result.mappingAbort ?? 0), result.blocks)
+    // review R9 + seventh pass F3 — the buckets sum WITH the mapping-abort
+    // count (a block the read layer found not corrupt at the mapped location)
+    // and the not-examined one (a block whose mapping could not be followed at
+    // all, which is what a mock read layer produces).
+    assert.equal(
+      result.repaired + result.unrepairable + result.aboveMd + (result.mappingAbort ?? 0) + (result.notExamined ?? 0),
+      result.blocks,
+    )
     assert.equal(result.files[0].path, FILE)
     assert.deepEqual(result.files[0].blocks.map(b => b.block), [12, 300])
     await server.close()
@@ -438,6 +451,148 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
     // ahr0's bands are striped (raid5), so the stripe-cache clause rides.
     assert.match(warnings, /the band's stripe cache at its floor for the duration — a busy node will feel it/)
     assert.match(warnings, /bring latency-sensitive workloads down first/)
+    await server.close()
+  })
+})
+
+/**
+ * Seventh pass, F10 — LUN awareness on the repair route.
+ *
+ * `ahr-repair.ts` already called `heldByLunOnce`, but only AFTER the fact, to
+ * word the advice on a block that could not be repaired. A file backing a LUN
+ * with a LIVE initiator session was repaired under that session without the
+ * operator ever being told. A repair writes 4 KiB it has proven correct and
+ * btrfs's copy-on-write leaves the old extent alone — so this is not the
+ * "corrupt what the initiator sees" hazard — but the initiator is holding its
+ * own cache of the file and has no idea the bytes moved.
+ */
+describe('POST /v1/ahr/:name/repair — a file backing a live LUN (F10)', () => {
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-repair-lun-'))
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /** The captured LIO tree, with LUN 1's image path pointed at the repair FILE. */
+  async function configfsServing(path: string, loggedIn: boolean): Promise<string> {
+    const root = join(dir, 'target')
+    let manifest = readFileSync(join(ISCSI_FIXTURES, 'configfs-live.manifest'), 'utf-8')
+    manifest = manifest.replace('udev_path = /gtiscsi/images/lun2.raw', `udev_path = ${path}`)
+    if (loggedIn) {
+      const info = readFileSync(join(ISCSI_FIXTURES, 'configfs-acl-info-loggedin.txt'), 'utf-8')
+        .trimEnd()
+        .replaceAll('\\', '\\\\')
+        .replaceAll('\n', '\\n')
+      manifest = manifest.replace(
+        /F (iscsi\/[^\n]*acls\/iqn\.1993-08[^\n]*\/info) = [^\n]*/,
+        `F $1 = ${info}`,
+      )
+    }
+    await materializeConfigfsManifest(manifest, root)
+    return root
+  }
+
+  async function serverServing(root: string): Promise<TestServer> {
+    const executor = withFiles(ahrExecutor(), [FILE])
+    const app = Fastify({ logger: false })
+    const jobQueue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: '/nonexistent/fstab',
+      kernelRelease: '7.0.14-8-pve',
+      iscsiPaths: {
+        configfsRoot: root,
+        saveconfigPath: join(dir, 'absent-saveconfig.json'),
+        pveStorageCfg: join(dir, 'absent-storage.cfg'),
+        blockRoot: join(dir, 'absent-block'),
+      },
+    })
+    const server = app as unknown as TestServer
+    server.jobQueue = jobQueue
+    return server
+  }
+
+  it('409 lun-session-active BEFORE a confirm code exists', async () => {
+    const server = await serverServing(await configfsServing(FILE, true))
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
+    assert.equal(res.statusCode, 409)
+    const error = res.json().error
+    assert.equal(error.reason, 'lun-session-active')
+    assert.match(error.message, /backs iSCSI LUN/)
+    assert.match(error.message, /logged in right now/)
+    assert.match(error.message, /Log the initiator out/)
+    assert.match(error.message, /copy-on-write leaves the old extent untouched/)
+    assert.ok(!res.headers['x-anas-confirm-code'], 'no confirm code is minted for an unsafe-now refusal')
+    await server.close()
+  })
+
+  it('a LUN with NO session is not refused — the repair proceeds to its confirm gate', async () => {
+    const server = await serverServing(await configfsServing(FILE, false))
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.headers['x-anas-confirm-code'])
+    await server.close()
+  })
+
+  it('a file no LUN backs is not refused either', async () => {
+    const server = await serverServing(await configfsServing('/gtiscsi/images/lun2.raw', true))
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+    await server.close()
+  })
+})
+
+/**
+ * Seventh pass, F11 — the finding's inode reaches the engine through the route.
+ *
+ * It is part of the SELECTION, so it is part of what the confirm code binds: a
+ * code minted for "these blocks of this path" must not authorize "these blocks
+ * of whatever is at this path now".
+ */
+describe('POST /v1/ahr/:name/repair — the finding\'s inode (F11)', () => {
+  function withInode(inode?: number): string {
+    return JSON.stringify({ files: [{ path: FILE, blocks: [300], ...(inode === undefined ? {} : { inode }) }] })
+  }
+
+  it('rides the request and the confirm signature', async () => {
+    const server = await serverWith(withFiles(ahrExecutor(), [FILE]))
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: withInode(4711) })
+    assert.equal(first.statusCode, 409)
+    const code = first.headers['x-anas-confirm-code'] as string
+    assert.ok(code)
+    // The SAME selection is authorized…
+    const same = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload: withInode(4711) })
+    assert.equal(same.statusCode, 202)
+    await server.close()
+  })
+
+  it('…and a code minted for one inode does not authorize another', async () => {
+    const server = await serverWith(withFiles(ahrExecutor(), [FILE]))
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: withInode(4711) })
+    const code = first.headers['x-anas-confirm-code'] as string
+    const other = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload: withInode(4712) })
+    assert.equal(other.statusCode, 409)
+    assert.equal(other.json().error.code, 'CONFIRMATION_REQUIRED')
+    await server.close()
+  })
+
+  it('stays optional — a request without it behaves exactly as before', async () => {
+    const server = await serverWith(withFiles(ahrExecutor(), [FILE]))
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: withInode() })
+    assert.equal(first.statusCode, 409)
+    const code = first.headers['x-anas-confirm-code'] as string
+    const second = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload: withInode() })
+    assert.equal(second.statusCode, 202)
     await server.close()
   })
 })

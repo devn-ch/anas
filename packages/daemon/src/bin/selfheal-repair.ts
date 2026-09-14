@@ -20,7 +20,7 @@ import { repairBlock, SelfhealRunError } from '../services/selfheal-repair.js'
  * bar as the reference implementation it replaces:
  *
  *   exit 0 repaired · 2 unrepairable · 3 diagnosed-above-md ·
- *   4 mapping-abort · 70 injected failure · 1 internal error
+ *   4 mapping-abort · 5 not-examined · 70 injected failure · 1 internal error
  *
  * The JSON outcome goes to stdout. `REPAIR_REPORT=<path>` additionally writes
  * the suite's snake_case sidecar; `REPAIR_FAIL_AT=<step>` raises an injected
@@ -37,6 +37,9 @@ const EXIT = {
   'unrepairable': 2,
   'above-md': 3,
   'mapping-abort': 4,
+  // Seventh pass, F3: a block nobody looked at is not a block that was found
+  // healthy, so it does not share `mapping-abort`'s exit code either.
+  'not-examined': 5,
   'injected': 70,
 } as const
 

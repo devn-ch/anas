@@ -228,7 +228,7 @@
 
     // ---- Row shape + renderers ---------------------------------------------
 
-    function scrubRow(state, findingsByPool) {
+    function scrubRow(state, findingsByPool, parityByPool) {
         state = state || {};
         var target = state.target || {};
         var kind = target.kind || 'zfs';
@@ -260,7 +260,7 @@
             // attributed no file — that is exactly the parity-only-rot case —
             // and skipped bands surface even when everything else was clean:
             // neither may read as a clean bill.
-            parity: (kind === 'ahr' && findingsByPool) ? parityFor(findingsByPool, target.pool) : null,
+            parity: (kind === 'ahr' && parityByPool) ? parityFor(parityByPool, target.pool) : null,
             skipped: (kind === 'ahr' && findingsByPool) ? skippedFor(findingsByPool, target.pool) : null,
             // A stable per-row key (kind+pool) so selection survives a poll.
             rowKey: kind + ':' + (target.pool || '')
@@ -324,10 +324,45 @@
     // The newest scrub's phase-1 parity verdicts (D1) — present even when the
     // scrub attributed no corrupt file, because THAT is the parity-only-rot
     // case: data checksums all passed, the parity member disagrees.
+    //
+    // Seventh pass, F2 — a completed REPAIR can measure the same thing. A block
+    // that was written, proven cold against its stored checksum, and left md
+    // still counting the stripe is a parity residual on that band, reported in
+    // the SAME row shape. The newest of the two wins, for the same reason the
+    // newest scrub does: the older reading describes a pool that has changed.
+    function latestParityByPool(res) {
+        var byPool = {};
+        var list = (res && res.data) || [];
+        for (var i = 0; i < list.length; i++) {
+            var job = list[i] || {};
+            if (job.status !== 'completed' || !job.result) {
+                continue;
+            }
+            var rows = null;
+            var pool = null;
+            if (job.operation === 'ahr.scrub') {
+                pool = job.result.scrubbed;
+                rows = job.result.parityMismatches;
+            } else if (job.operation === 'ahr.repair') {
+                pool = job.result.pool;
+                rows = job.result.parityResiduals;
+            } else {
+                continue;
+            }
+            if (!pool) {
+                continue;
+            }
+            var prior = byPool[pool];
+            if (!prior || jobTime(job) >= prior.at) {
+                byPool[pool] = { at: jobTime(job), rows: (rows && rows.length) ? rows : null };
+            }
+        }
+        return byPool;
+    }
+
     function parityFor(byPool, pool) {
         var entry = byPool[pool];
-        var list = entry && entry.result && entry.result.parityMismatches;
-        return (list && list.length) ? list : null;
+        return (entry && entry.rows && entry.rows.length) ? entry.rows : null;
     }
 
     // The newest scrub's skipped bands (D8) — a band md never checked must not
@@ -480,8 +515,10 @@
                             + 'member, not in the data, and at the next disk failure md would reconstruct from the '
                             + 'wrong parity. Click to rewrite that band\'s parity from the data as it stands.')
                         : t('md counted mismatches on these bands, but the checksum scrub found no corrupt files. '
-                            + 'No band here is a parity band, so there is no parity to rewrite — a RAID1 mirror\'s '
-                            + 'legs disagree and are arbitrated per block by Repair from parity. Click for the detail.'));
+                            + 'No band here is a parity band, so there is no parity to rewrite: a RAID1 mirror\'s '
+                            + 'legs disagree with each other. Mirror mismatch — not yet repairable from ANAS '
+                            + '(selfheal.11); do not run md repair on a mirror, it copies the first in-sync leg '
+                            + 'over the others without looking at which one is right. Click for the detail.'));
                 spans.push('<span class="anas-scrub-parity-link" style="color:var(--anas-warn,#b06a12);'
                     + 'cursor:pointer;text-decoration:underline;" title="' + enc(parityTip) + '">'
                     + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
@@ -602,15 +639,17 @@
                 try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
             }
             var findingsByPool = {};
+            var parityByPool = {};
             try {
                 findingsByPool = latestScrubByPool(both[1]);
+                parityByPool = latestParityByPool(both[1]);
             } catch (eJ) {
                 ANAS.warn('scrub findings read failed: ' + ANAS.errText(eJ));
             }
             var list = (res && res.data) || [];
             var rows = [];
             for (var i = 0; i < list.length; i++) {
-                rows.push(scrubRow(list[i], findingsByPool));
+                rows.push(scrubRow(list[i], findingsByPool, parityByPool));
             }
             try {
                 scrubGrid.getStore().loadData(rows);
@@ -1056,11 +1095,21 @@
             if (!repairableRow(sel[i])) {
                 continue;
             }
-            if (sel[i].get('compressed') && Number(sel[i].get('extentFirst')) >= 0) {
-                out.push({ path: sel[i].get('path'), blocks: [Number(sel[i].get('extentFirst'))] });
-                continue;
+            // The finding's INODE rides along (seventh pass, F11): a path is not
+            // an identity, and a file deleted and re-created since the scrub has
+            // the same path with different bytes. The daemon stats the path
+            // before it pins anything and refuses a mismatch by name.
+            var ino = Number(sel[i].get('inode'));
+            var file = { path: sel[i].get('path') };
+            if (isFinite(ino) && ino >= 0) {
+                file.inode = ino;
             }
-            out.push({ path: sel[i].get('path'), blocks: (sel[i].get('blockArray') || []).slice() });
+            if (sel[i].get('compressed') && Number(sel[i].get('extentFirst')) >= 0) {
+                file.blocks = [Number(sel[i].get('extentFirst'))];
+            } else {
+                file.blocks = (sel[i].get('blockArray') || []).slice();
+            }
+            out.push(file);
         }
         return out;
     }
@@ -1110,6 +1159,7 @@
             + ' · ' + Number(res.unrepairable || 0) + ' ' + t('unrepairable')
             + ' · ' + Number(res.aboveMd || 0) + ' ' + t('above md')
             + ' · ' + Number(res.mappingAbort || 0) + ' ' + t('not corrupt at the mapped location')
+            + ' · ' + Number(res.notExamined || 0) + ' ' + t('not examined')
             + ' (' + t('of') + ' ' + Number(res.blocks || 0) + ' ' + t('4 KiB block(s)') + ')';
         var lines = [enc(counts)];
         // Each bucket reads its own count (review R9): "restore from backup"
@@ -1166,9 +1216,46 @@
                 + '— nothing was written, nothing to restore: the bytes there still pass their stored '
                 + 'checksum, so the finding no longer describes them.')));
         }
+        // Seventh pass, F3 — the blocks NOBODY LOOKED AT. "Nothing was written"
+        // is all they share with a mapping-abort; "the bytes are fine" is true
+        // of none of them, so they never borrow that sentence.
+        if (Number(res.notExamined || 0) > 0) {
+            var whys = {};
+            for (var n = 0; n < files.length; n++) {
+                var nb = files[n].blocks || [];
+                for (var k = 0; k < nb.length; k++) {
+                    if (nb[k].outcome === 'not-examined') {
+                        whys[nb[k].reasonCode || 'unresolvable'] = true;
+                    }
+                }
+            }
+            var why = [];
+            for (var code in whys) {
+                if (Object.prototype.hasOwnProperty.call(whys, code)) {
+                    why.push(code);
+                }
+            }
+            lines.push(enc(Number(res.notExamined || 0) + ' ' + t('block(s) could not be EXAMINED')
+                + (why.length ? ' (' + why.join(', ') + ')' : '') + ' — '
+                + t('nothing was written, and nothing is known about those bytes. This is neither a clean '
+                    + 'bill of health nor a reason to restore: re-scrub once the reason no longer applies.')));
+        }
         if (Number(res.aboveMd || 0) > 0) {
             lines.push(enc(t('Above md: parity already agreed with the bad data — this implicates '
                 + 'something other than the disks (memory, controller, software). Nothing was written.')));
+        }
+        // Seventh pass, F2 — blocks that were repaired and PROVEN while md still
+        // counts mismatching stripes on their band. The file is right; the
+        // band's parity is not, and Rewrite parity is the verb for that.
+        var residuals = res.parityResiduals || [];
+        if (residuals.length) {
+            var bands = [];
+            for (var r = 0; r < residuals.length; r++) {
+                bands.push(residuals[r].band + ' (' + t('mismatch_cnt') + ' ' + residuals[r].mismatchCnt + ')');
+            }
+            lines.push(enc(t('Repaired, and md still counts mismatching stripes on') + ' ' + bands.join(', ')
+                + ' — ' + t('the data is right and the parity (or Q) member is what disagrees. '
+                    + 'Rewrite parity on that band; no fresh scrub is needed, this run measured it.')));
         }
         panel.update(lines.join('<br>'));
     }
@@ -1309,8 +1396,8 @@
     // refuses it (409 `not-a-parity-band`); the button says so first, so the
     // operator is not sent to a refusal to find out.
     var MIRROR_BAND_REASON = 'a RAID1 mirror band has no parity to rewrite — md\'s repair on a mirror '
-        + 'copies the first in-sync leg over the others without looking at which one is right. A mirror '
-        + 'mismatch is arbitrated by Repair from parity per block, never by md repair';
+        + 'copies the first in-sync leg over the others without looking at which one is right. '
+        + 'Mirror mismatch — not yet repairable from ANAS (selfheal.11); do not run md repair on a mirror';
 
     function parityRewriteBlocked(win, hasFindings) {
         if (hasFindings) {
@@ -1469,15 +1556,15 @@
                         : (allMirror
                             ? t('md counted mismatches on these bands and the checksum pass found nothing. These are '
                                 + 'RAID1 mirror bands: md counted legs that disagree with each other, not parity that '
-                                + 'disagrees with the data, and there is nothing here to rewrite. Repair from parity '
-                                + 'arbitrates a mirror per block, against the checksum btrfs stored for it.')
+                                + 'disagrees with the data, and there is nothing here to rewrite. Mirror mismatch — '
+                                + 'not yet repairable from ANAS (selfheal.11); do not run md repair on a mirror.')
                             : t('md counted parity mismatches on these bands and the checksum pass found nothing: on a '
                                 + 'parity band the data is right and the parity is what is wrong. Rewriting recomputes '
                                 + 'that band\'s parity from the data as it stands — a fresh checksum scrub of the whole '
                                 + 'pool runs first (usually the longest part of the run), and any finding aborts it.')
                             + (anyMirror
-                                ? ' ' + t('A RAID1 band in this list has no parity to rewrite; its mismatch is arbitrated '
-                                    + 'by Repair from parity per block.')
+                                ? ' ' + t('A RAID1 band in this list has no parity to rewrite: mirror mismatch — not yet '
+                                    + 'repairable from ANAS (selfheal.11); do not run md repair on a mirror.')
                                 : '')))
                 },
                 {

@@ -7,6 +7,7 @@ import { MockExecutor } from '../../executor/mock.js'
 import { parseTreeRoots } from '../selfheal-btree.js'
 import { crc32c, csumHex } from '../selfheal-csum.js'
 import {
+  bandBadBlocks,
   chunkForLogical,
   extentForFileOffset,
   extentsForStripe,
@@ -14,7 +15,9 @@ import {
   locateLogicalIn,
   logicalToLvByte,
   MAX_OWNER_LEAVES,
+  memberHasBadBlock,
   memberOffsetOn,
+  parseBadBlocks,
   parseChunkItems,
   parseDmTable,
   parseExtentItems,
@@ -687,7 +690,11 @@ describe('selfheal mapping — the extent tree (selfheal.8)', () => {
     assert.equal(MAX_OWNER_LEAVES, 4, 'the cap this case is built to outrun')
     await assert.rejects(
       extentsForStripe(executor, ctx, 256, 257, EXTENT),
-      (err: unknown) => err instanceof SelfhealMapError && /owner scan truncated at 4 leaves/.test((err as Error).message),
+      // Seventh pass, F3: the reason code rides too — a truncated scan is a
+      // block NOBODY LOOKED AT, and saying which kind is the whole point.
+      (err: unknown) => err instanceof SelfhealMapError
+        && /owner scan truncated at 4 leaves/.test(err.message)
+        && err.reasonCode === 'owner-scan-truncated',
       'the scan refuses instead of handing back the 8 items its 4 leaves held',
     )
   })
@@ -789,5 +796,97 @@ describe('selfheal mapping — the extent tree (selfheal.8)', () => {
       extentsForStripe(executor, ctx, 999, 257, 13631488),
       SelfhealMapError,
     )
+  })
+})
+
+/**
+ * Seventh pass, F3 — a map failure is a block NOBODY LOOKED AT, and WHICH
+ * failure it was is the only thing that says what a re-scrub would need.
+ *
+ * Every one of these used to become the `mapping-abort` bucket, whose sentence
+ * asserts the bytes at the mapped location still pass their stored checksum.
+ * (`inline-extent` and `hole` are proved at the engine level, in
+ * selfheal-repair.test.ts, because that is where the whole verdict is decided.)
+ */
+describe('selfheal mapping — every map failure carries its reason (F3)', () => {
+  it('a band with no readable geometry is `band-unreadable`, naming the band', () => {
+    const blind = SEGMENTS.map(segment => ({ segment, device: '/dev/md127', geometry: null, error: 'sysfs went away' }))
+    assert.throws(
+      () => locateLogicalIn(CHUNKS[0].logical, CHUNKS[0], blind),
+      (error: unknown) => {
+        assert.ok(error instanceof SelfhealMapError)
+        assert.equal(error.reasonCode, 'band-unreadable')
+        assert.match(error.message, /sysfs went away/)
+        return true
+      },
+    )
+  })
+
+  it('anything else is `unresolvable` — the honest default, never a guess', () => {
+    assert.throws(
+      () => chunkForLogical(CHUNKS, 1 << 40),
+      (error: unknown) => {
+        assert.ok(error instanceof SelfhealMapError)
+        assert.equal(error.reasonCode, 'unresolvable')
+        return true
+      },
+    )
+    assert.throws(
+      () => segmentForLvByte(SEGMENTS, Number.MAX_SAFE_INTEGER),
+      (error: unknown) => {
+        assert.ok(error instanceof SelfhealMapError)
+        assert.equal(error.reasonCode, 'unresolvable')
+        return true
+      },
+    )
+  })
+})
+
+/**
+ * Seventh pass, F8 — md's bad-block list, read where the topology is built.
+ *
+ * A recorded range is a span md returned a URE on during a rebuild and never
+ * reconstructed. Until this pass nothing in the daemon read the file at all:
+ * the packaging hook counted the ranges once, at `RebuildFinished`, and every
+ * repair and rewrite gate was blind to it.
+ */
+describe('selfheal mapping — md bad blocks (F8)', () => {
+  it('parses one range per line, ignoring anything that is not two numbers', () => {
+    assert.deepEqual(parseBadBlocks('6368 8\n1048576 16\n\n'), [
+      { startSector: 6368, lengthSectors: 8 },
+      { startSector: 1048576, lengthSectors: 16 },
+    ])
+  })
+
+  it('an EMPTY file is no ranges; an UNREADABLE one is null, which is not the same', () => {
+    assert.deepEqual(parseBadBlocks(''), [])
+    assert.equal(parseBadBlocks(null), null, 'a member ANAS cannot ask about is not a member it calls clean')
+  })
+
+  it('a range is matched in the member\'s OWN data coordinates', () => {
+    const geo = { ...RAID5, badBlocks: RAID5.members.map((_, role) => (role === 1 ? [{ startSector: 6368, lengthSectors: 8 }] : [])) }
+    // 1048576 is rd1's data offset, so sector 6368 of the data area is here:
+    const covered = 1048576 + 6368 * 512
+    assert.equal(memberHasBadBlock(geo, 1, covered), true)
+    assert.equal(memberHasBadBlock(geo, 1, covered + 4096), false, 'the next block is outside the range')
+    assert.equal(memberHasBadBlock(geo, 0, covered), false, 'the range belongs to role 1 alone')
+  })
+
+  it('an unreadable list answers FALSE rather than refusing every repair on the node', () => {
+    const geo = { ...RAID5, badBlocks: RAID5.members.map(() => null) }
+    assert.equal(memberHasBadBlock(geo, 1, 1048576), false)
+    assert.deepEqual(bandBadBlocks(geo), [])
+  })
+
+  it('bandBadBlocks names the members that carry ranges, with their devices', () => {
+    const geo = { ...RAID5, badBlocks: RAID5.members.map((_, role) => (role === 3 ? [{ startSector: 0, lengthSectors: 8 }] : [])) }
+    assert.deepEqual(bandBadBlocks(geo), [{ role: 3, device: '/dev/loop3', ranges: [{ startSector: 0, lengthSectors: 8 }] }])
+  })
+
+  it('geometryFromAttributes reads them off rd<n>/bad_blocks — the kernel\'s symlink to dev-<name>', () => {
+    const attributes = { ...sysfsAttributes('md-sysfs-raid5.txt'), 'rd2/bad_blocks': '40 8\n' }
+    const geo = geometryFromAttributes('/dev/md127', 'md127', '/sys/block/md127/md', attributes, parseMdDetailExport(fixture('mdadm-detail-export-raid5.txt'), 6))
+    assert.deepEqual(geo.badBlocks[2], [{ startSector: 40, lengthSectors: 8 }])
+    assert.equal(geo.badBlocks[0], null, 'an attribute nobody read is unknown, not empty')
   })
 })

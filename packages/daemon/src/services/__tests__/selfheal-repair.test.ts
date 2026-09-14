@@ -7,7 +7,7 @@ import type {
 } from '../../executor/types.js'
 import type { SelfhealRepairOptions } from '../selfheal-repair.js'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -161,6 +161,9 @@ class FakeNode implements CommandExecutor {
     this.file = join(this.mountpoint, 'f1.bin')
     this.sys = join(this.root, 'sys/block/md127/md')
     mkdirSync(this.mountpoint, { recursive: true })
+    // A real file at the mapped path: the engine stats it to confirm the inode
+    // the scrub examined is the one that is there (F11).
+    writeFileSync(this.file, '')
     mkdirSync(this.sys, { recursive: true })
     mkdirSync(join(this.root, 'proc/sys/vm'), { recursive: true })
     writeFileSync(join(this.root, 'proc/sys/vm/drop_caches'), '0')
@@ -359,12 +362,13 @@ class FakeMirror implements CommandExecutor {
   static readonly OFFSETS = [1048576, 4194304]
   static readonly LEGS = ['/dev/loop0', '/dev/loop1']
 
-  constructor(options?: { corruptLeg?: number, mdServes?: 'good' | 'bad' | 'neither' }) {
+  constructor(options?: { corruptLeg?: number, mdServes?: 'good' | 'bad' | 'neither', bothLegsBad?: boolean }) {
     this.root = mkdtempSync(join(tmpdir(), 'anas-selfheal-r1-'))
     this.mountpoint = join(this.root, 'mnt')
     this.file = join(this.mountpoint, 'f1.bin')
     this.sys = join(this.root, 'sys/block/md126/md')
     mkdirSync(this.mountpoint, { recursive: true })
+    writeFileSync(this.file, '')
     mkdirSync(this.sys, { recursive: true })
     mkdirSync(join(this.root, 'proc/sys/vm'), { recursive: true })
     writeFileSync(join(this.root, 'proc/sys/vm/drop_caches'), '0')
@@ -386,7 +390,9 @@ class FakeMirror implements CommandExecutor {
     const junk = Buffer.alloc(BS, 0xAB)
     const bad = options?.corruptLeg ?? 0
     for (const [role, device] of FakeMirror.LEGS.entries()) {
-      const content = role === bad ? junk : HEALTHY
+      // `bothLegsBad` is rot that arrived THROUGH md: the same wrong bytes on
+      // every leg (F4).
+      const content = options?.bothLegsBad || role === bad ? junk : HEALTHY
       this.legs.set(device, new Map([[FakeMirror.OFFSETS[role] + MD_BYTE, content]]))
     }
     this.mdBytes = options?.mdServes === 'bad'
@@ -402,6 +408,10 @@ class FakeMirror implements CommandExecutor {
 
   knob(key: string): string {
     return readFileSync(join(this.sys, key), 'utf-8').trim()
+  }
+
+  setKnob(key: string, value: string): void {
+    writeFileSync(join(this.sys, key), `${value}\n`)
   }
 
   async exec(command: string, args: string[]): Promise<ExecResult> {
@@ -1403,8 +1413,14 @@ describe('selfheal repair — a RAID1 band', () => {
 
     it('REFUSES: the md offset is not where these member bytes live', async () => {
       const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
-      assert.equal(outcome.outcome, 'unrepairable')
+      // Seventh pass, F9 — the guard fires when NOTHING about this file has
+      // been established, so it is `not-examined`/`unresolvable` and never the
+      // bucket that advises a restore.
+      assert.equal(outcome.outcome, 'not-examined')
+      assert.equal(outcome.reasonCode, 'unresolvable')
       assert.match(outcome.reason, /matches NO leg of this mirror/)
+      assert.match(outcome.reason, /nothing is known about this file's bytes/)
+      assert.ok(!/restore/i.test(outcome.reason), outcome.reason)
       assert.equal(mirror.wroteThroughMd, null)
     })
   })
@@ -1649,5 +1665,414 @@ describe('selfheal repair — pinning a §12 pool', () => {
     assert.match(coldread?.detail ?? '', /^skipped: top-level mount busy/)
     assert.equal(coldread?.ok, true, 'a skipped confirmation is not a failed step')
     await holding
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  Seventh pass — the decision-tree findings
+// ---------------------------------------------------------------------------
+
+/** RAID6 placement of the SAME file block the RAID5 rig uses (chunk 246). */
+const R6_TARGET_ROLE = 2
+const R6_MEMBER_OFFSET = 5095424
+const R6_P_ROLE = 4
+const R6_Q_ROLE = 5
+/** The data roles of that stripe, in md's order: anchor Q+1 … Q+4. */
+const R6_DATA_ROLES = [0, 1, 2, 3]
+
+/**
+ * The SAME rig as {@link FakeNode}, told it is a RAID6 (F2).
+ *
+ * Six members, `left-symmetric`, chunk 64 KiB — so the block the btrfs chain
+ * resolves lands on role 2 at a different row, with P on role 4 and Q on role 5.
+ * Q is deliberately JUNK: the P-XOR candidate is the one that can win
+ * arbitration, which is exactly the shape that leaves md still counting the
+ * stripe after a provably-correct block has been written.
+ */
+class FakeRaid6Node extends FakeNode {
+  /** What `mismatch_cnt` reads after the engine's write — Q is still wrong. */
+  postWriteMismatch = '8'
+  /** Set to make the cold read through the pin EIO. */
+  coldReadFails = false
+
+  constructor() {
+    super()
+    this.setKnob('level', 'raid6')
+    this.members.clear()
+    const others = R6_DATA_ROLES.filter(r => r !== R6_TARGET_ROLE).map(r => [r, filler(r + 1)] as const)
+    for (const [role, bytes] of others)
+      this.members.set(MEMBERS[role], bytes)
+    this.members.set(MEMBERS[R6_P_ROLE], xor(HEALTHY, ...others.map(([, b]) => b)))
+    // Q rotten: the syndrome solve cannot produce the block, P-XOR can.
+    this.members.set(MEMBERS[R6_Q_ROLE], Buffer.alloc(BS, 0x5A))
+    this.members.set(MEMBERS[R6_TARGET_ROLE], Buffer.alloc(BS, 0xAB))
+    this.mdBlock = this.members.get(MEMBERS[R6_TARGET_ROLE]) as Buffer
+  }
+
+  override async exec(command: string, args: string[]): Promise<ExecResult> {
+    if (command === '/usr/sbin/mdadm') {
+      this.calls.push({ command, args })
+      return { stdout: fixture('mdadm-detail-export-raid5.txt').replace('MD_LEVEL=raid5', 'MD_LEVEL=raid6'), stderr: '', exitCode: 0 }
+    }
+    if (command === '/usr/bin/dd') {
+      const source = args.find(a => a.startsWith('if='))?.slice(3) ?? ''
+      const target = args.find(a => a.startsWith('of='))?.slice(3) ?? ''
+      this.calls.push({ command, args })
+      if (target === '/dev/null' && this.coldReadFails)
+        return { stdout: '', stderr: 'Input/output error', exitCode: 1 }
+      if (target !== '' && target !== '/dev/null') {
+        this.wroteThroughMd = readFileSync(source)
+        this.mdBlock = this.wroteThroughMd
+        this.members.set(MEMBERS[R6_TARGET_ROLE], this.wroteThroughMd)
+        // md rewrote the data row; Q is still rotten, so the stripe still counts.
+        this.setKnob('mismatch_cnt', this.postWriteMismatch)
+      }
+      return { stdout: '', stderr: '', exitCode: 0 }
+    }
+    return super.exec(command, args)
+  }
+
+  override async pipeline(cmd1: string, args1: string[]): Promise<PipelineResult> {
+    this.calls.push({ command: cmd1, args: args1 })
+    const device = args1.find(a => a.startsWith('if='))?.slice(3) ?? ''
+    const skip = Number(args1.find(a => a.startsWith('skip='))?.slice(5) ?? '0')
+    const count = Number(args1.find(a => a.startsWith('count='))?.slice(6) ?? '1')
+    let bytes: Buffer
+    if (device === '/dev/mapper/gtsh-data') {
+      bytes = Buffer.alloc(count * BS)
+      for (let i = 0; i + 4 <= bytes.length; i += 4)
+        bytes.writeUInt32LE(STORED, i)
+      sealNode(bytes.subarray(0, NODE_BYTES), CSUM_LEAF)
+    }
+    else if (device === '/dev/md127') {
+      assert.equal(skip * BS, MD_BYTE, 'the engine read md somewhere the mapping did not point')
+      bytes = this.mdBlock
+    }
+    else {
+      assert.equal(skip * BS, R6_MEMBER_OFFSET, `member read at ${skip * BS}, not the RAID6 row`)
+      bytes = this.members.get(device) ?? Buffer.alloc(BS)
+    }
+    return { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: bytes.toString('base64') }
+  }
+}
+
+/**
+ * F2 — the block was WRITTEN and PROVEN, and the band still counts a mismatch.
+ *
+ * Before this pass the engine failed the block `unrepairable` with "Restore
+ * <file> from backup" over a block it had just reconstructed, arbitrated
+ * against the checksum btrfs stored for it and written through md. That is
+ * advice to overwrite recoverable data from an older backup — and the residual
+ * it was actually looking at (parity, on that band) was recorded nowhere, so
+ * Rewrite parity refused until a fresh multi-hour scrub had run.
+ */
+describe('selfheal repair — RAID6 with the target block AND Q rotten (F2)', () => {
+  let r6: FakeRaid6Node
+  beforeEach(() => {
+    forgetIssuedChecks()
+    r6 = new FakeRaid6Node()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = r6.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(r6.root, 'run')
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    r6.cleanup()
+  })
+
+  it('reports REPAIRED with a parity residual, never a restore', async () => {
+    const outcome = await repairBlock(r6, { mountpoint: r6.mountpoint, file: r6.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.ok(r6.wroteThroughMd?.equals(HEALTHY), 'the P-XOR candidate went through md')
+    assert.equal(outcome.diagnostics?.reconstruction, 'p-xor')
+    assert.equal(outcome.diagnostics?.postcheckMismatch, 8)
+    assert.match(outcome.reason, /block is repaired; the band still has a parity\/Q mismatch/)
+    assert.match(outcome.reason, /Run Rewrite parity on/)
+    assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+    assert.deepEqual(outcome.parityResidual, {
+      array: '/dev/md127',
+      band: 'md127',
+      bandIndex: null,
+      mismatchCnt: 8,
+    })
+  })
+
+  it('names the BAND when the caller handed the pool in — the row Rewrite parity reads', async () => {
+    const pool = {
+      name: 'tank',
+      mountpoint: r6.mountpoint,
+      arrays: [{ band: 3, device: '/dev/md/tank-r3', kernelName: 'md127', level: 'raid6' }],
+    } as unknown as AhrPool
+    const outcome = await repairBlock(r6, { mountpoint: r6.mountpoint, file: r6.file, block: 300, pool }, OPTIONS)
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.deepEqual(outcome.parityResidual, {
+      array: '/dev/md127',
+      band: 'tank-r3',
+      bandIndex: 3,
+      mismatchCnt: 8,
+    })
+    assert.match(outcome.reason, /Run Rewrite parity on tank-r3/)
+  })
+
+  it('still fails UNREPAIRABLE when the written block does not read back clean either', async () => {
+    const outcome = await repairBlock(
+      r6,
+      { mountpoint: r6.mountpoint, file: r6.file, block: 300 },
+      { ...OPTIONS, beforeStep: (name) => {
+        // The cold read through the pin EIOs: the block cannot be proven, so
+        // the non-zero post-check is not "just parity" after all.
+        if (name === 'postcheck')
+          r6.coldReadFails = true
+      } },
+    )
+    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    assert.match(outcome.reason, /still reads back with an error through a fresh snapshot/)
+    assert.match(outcome.reason, /Restore /)
+    assert.equal(outcome.parityResidual, undefined)
+  })
+})
+
+/**
+ * F5 — md takes an operation of its own AFTER the write.
+ *
+ * `boundedWindowCheck` raises `ForeignSyncOpError` from the POST-check too, and
+ * one global catch answered every one of them with "nothing written". A member
+ * failing inside a post-check window — minutes on a 20 TB band — therefore
+ * produced an outcome whose central factual claim was false, in the bucket that
+ * then advises a restore.
+ */
+describe('selfheal repair — a foreign md op AFTER the write (F5)', () => {
+  useNode(() => new FakeNode())
+
+  it('says the block WAS written and the post-check could not run', async () => {
+    const outcome = await repairBlock(
+      node,
+      { mountpoint: node.mountpoint, file: node.file, block: 300 },
+      { ...OPTIONS, beforeStep: (name) => {
+        // The write has landed; a member fails and md starts rebuilding.
+        if (name === 'postcheck') {
+          node.setKnob('degraded', '1')
+          node.setKnob('sync_action', 'recover')
+        }
+      } },
+    )
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.ok(node.wroteThroughMd?.equals(HEALTHY), 'the block really was written')
+    assert.match(outcome.reason, /the block was written and matches its checksum/)
+    assert.match(outcome.reason, /the post-check could not run/)
+    assert.match(outcome.reason, /Re-scrub to confirm parity/)
+    assert.ok(!/nothing written/.test(outcome.reason), outcome.reason)
+    assert.match(outcome.postcheckSkipped ?? '', /md is running recover/)
+  })
+})
+
+/**
+ * F4 — through-md rot on a MIRROR reads as `above-md`, exactly as it does on a
+ * parity band.
+ *
+ * `reverify` used to abort before the pre-check with "there is no good copy
+ * left. Restore from backup", so the diagnosis a parity band gets from the same
+ * fault — parity already agreed with the bad data, which implicates something
+ * other than the disks — was lost, `aboveMd` stayed 0 and a node with failing
+ * memory kept corrupting.
+ */
+describe('selfheal repair — every mirror leg fails the csum (F4)', () => {
+  let mirror: FakeMirror
+  beforeEach(() => {
+    forgetIssuedChecks()
+    mirror = new FakeMirror({ bothLegsBad: true })
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = mirror.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(mirror.root, 'run')
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    mirror.cleanup()
+  })
+
+  it('mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD', async () => {
+    mirror.setKnob('mismatch_cnt', '0')
+    const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'above-md', outcome.reason)
+    assert.match(outcome.reason, /the legs AGREE with each other and are both wrong/)
+    assert.match(outcome.reason, /implicates something other than the disks/)
+    assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+    assert.equal(mirror.wroteThroughMd, null)
+  })
+
+  it('mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE', async () => {
+    mirror.setKnob('mismatch_cnt', '6')
+    const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    assert.match(outcome.reason, /counts 6 mismatch\(es\), so the legs disagree with each other/)
+    assert.match(outcome.reason, /Restore /)
+    assert.equal(mirror.wroteThroughMd, null)
+  })
+})
+
+/**
+ * F11 — the repair's identity is the inode, not just the path.
+ *
+ * A path deleted and re-created between the scrub and the repair used to be
+ * caught by `reverify` ("not corrupt here") and by nothing else — a coincidence
+ * that also says the wrong thing about a file nobody examined.
+ */
+describe('selfheal repair — the finding\'s inode (F11)', () => {
+  useNode(() => new FakeNode())
+
+  it('repairs when the inode matches the file that is there', async () => {
+    const outcome = await repairBlock(
+      node,
+      { mountpoint: node.mountpoint, file: node.file, block: 300, inode: statSync(node.file).ino },
+      OPTIONS,
+    )
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+  })
+
+  it('refuses NOT-EXAMINED when it does not, and pins nothing', async () => {
+    const outcome = await repairBlock(
+      node,
+      { mountpoint: node.mountpoint, file: node.file, block: 300, inode: statSync(node.file).ino + 1 },
+      OPTIONS,
+    )
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, 'inode-changed')
+    assert.match(outcome.reason, /is not the file the finding describes/)
+    assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+    assert.equal(node.wroteThroughMd, null)
+    assert.equal(node.created.length, 0, 'nothing was pinned')
+  })
+})
+
+/**
+ * F8 — a member carrying recorded md bad blocks over the row is ABSENT.
+ *
+ * md reconstructs nothing from a bad-block range: it serves EIO there. Reading
+ * such a member and XORing what comes back produces a candidate that is wrong,
+ * and on RAID6 could be arbitrated against the wrong syndrome.
+ */
+describe('selfheal repair — md bad blocks over the row (F8)', () => {
+  useNode(() => new FakeNode())
+
+  /** One range covering the target row, in the member's own data coordinates. */
+  function badBlockRow(role: number): void {
+    const dir = join(node.sys, `rd${role}`)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'bad_blocks'), `${(MEMBER_OFFSET - 1048576) / 512} 8\n`)
+  }
+
+  it('RAID5: a sibling with a recorded range ends the reconstruction, by name', async () => {
+    badBlockRow(1)
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    assert.equal(outcome.reasonCode, 'bad-blocks-present')
+    assert.match(outcome.reason, /a RAID5 reconstruction needs every other member/)
+    assert.match(outcome.reason, /md has recorded bad blocks over this row on \/dev\/loop1/)
+    assert.match(outcome.reason, /Replace that member/)
+    assert.equal(node.wroteThroughMd, null)
+  })
+
+  it('an EMPTY bad-block file changes nothing — every member is still a source', async () => {
+    for (let role = 0; role < 6; role++) {
+      const dir = join(node.sys, `rd${role}`)
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'bad_blocks'), '\n')
+    }
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+  })
+
+  it('a range somewhere ELSE on the member does not touch this row', async () => {
+    const dir = join(node.sys, 'rd1')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'bad_blocks'), '8 16\n')
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+  })
+})
+
+/**
+ * F3 — a block whose MAPPING failed is `not-examined`, with the reason.
+ *
+ * The `mapping-abort` bucket's sentence asserts a positive fact: the bytes on
+ * the member still pass their stored checksum, so nothing was written AND
+ * nothing needs a restore. True of the one case `reverify` establishes it for;
+ * false of an inline extent, a HOLE (every ANAS-created LUN image is sparse),
+ * a truncated owner scan and a band whose geometry went unreadable. Those
+ * blocks were never examined and may be genuinely corrupt.
+ */
+describe('selfheal repair — a block the mapping could not reach (F3)', () => {
+  /** The rig, with the target file's EXTENT_DATA item rewritten. */
+  class FakeExtentNode extends FakeNode {
+    constructor(readonly rewrite: (item: string) => string) {
+      super()
+    }
+
+    override async exec(command: string, args: string[]): Promise<ExecResult> {
+      if (command === '/usr/bin/btrfs' && args[1] === 'dump-tree' && args[2] === '-b'
+        && TREE_LEAVES[Number(args[3])] === 'dump-tree-subvol.txt') {
+        this.calls.push({ command, args })
+        return { stdout: this.rewrite(fixture('dump-tree-subvol.txt')), stderr: '', exitCode: 0 }
+      }
+      return super.exec(command, args)
+    }
+  }
+
+  let staged: FakeExtentNode
+  function run(rewrite: (item: string) => string) {
+    staged = new FakeExtentNode(rewrite)
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = staged.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(staged.root, 'run')
+    return repairBlock(staged, { mountpoint: staged.mountpoint, file: staged.file, block: 300 }, OPTIONS)
+  }
+  beforeEach(() => forgetIssuedChecks())
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    staged?.cleanup()
+  })
+
+  it('an INLINE extent: not-examined / inline-extent, and NOT "nothing needs a restore"', async () => {
+    const outcome = await run(text => text.replace(
+      '\t\tgeneration 9 type 1 (regular)\n\t\textent data disk byte 13631488 nr 8388608',
+      '\t\tgeneration 9 type 0 (inline)\n\t\tinline extent data size 120 ram_bytes 120 compression 0 (none)',
+    ))
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, 'inline-extent')
+    assert.match(outcome.reason, /is an inline extent/)
+    assert.equal(staged.wroteThroughMd, null)
+  })
+
+  it('a HOLE: not-examined / hole — reachable on any ANAS-created (sparse) LUN image', async () => {
+    const outcome = await run(text => text.replace(
+      'extent data disk byte 13631488 nr 8388608',
+      'extent data disk byte 0 nr 0',
+    ))
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, 'hole')
+    assert.match(outcome.reason, /is a hole/)
+    assert.equal(staged.wroteThroughMd, null)
+  })
+
+  it('a band whose geometry goes unreadable after the gates: not-examined / band-unreadable', async () => {
+    staged = new FakeExtentNode(text => text)
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = staged.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(staged.root, 'run')
+    const outcome = await repairBlock(
+      staged,
+      { mountpoint: staged.mountpoint, file: staged.file, block: 300 },
+      { ...OPTIONS, beforeStep: (name) => {
+        // The gates passed on a readable pool; the array stops answering
+        // between them and the re-resolve. (A pool that is ALREADY like this is
+        // refused at the gates, which is a different and older leaf.)
+        if (name === 'resolve') {
+          staged.dmTableLv = '0 2031616 linear 9:99 2560\n'
+          staged.dmTableAll = `gtsh-data: ${staged.dmTableLv}`
+        }
+      } },
+    )
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, 'band-unreadable')
+    assert.equal(staged.wroteThroughMd, null)
   })
 })

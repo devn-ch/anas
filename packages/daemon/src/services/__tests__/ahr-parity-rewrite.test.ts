@@ -542,3 +542,123 @@ describe('the confirm gate\'s warnings', () => {
     assert.equal(approximateDuration(5400), '1 h 30 min')
   })
 })
+
+/**
+ * Seventh pass, F8 — a band with recorded md bad blocks is refused.
+ *
+ * md reconstructs nothing from a recorded bad-block range: it serves EIO there.
+ * A whole-band `mdadm --action=repair` walks every stripe and recomputes parity
+ * from what it reads — rows md cannot read included. Until this pass nothing in
+ * the daemon read a member's `bad_blocks` at all, and this verb would have handed
+ * such a band a repair regardless.
+ */
+describe('rewrite parity — a member with recorded bad blocks (F8)', () => {
+  let md: FakeMd
+  beforeEach(() => {
+    forgetIssuedChecks()
+    md = new FakeMd()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    md.cleanup()
+  })
+
+  it('REFUSES the band, names the member, and hands md nothing', async () => {
+    md.set('rd2/bad_blocks', '6368 8')
+    const result = await rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN })
+    assert.equal(result.outcome, 'refused')
+    assert.equal(result.reasonCode, 'bad-blocks-present')
+    assert.ok(result.reason?.includes('recorded bad blocks'), result.reason)
+    assert.ok(result.reason?.includes('replace the member first'), result.reason)
+    assert.deepEqual(md.actions(), [], 'no repair and no check were issued')
+  })
+
+  it('an EMPTY bad-block list is not a refusal — the band rewrites as it always did', async () => {
+    for (let role = 0; role < 6; role++)
+      md.set(`rd${role}/bad_blocks`, '')
+    const result = await rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN })
+    assert.equal(result.outcome, 'rewritten', result.reason)
+  })
+})
+
+/**
+ * Seventh pass, F2 — the proof may come from a completed REPAIR.
+ *
+ * A repair that wrote a block, proved it cold against the checksum btrfs stored
+ * for it, and then saw md still counting mismatching stripes has MEASURED the
+ * residual. Before this pass that number was recorded nowhere and Rewrite
+ * parity refused `no-parity-mismatch` until a fresh multi-hour two-phase scrub
+ * had rediscovered it.
+ */
+describe('parityRewriteEvidence — a repair job as the proof (F2)', () => {
+  function repairJob(result: unknown, createdAt = '2026-09-13T06:00:00.000Z'): Job {
+    return {
+      id: 'job-r1',
+      status: 'completed',
+      operation: 'ahr.repair',
+      progress: null,
+      createdAt,
+      createdBy: 'root@pam',
+      startedAt: null,
+      completedAt: null,
+      result,
+      error: null,
+    }
+  }
+  function scrubJobAt(result: unknown, createdAt: string): Job {
+    return { ...repairJob(result), id: 'job-s1', operation: 'ahr.scrub', createdAt }
+  }
+
+  const RESIDUAL = { band: 'tank-r1', bandIndex: 1, array: '/dev/md/tank-r1', mismatchCnt: 8 }
+
+  it('a residual on the band IS the proof', () => {
+    const answer = parityRewriteEvidence('tank', repairJob({
+      repaired: 2,
+      unrepairable: 0,
+      aboveMd: 0,
+      notExamined: 0,
+      parityResiduals: [RESIDUAL],
+    }), 1)
+    assert.equal(answer.ok, true)
+    assert.equal(answer.ok === true && answer.mismatchCnt, 8)
+    assert.equal(answer.ok === true && answer.jobId, 'job-r1')
+  })
+
+  it('…on THAT band only', () => {
+    const answer = parityRewriteEvidence('tank', repairJob({ parityResiduals: [RESIDUAL] }), 2)
+    assert.equal(answer.ok, false)
+    assert.equal(answer.ok === false && answer.code, 'no-parity-mismatch')
+  })
+
+  it('a run that left blocks unrepaired, above md or unexamined is NOT proof', () => {
+    for (const left of ['unrepairable', 'aboveMd', 'notExamined']) {
+      const answer = parityRewriteEvidence('tank', repairJob({
+        repaired: 1,
+        [left]: 1,
+        parityResiduals: [RESIDUAL],
+      }), 1)
+      assert.equal(answer.ok, false, left)
+      assert.equal(answer.ok === false && answer.code, 'data-findings-present', left)
+      assert.ok(answer.ok === false && /Rewriting parity now would recompute it from data this node cannot vouch for/.test(answer.reason), left)
+    }
+  })
+
+  it('the NEWER of the scrub and the repair is the one that describes the band now', () => {
+    const scrub = scrubJobAt({ btrfsErrors: null, findings: [], parityMismatches: [{ band: 'tank-r1', bandIndex: 1, array: '/dev/md/tank-r1', mismatchCnt: 40 }] }, '2026-09-13T01:00:00.000Z')
+    const repair = repairJob({ repaired: 1, unrepairable: 0, aboveMd: 0, notExamined: 0, parityResiduals: [RESIDUAL] }, '2026-09-13T06:00:00.000Z')
+    const newer = parityRewriteEvidence('tank', [scrub, repair], 1)
+    assert.equal(newer.ok === true && newer.jobId, 'job-r1', 'the repair ran last')
+    assert.equal(newer.ok === true && newer.mismatchCnt, 8)
+
+    const older = parityRewriteEvidence('tank', [scrub, { ...repair, createdAt: '2026-09-12T01:00:00.000Z' }], 1)
+    assert.equal(older.ok === true && older.jobId, 'job-s1', 'the scrub ran last')
+    assert.equal(older.ok === true && older.mismatchCnt, 40)
+  })
+
+  it('a list with nothing in it is still "no proof", not a crash', () => {
+    const answer = parityRewriteEvidence('tank', [undefined, undefined], 1)
+    assert.equal(answer.ok, false)
+    assert.equal(answer.ok === false && answer.code, 'no-parity-mismatch')
+  })
+})

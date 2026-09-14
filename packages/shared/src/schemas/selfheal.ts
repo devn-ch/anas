@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AhrScrubFinding } from './ahr.js'
+import { AhrScrubFinding, AhrScrubParityMismatch } from './ahr.js'
 import { AbsolutePath } from './common.js'
 
 /**
@@ -29,15 +29,25 @@ import { AbsolutePath } from './common.js'
  *   corruption did not arrive from a disk. Nothing is written. The wording is
  *   deliberately "implicates something other than the disks", never a
  *   certainty: md only reports that parity and data are consistent.
- * - `mapping-abort` — the bytes at the computed member location still pass
- *   their stored csum. Either the mapping is wrong or the block was already
- *   repaired; either way the engine refuses to write. "Not corrupt here."
+ * - `mapping-abort` — the bytes at the computed member location were READ and
+ *   still pass their stored csum. Either the mapping is wrong or the block was
+ *   already repaired; either way the engine refuses to write. "Not corrupt
+ *   here." It is the one verdict that asserts a POSITIVE fact about the bytes,
+ *   so it is reachable only from the re-verify, which established it.
+ * - `not-examined` — the block was never looked at. The mapping could not be
+ *   followed (an inline extent, a hole, a truncated owner scan, a band whose
+ *   geometry went unreadable), the file at the path is not the file the scrub
+ *   examined, or the read-back guard says the mapping and the array disagree.
+ *   Nothing was written and NOTHING IS KNOWN about the bytes — which is the
+ *   opposite of `mapping-abort` and the opposite of `unrepairable`. Its
+ *   `reasonCode` says which of those it is (seventh pass, F3/F9/F11).
  */
 export const SelfhealOutcomeKind = z.enum([
   'repaired',
   'unrepairable',
   'above-md',
   'mapping-abort',
+  'not-examined',
 ])
 export type SelfhealOutcomeKind = z.infer<typeof SelfhealOutcomeKind>
 
@@ -64,7 +74,54 @@ export type SelfhealOutcomeKind = z.infer<typeof SelfhealOutcomeKind>
  */
 export const SELFHEAL_CSUM_UNREADABLE = 'csum-unreadable'
 
-export const SelfhealReasonCode = z.enum([SELFHEAL_CSUM_UNREADABLE])
+/**
+ * The reason codes of the `not-examined` verdict (seventh pass, F3/F9/F11).
+ *
+ * Each one is a different sentence about a block NOBODY LOOKED AT, and the
+ * distinction is the whole point: "nothing was written" is true of all of them,
+ * "the bytes are fine" is true of none.
+ *
+ * - `inline-extent` — the block's bytes live in the metadata tree, not in a
+ *   data chunk. There is no member offset to read, arbitrate or write.
+ * - `hole` — the extent is a HOLE. Every LUN image ANAS creates is sparse
+ *   (`iscsi-mutate.ts:createSparseImage` uses `ftruncate`), so this is reachable
+ *   on any ANAS-created LUN and says nothing at all about the LUN's data.
+ * - `owner-scan-truncated` — the extent's back-reference scan hit its bound, so
+ *   what it found is a prefix rather than the file's extents in that stripe.
+ * - `band-unreadable` — the band the byte sits on had no readable md geometry
+ *   at the moment of the lookup.
+ * - `unresolvable` — the chain could not be followed for any other reason, and
+ *   the read-back guard's own failure: the mapping and the array disagree.
+ * - `inode-changed` — the file at the path is not the file the scrub examined
+ *   (the finding's inode and the live `stat` disagree). Nothing was pinned.
+ *
+ * `csum-unreadable` stays what it always was: an `unrepairable` qualifier, not
+ * a `not-examined` one. There the block WAS read; what could not be read is the
+ * checksum that would arbitrate it.
+ */
+export const SELFHEAL_NOT_EXAMINED_REASONS = [
+  'inline-extent',
+  'hole',
+  'owner-scan-truncated',
+  'band-unreadable',
+  'unresolvable',
+  'inode-changed',
+] as const
+export type SelfhealNotExaminedReason = typeof SELFHEAL_NOT_EXAMINED_REASONS[number]
+
+/**
+ * A member carrying a recorded md bad-block range over the row under repair
+ * (seventh pass, F8). md reconstructs nothing from such a member, so it is
+ * treated as ABSENT — on RAID5 that ends the reconstruction, on RAID6 it leaves
+ * the Q path.
+ */
+export const SELFHEAL_BAD_BLOCKS_PRESENT = 'bad-blocks-present'
+
+export const SelfhealReasonCode = z.enum([
+  SELFHEAL_CSUM_UNREADABLE,
+  SELFHEAL_BAD_BLOCKS_PRESENT,
+  ...SELFHEAL_NOT_EXAMINED_REASONS,
+])
 export type SelfhealReasonCode = z.infer<typeof SelfhealReasonCode>
 
 /**
@@ -209,12 +266,54 @@ export type SelfhealDiagnostics = z.infer<typeof SelfhealDiagnostics>
  * member; a mountpoint the engine was handed directly has no pool name until
  * selfheal.6 hands one in).
  */
+export const SelfhealParityResidual = z.object({
+  /** The md array the residual is on, as the engine resolved it (`/dev/md127`). */
+  array: z.string(),
+  /**
+   * The band's label (`tank-r1`) when the caller handed the pool in, and the
+   * array's kernel name otherwise — the engine is also driven by the loop-device
+   * suite, which has bands but no AHR pool.
+   */
+  band: z.string(),
+  /**
+   * The band INDEX, when it could be resolved from the pool's topology. Null
+   * from the suite's rigs. It is carried separately from the label because a
+   * `parityMismatches` row is keyed on it, and that row is what makes Rewrite
+   * parity reachable without a fresh multi-hour scrub.
+   */
+  bandIndex: z.number().int().positive().nullable(),
+  /** `mismatch_cnt` the post-check read AFTER the block had been written. */
+  mismatchCnt: z.number().int().nonnegative(),
+})
+export type SelfhealParityResidual = z.infer<typeof SelfhealParityResidual>
+
 export const SelfhealOutcome = z.object({
   outcome: SelfhealOutcomeKind,
   /** Why, in one sentence, for the operator — not for a parser. */
   reason: z.string(),
   /** The one verdict a parser must tell apart; absent on all the others. */
   reasonCode: SelfhealReasonCode.optional(),
+  /**
+   * The block was repaired and the BAND still counts a parity/Q mismatch
+   * (seventh pass, F2).
+   *
+   * RAID6 with rot in the target block AND in Q: the P-XOR candidate wins
+   * arbitration, the block goes through md, and the post-check still counts a
+   * mismatch because Q is still wrong. The block is provably correct — it was
+   * re-read cold through the pin and matched the checksum btrfs stored for it —
+   * so the verdict is `repaired`, and what is left over is a PARITY residual on
+   * the band, not a data problem in the file. It rides here so the repair job
+   * can hand it on as a `parityMismatches` row, which is what Rewrite parity
+   * stands on.
+   */
+  parityResidual: SelfhealParityResidual.optional(),
+  /**
+   * The write landed and the POST-CHECK could not run (seventh pass, F5): md
+   * took an operation of its own — a member failing inside a post-check window
+   * that is minutes long on a 20 TB band is the case — between the write and
+   * the verification. The note says which op. Never "nothing written".
+   */
+  postcheckSkipped: z.string().optional(),
   /** Absolute path of the file on the node. */
   file: z.string(),
   /** 4 KiB file block index (byte offset / 4096). */
@@ -254,6 +353,18 @@ export const AhrRepairFile = z.object({
   path: AbsolutePath,
   /** 4 KiB file block indexes, as `AhrScrubFinding.badBlocks` reports them. */
   blocks: z.array(z.number().int().nonnegative()).min(1, 'name at least one block'),
+  /**
+   * The inode the scrub examined (seventh pass, F11). ADDITIVE and optional —
+   * a caller that does not know it (the dev entry point, an older UI) simply
+   * omits it and the engine behaves exactly as it did.
+   *
+   * A path is not an identity: a file deleted and re-created between the scrub
+   * and the repair has the same path and different bytes. The finding already
+   * carries the inode; when it rides along, the engine `stat`s the path before
+   * it pins anything and refuses a mismatch by name (`inode-changed`) rather
+   * than relying on the re-verify to notice by accident.
+   */
+  inode: z.number().int().nonnegative().optional(),
 })
 export type AhrRepairFile = z.infer<typeof AhrRepairFile>
 
@@ -275,6 +386,12 @@ export const AhrRepairBlockOutcome = z.object({
    * could not be read from one that genuinely needs a restore.
    */
   reasonCode: SelfhealReasonCode.optional(),
+  /**
+   * The block was repaired but its BAND still counts a parity/Q mismatch
+   * (seventh pass, F2). Carried per block because it is the block's own
+   * post-check that read it; the job rolls them up into `parityResiduals`.
+   */
+  parityResidual: SelfhealParityResidual.optional(),
 })
 export type AhrRepairBlockOutcome = z.infer<typeof AhrRepairBlockOutcome>
 
@@ -288,25 +405,35 @@ export type AhrRepairFileOutcome = z.infer<typeof AhrRepairFileOutcome>
 /**
  * The result of a repair job.
  *
- * FOUR honest counts, and no fifth place to hide a block in (review R9 —
+ * FIVE honest counts, and no sixth place to hide a block in (review R9 —
  * `mapping-abort` is counted AS ITSELF, never folded into `unrepairable`, so
  * each bucket's advice follows its own blocks):
  *
  *  - `repaired` — the reconstruction matched the stored checksum, was written
- *    through md, re-checked clean and read back cold.
+ *    through md, re-checked clean and read back cold. A repaired block whose
+ *    BAND still counts a parity mismatch is still repaired (seventh pass, F2);
+ *    the leftover rides `parityResiduals`.
  *  - `unrepairable` — nothing below the csum tree can be proven right for this
  *    block (two bad blocks in one stripe, an extent with no csum at all, a
- *    post-check that did not come back clean). Restore the file from backup.
+ *    post-check whose cold read did not come back clean). Restore the file from
+ *    backup.
  *  - `aboveMd` — parity already agreed with the bad data. Nothing was written.
  *  - `mappingAbort` — the block was NOT CORRUPT AT THE MAPPED LOCATION: the
- *    bytes there still pass their stored csum, so the engine refused to write.
- *    Nothing was written, nothing to restore — the finding no longer
- *    describes the block. The per-block entry keeps the outcome and its own
- *    reason either way.
+ *    bytes there were READ and still pass their stored csum, so the engine
+ *    refused to write. Nothing was written, nothing to restore — the finding no
+ *    longer describes the block.
+ *  - `notExamined` — the block was never looked at (seventh pass, F3/F9/F11):
+ *    an inline extent, a hole, a truncated owner scan, a band whose geometry
+ *    went unreadable, a read-back guard that says the mapping and the array
+ *    disagree, or a path whose inode is not the one the scrub examined. Nothing
+ *    was written and nothing is known about the bytes — so it is neither a
+ *    reassurance nor a restore.
  *
- * `blocks` is every block attempted, so the four counts always add up to it.
- * `mappingAbort` defaults to 0 so a payload from a daemon that folded it into
- * `unrepairable` (pre-R9) still parses.
+ * The per-block entry keeps the outcome and its own reason in every bucket.
+ *
+ * `blocks` is every block attempted, so the five counts always add up to it.
+ * `mappingAbort` and `notExamined` default to 0 so a payload from an older
+ * daemon (which folded them elsewhere) still parses.
  */
 export const AhrRepairResult = z.object({
   /** The AHR pool the repair ran on. */
@@ -315,9 +442,21 @@ export const AhrRepairResult = z.object({
   repaired: z.number().int().nonnegative(),
   unrepairable: z.number().int().nonnegative(),
   aboveMd: z.number().int().nonnegative(),
-  /** Blocks whose mapped location was not corrupt — left alone, nothing to restore. */
+  /** Blocks whose mapped location was read and not corrupt — left alone, nothing to restore. */
   mappingAbort: z.number().int().nonnegative().default(0),
-  /** Total blocks attempted — repaired + unrepairable + aboveMd + mappingAbort. */
+  /** Blocks nothing was established about — see {@link SelfhealOutcomeKind}. */
+  notExamined: z.number().int().nonnegative().default(0),
+  /**
+   * The bands a repaired block left a parity/Q mismatch on (seventh pass, F2),
+   * de-duplicated per band and carrying the highest count seen.
+   *
+   * Deliberately the SAME row shape the scrub's `parityMismatches` uses: the
+   * Scrubs parity indicator and Rewrite parity both read that shape, so a
+   * residual a repair discovered is actionable without waiting hours for a
+   * fresh two-phase scrub to rediscover it.
+   */
+  parityResiduals: z.array(AhrScrubParityMismatch).default([]),
+  /** Total blocks attempted — repaired + unrepairable + aboveMd + mappingAbort + notExamined. */
   blocks: z.number().int().nonnegative(),
 })
 export type AhrRepairResult = z.infer<typeof AhrRepairResult>
@@ -367,6 +506,11 @@ export type AhrParityRewriteOutcome = z.infer<typeof AhrParityRewriteOutcome>
  * passes: a RAID1 band has no parity to rewrite, and md's `repair` on a mirror
  * copies the first in-sync leg over the others — a 50/50 chance of writing the
  * rotten copy over the good one. It never becomes true for that band.
+ *
+ * `bad-blocks-present` is the seventh pass's (F8): a member of the band carries
+ * recorded bad-block ranges, so md cannot reconstruct from it. A whole-band
+ * `repair` over such an array recomputes parity from rows md could not read.
+ * The member is replaced first; it is not a wait-and-retry state either.
  */
 export const AhrParityRewriteReasonCode = z.enum([
   'no-parity-mismatch',
@@ -378,6 +522,7 @@ export const AhrParityRewriteReasonCode = z.enum([
   'no-such-band',
   'pool-not-mounted',
   'not-a-parity-band',
+  'bad-blocks-present',
 ])
 export type AhrParityRewriteReasonCode = z.infer<typeof AhrParityRewriteReasonCode>
 

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 
 /**
@@ -61,6 +62,13 @@ async function runCheck(): Promise<TreeCheck> {
   return mod.checkDecisionTree()
 }
 
+/** The doc's generated halves, rendered from the same YAML (seventh pass). */
+async function renderDoc(): Promise<string> {
+  const url = new URL('../../../../test/self-heal/render-trees.mjs', import.meta.url).href
+  const mod = await import(url) as { renderDoc: () => string }
+  return mod.renderDoc()
+}
+
 describe('AHR self-heal decision tree (test/self-heal/decision-tree.yaml)', () => {
   it('parses, and every node, reference and root resolves', async () => {
     const result = await runCheck()
@@ -100,5 +108,18 @@ describe('AHR self-heal decision tree (test/self-heal/decision-tree.yaml)', () =
     // A node reachable from no root is the one orphan shape that IS structural
     // — it means an edge was dropped, not that the product has a gap.
     assert.deepEqual(r.orphanNodes, [], `nodes reachable from no root: ${r.orphanNodes.join(', ')}`)
+  })
+
+  it('the doc\'s drawings and coverage table are what the YAML renders to', async () => {
+    // The trees used to be hand-drawn, which is how one node came to carry two
+    // different truncations of its label in two places (seventh pass). §Coverage
+    // and §The trees are generated now, and this is what keeps them generated:
+    // edit the YAML, run `node test/self-heal/render-trees.mjs`.
+    const doc = await readFile(new URL('../../../../docs/AHR-SELF-HEAL-DECISION-TREE.md', import.meta.url), 'utf8')
+    assert.equal(
+      doc,
+      await renderDoc(),
+      'docs/AHR-SELF-HEAL-DECISION-TREE.md is out of date — run: node test/self-heal/render-trees.mjs',
+    )
   })
 })
