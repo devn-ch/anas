@@ -21,7 +21,7 @@ from common import (BS, LOGS, PARITY_CMD, SUITE_OUT, bounded_end_check,
                     dm_segments, drop_caches, evict_stripe_cache, fail_member,
                     file_sector_digests, find_btrfs_dev, full_check, locate_block,
                     make_marker, make_snap, md_attr, md_attr_or_none, md_geometry,
-                    readd_member, read_direct, regen, remove_snap,
+                    mdsys, readd_member, read_direct, regen, remove_snap,
                     restore_sync_knobs, reverse_predict, sig_for, snapshot_read,
                     subvolume_names, write_direct)
 from oracle import (ORACLE_SNAP, corrupt_block, disambiguate_data_slot,
@@ -343,27 +343,71 @@ def control1_parity_trap(ctx: CaseCtx, rec: Recorder, level: int) -> None:
     """Negative control: the same repair at DEFAULT rmw_level MUST break
     sibling blocks (GT-7 / GT-12).
 
-    Vacuity review F5 — the canary: the naive write just went THROUGH md, so
-    the stripe sits in md's stripe cache, and a bounded check over it WITHOUT
-    the eviction reads the cached pre-corruption content and reports 0 — the
-    stale cache would have hidden the poison. Both numbers are recorded and
-    both asserted: if the no-eviction check ever reads > 0, the staleness
-    premise this control (and the evicted checks of every case) stands on is
-    gone, and the suite fails loudly instead of proving less than it claims."""
+    Vacuity review F5 — the canary, rebuilt during the 2026-09-14 node re-run
+    on kernel 7.0.14-17 (probe rounds in the run log): the ORIGINAL canary
+    checked the stripe the naive write had JUST written through md and
+    expected a no-eviction check over it to read "cached pre-corruption
+    content" and report 0 — but the write poisons the CACHED copy along with
+    the member (GT-14's mechanism leaves the post-write stripe in the cache),
+    so that check can only ever report the poison (probed: 8 on every rig,
+    every order). A cache hides only rot that landed BEHIND md AFTER the
+    stripe was last written through it.
+
+    The canary now proves exactly that, on a second signed block of its own
+    while the array is otherwise clean (so the reveal counts the canary's rot
+    and nothing else — non-vacuous):
+
+    - a CLEAN write through md at rmw_level=0 (reconstruct — parity
+      recomputed correct) caches the stripe correct;
+    - the canary block is junked BEHIND md;
+    - a no-eviction check over the stripe MUST report 0 — the stale cache
+      hid the rot (probed deterministic on this kernel);
+    - a whole-array check MUST report > 0 — the wide window recycles md's
+      stripe cache and forces the member read. The shrink+sweep eviction
+      CANNOT be used for this on kernel 7.0.14-17: a recently touched stripe
+      survives it (probed: evicted check reads the stale cache and reports 0
+      with the rot sitting on the member), so the wide window is the only
+      deterministic cache-buster the suite has.
+
+    The wide check also churns the cache past the poison half's stripe,
+    which helps keep the naive write below cache-cold (GT-14: a warm-cache
+    naive write takes md's reconstruct path and does NOT poison)."""
     path = ctx.files["c1"] if level == 5 else ctx.files["r1"]
     block = 300 if level == 5 else 1400
-    # fresh corruption (scan-located)
+    canary_block = 1900 if level == 6 else 1500
+
+    # --- the staleness canary (array otherwise clean at this point) ---------
+    loc_c = locate_block(ctx.mddev, ctx.mp, path, canary_block)
+    cname = os.path.basename(path).removesuffix(".bin")
+    orig_c = regen(cname)[canary_block * BS:(canary_block + 1) * BS]
+    assert md_attr(ctx.mddev, "rmw_level") == "1", "rmw_level not at default"
+    with open(f"{mdsys(ctx.mddev)}/rmw_level", "w") as fh:
+        fh.write("0")     # reconstruct write: parity recomputed, stripe cached CORRECT
+    write_direct(ctx.mddev, loc_c["md_byte"] - loc_c["md_byte"] % BS, orig_c)
+    with open(f"{mdsys(ctx.mddev)}/rmw_level", "w") as fh:
+        fh.write("1")
+    restore_sync_knobs(ctx.mddev)
+    ctx.corrupt_below_md(path, canary_block)          # rot BEHIND md
+    mm_stale = bounded_window_check(ctx.mddev, loc_c["stripe"], evict=False)
+    restore_sync_knobs(ctx.mddev)
+    mm_reveal = full_check(ctx.mddev)["mismatch_cnt"]  # wide window recycles
+    restore_sync_knobs(ctx.mddev)
+
+    # --- the poison half (GT-7 / GT-12, unchanged) ---------------------------
     dev, off, boff = ctx.corrupt_below_md(path, block)
     loc = locate_block(ctx.mddev, ctx.mp, path, block)
     ctx.naive_write_through_md(path, block)     # original bytes through md, rmw default
-    mm_stale = bounded_window_check(ctx.mddev, loc["stripe"], evict=False)
     mm = bounded_window_check(ctx.mddev, loc["stripe"])
-    ok1 = mm > 0 and mm_stale == 0
+    restore_sync_knobs(ctx.mddev)
+    ok1 = mm > 0 and mm_stale == 0 and mm_reveal > 0
     rec.add("control", f"1{ctx.tag}-n1", f"naive repair at default rmw_level poisons "
-            f"parity ({level_label(level)})", ok1,
+            f"parity; the no-eviction canary proves the cache can hide rot "
+            f"({level_label(level)})", ok1,
             f"bounded check stripe {loc['stripe']}: mismatch_cnt={mm} (evicted, "
-            f"expected >0); no-eviction canary mismatch_cnt={mm_stale} (expected "
-            f"0 — the stale cache would have hidden the poison)")
+            f"expected >0); canary block {canary_block}, stripe {loc_c['stripe']}: "
+            f"no-eviction mismatch_cnt={mm_stale} (expected 0 — the stale cache hid "
+            f"the rot behind md); whole-array check mismatch_cnt={mm_reveal} "
+            f"(expected >0 — the wide window recycles the cache and reveals it)")
     # fail a different data member: sibling blocks must read back WRONG
     rep = {"stripe": loc["stripe"], "disk": loc["disk"],
            "parity_disk": loc["parity_disk"], "q_disk": loc.get("q_disk")}

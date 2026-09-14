@@ -32,7 +32,7 @@ from oracle import ORACLE_SNAP
 import cases as C
 from cases import Recorder, REPAIR_SNAP
 
-RIG5_FILES = [("c1", "random", 8 * 1024 * 1024, 1, [300]),
+RIG5_FILES = [("c1", "random", 8 * 1024 * 1024, 1, [300, 1500]),
               ("z1", "zeros", 4 * 1024 * 1024, None, [300]),
               ("c4", "random", 4 * 1024 * 1024, 4, [300]),
               ("c5", "random", 4 * 1024 * 1024, 5, [300, 700])]
@@ -43,8 +43,11 @@ RIG5_FILES = [("c1", "random", 8 * 1024 * 1024, 1, [300]),
 # that is an allocation fact no file size controls — and verify_stripe now
 # counts block-by-block and reports every such block instead of silently
 # dropping a whole chunk.)
-RIG5X_FILES = [("c1", "random", 16 * 1024 * 1024, 1, [300])]
-RIG6_FILES = [("r1", "random", 8 * 1024 * 1024, 1, [300, 1000, 1400])]
+# The second signed block of c1/r1 (1500; 1900 on the RAID6 rig, clear of
+# 1r6-b's block 1000 and the control's 1400) is the staleness canary's own
+# block — control1_parity_trap corrupts it behind md after a clean write.
+RIG5X_FILES = [("c1", "random", 16 * 1024 * 1024, 1, [300, 1500])]
+RIG6_FILES = [("r1", "random", 8 * 1024 * 1024, 1, [300, 1000, 1400, 1900])]
 RIG1_FILES = [("l1", "random", 4 * 1024 * 1024, 7, [300])]
 # Case 8 (selfheal.10) gets a rig of its own: the verb scrubs the WHOLE
 # filesystem and any finding aborts it, so it cannot follow cases that leave

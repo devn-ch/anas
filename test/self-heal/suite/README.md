@@ -10,7 +10,7 @@ never the ANAS install, never `/dev/sda*` or `/dev/zd*`.
 
 | id | case | negative control |
 |----|------|------------------|
-| 1a / 1r6-a | parity trap, RAID5 (6 × 200 MiB) / RAID6 (7 members): corrupt a data block below md, repair, fail a DIFFERENT member, every sibling block reads back correctly — the sibling check counts the blocks it actually compares and requires `wrong == 0 AND total > 0` (a block outside the file's extent or past EOF is not counted and is named in the detail line; an all-outside row cannot pass vacuously) | 1-neg: the same repair with `rmw_level` at its default MUST poison parity (`mismatch_cnt > 0`) and sibling blocks MUST read back wrong; it also carries the eviction canary — the same bounded check over the just-written stripe WITHOUT the eviction must read the stale cache and report 0, proving the eviction is what makes the evicted checks honest |
+| 1a / 1r6-a | parity trap, RAID5 (6 × 200 MiB) / RAID6 (7 members): corrupt a data block below md, repair, fail a DIFFERENT member, every sibling block reads back correctly — the sibling check counts the blocks it actually compares and requires `wrong == 0 AND total > 0` (a block outside the file's extent or past EOF is not counted and is named in the detail line; an all-outside row cannot pass vacuously) | 1-neg: the same repair with `rmw_level` at its default MUST poison parity (`mismatch_cnt > 0`) and sibling blocks MUST read back wrong; it also carries the staleness canary — on a second signed block, a CLEAN write (`rmw_level=0`) caches the stripe correct, rot lands BEHIND md, a no-eviction check must read the stale cache and report 0, and a whole-array check must reveal it (the wide window is the cache-buster: on kernel 7.0.14-17 a recently written stripe survives the shrink+sweep eviction — probed; the original canary, which expected 0 over the stripe the naive write had just poisoned, was unsound — the write poisons the cached copy too, and the no-eviction check could only ever report the poison) |
 | 1r5x-a | the RAID5 parity case again on a rig built with `--chunk=512K` — md's default and the AHR band shape (F4): every stripe/sector window is derived from the array's own `chunk_size`, so nothing is hardcoded to the rig's 64 KiB | 1-neg (same controls, tagged `r5x`) |
 | 1r6-b | RAID6 with the P member failed after repair (Q reconstruction path) | (same controls) |
 | 2 | zero-block mapping: corrupt the data slot of a zeros file (scan hits data AND parity; flip-test disambiguates), repair invoked with a deliberately wrong block index onto a healthy zero block must exit 4 | 2-neg: the correct block still repairs (exit 0) and reads back cold |
@@ -37,8 +37,11 @@ NODE=root@someother test/self-heal/suite/run-suite.sh
 REPAIR_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-repair.js" \
 REPORT_NAME=LAST-RUN-engine.md test/self-heal/suite/run-suite.sh
 
-# the ANAS parity rewrite (selfheal.10) — case 8's verb
-PARITY_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-parity.js --assume-mismatch" \
+# the ANAS parity rewrite (selfheal.10) — case 8's verb. No flag: the suite
+# produces the evidence file itself (its own bounded check) and passes it as
+# `--evidence`, so the run exercises the REAL gate; `--assume-mismatch`
+# remains as the dev bypass (8-no-evidence strips it and passes no file).
+PARITY_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-parity.js" \
 REPORT_NAME=LAST-RUN-parity.md test/self-heal/suite/run-suite.sh
 ```
 
@@ -63,7 +66,13 @@ The suite calls `${REPAIR_CMD:-python3 <suite dir>/repair-ref.py}` as
 `<cmd> <mountpoint> <file> <block>`.
 
 Exit codes: `0` repaired · `2` unrepairable · `3` diagnosed-above-md ·
-`4` mapping-abort ("not corrupt here") · `1` internal error.
+`4` mapping-abort ("not corrupt here") · `5` not-examined · `1` internal error.
+`5` is the ANAS engine's alone (selfheal.5, F3): an inline extent, a hole, an
+unreadable band, a truncated owner scan — a block nobody looked at must not
+claim what `4` asserts (the bytes there passed their checksum). The reference
+has no such exit and no suite case builds one of those shapes; the suite's only
+exit-4 assertion (2-wrong-index) exercises the re-verify, which the engine
+still reports as `mapping-abort`.
 
 Optional env the suite sets:
 
@@ -102,7 +111,9 @@ counted a parity mismatch on this band and its checksum pass was clean", and a
 loop rig has no daemon and no job queue to hold such a job. The flag supplies
 that ONE precondition; the fresh btrfs scrub, the array gates, the whole-band
 repair, the verifying check and the `mismatch_cnt == 0` proof all run exactly as
-they do in the job.
+they do in the job. Since the evidence-gate round the dev entry also takes
+`--evidence <file>` in place of the flag, so a flag-less `PARITY_CMD` (the
+stronger run — no bypass) works when the suite supplies the file, as it does.
 
 The EVIDENCE GATE: without the flag the verb refuses — exit 3,
 `no-parity-mismatch`, before the scrub and before md — unless it is passed
@@ -118,18 +129,22 @@ refusal and that no md action was issued. `parity-ref.py` requires
 
 | REPAIR_CMD | report | result |
 |---|---|---|
-| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 41/41 cases, 14/14 controls |
-| `python3 parity-ref.py` (the reference parity rewrite) | — | case 8 + its control on the parity rig (the committed `LAST-RUN.md` predates case 8) |
-| `node …/daemon/dist/bin/selfheal-parity.js --assume-mismatch` (the ANAS parity rewrite, selfheal.10) | `LAST-RUN-parity.md` | 48/48 cases, 17/17 controls (2026-09-14, the full suite with case 8) |
-| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 41/41 cases, 14/14 controls (2026-09-13, with case 7 on the two-band rig) |
+| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 49/49 cases, 18/18 controls (2026-09-14, node re-run of the hardened suite on kernel 7.0.14-17) |
+| `python3 parity-ref.py` (the reference parity rewrite) | — | case 8 + its controls ride in `LAST-RUN.md` (the suite runs a `PARITY_CMD` in every full run) |
+| `node …/daemon/dist/bin/selfheal-parity.js` (the ANAS parity rewrite, selfheal.10, flag-less — the suite's `--evidence` gate) | `LAST-RUN-parity.md` | 49/49 cases, 18/18 controls (2026-09-14, node re-run on kernel 7.0.14-17) |
+| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 49/49 cases, 18/18 controls (2026-09-14, node re-run on kernel 7.0.14-17; first passed 2026-09-13 with case 7 on the two-band rig) |
 
-The committed `LAST-RUN*.md` reports predate the vacuity review's fixes: the
-suite as it stands has more rows than those runs show (5-disk, 8-neg-no-repair,
-8-no-evidence, the asserted 3-map and 8-inject) and the existing rows prove
-more than the old ones did (the counted stripe check, the on-disk refusal
-assertions, the deterministic RAID1 control, the subvolume-set pin check, the
-evidence gate). The counts above are those runs' results; a node re-run is
-required before this table can claim a pass for the suite as it stands.
+The 2026-09-14 node re-run was the first run of the suite AS the vacuity
+review left it (5-disk, 8-neg-no-repair, 8-no-evidence, the asserted 3-map and
+8-inject, the counted stripe check, the on-disk refusal assertions, the
+deterministic RAID1 control, the subvolume-set pin check, the evidence gate),
+and it caught one control: the case-1 no-eviction canary asserted 0 over the
+stripe the naive write had JUST poisoned, but the write poisons the cached
+copy along with the member (GT-14's mechanism leaves the post-write stripe in
+md's cache), so that check could only ever report the poison — probed at 8 on
+every rig before the control was rebuilt (see the case-1 control and the
+kernel-7.0.14-17 note below). All three implementations then passed the suite
+as it stands.
 
 The engine covers everything the reference does and adds the RAID6 Q-syndrome
 reconstruction as a fallback when the P-based XOR fails arbitration (a stripe
@@ -209,6 +224,20 @@ correctness on a rig:
   ±200 stripes while small; `bounded_window_check` calls it before every
   check. The same staleness affects degraded reads (`verify_stripe` sweeps
   first).
+- **Kernel 7.0.14-17 changes the eviction's reach** (probed live, 2026-09-14,
+  four probe rounds during the node re-run). The shrink keeps the 17 MOST
+  RECENT stripes, and the sweep's aligned reads no longer recycle a
+  recently touched stripe — a stripe written or checked through md moments
+  ago survives the whole recipe, and an "evicted" check over it reads the
+  stale cache (probed: rot on the member, mismatch_cnt 0). On
+  7.0.14-12 the same recipe evicted it. The suite's evicted checks stay
+  honest where it matters — their stripes' last through-md touch is in the
+  past, so the shrink discards them — but the case-1 canary needed
+  rebuilding: a whole-array check recycles the cache deterministically (the
+  wide window is the one cache-buster that worked in every probed state)
+  and is what proves the reveal there. A no-eviction check over a stripe a
+  repair JUST wrote always reports the post-write state, never 0 — the
+  original canary's premise was unsound.
 - **The naive write-back poisons parity unless the stripe's SIBLING data
   blocks are already in md's stripe cache** (settled by a dedicated 3-variant
   probe, two identical runs, 2026-09-11 — see GT-14 in

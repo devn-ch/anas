@@ -490,6 +490,15 @@ def evict_stripe_cache(mddev: str, stripe: int, span: int = 200) -> None:
     Shrink first, then sweep ±span stripes (excluding the target) while the
     cache is small: with 17 slots the sweep is forced through every slot and
     the target's entry is recycled. Restore the size afterwards.
+
+    Kernel 7.0.14-17 caveat (probed 2026-09-14): a RECENTLY touched stripe —
+    written or checked through md moments ago — survives the whole recipe
+    (the shrink keeps it among the 17 most recent and the sweep's reads no
+    longer recycle it), and the helper then silently reads the stale cache.
+    Trusted only for stripes whose last through-md touch is in the past; the
+    case-1 canary uses a whole-array check as its cache-buster instead
+    (cases.control1_parity_trap).
+
     RAID1 (GT-16) has no stripe_cache_size knob and no stripe cache at all —
     an absent attribute is skipped, never an error.
 
@@ -529,9 +538,13 @@ def bounded_window_check(mddev: str, stripe: int, cap: int = 180,
     refuses with EINVAL on a 512 KiB-chunk array). The stripe cache is evicted
     first (see evict_stripe_cache) so the check reads the members, not cached
     pre-corruption content — except with `evict=False`, which the case-1
-    control uses for its canary: the same check over a stripe that was just
-    written through md, WITHOUT the eviction, must read the stale cache and
-    report 0 (proof the eviction is what makes the evicted check honest)."""
+    control's canary uses: over a stripe whose cached copy predates rot that
+    landed BEHIND md, the check must read the stale cache and report 0 (the
+    staleness premise), with a whole-array check after it proving the wide
+    window reveals what the cache hid. On kernel 7.0.14-17 a recently
+    WRITTEN stripe survives even the eviction (the shrink keeps the 17 most
+    recent), which is why the canary's rot lands behind md after a clean
+    write and never on the stripe a repair just wrote."""
     geo = md_geometry(mddev)
     cs = chunk_sectors(geo)
     if evict:
