@@ -69,7 +69,7 @@ check "journald line has BADBLOCKS=3"   grep -q 'EVENT=RebuildFinished DEVICE=/d
 check "notify severity escalated"       grep -q ' warning md RebuildFinished' "${TMP}/perl.log"
 check "note counts the ranges"          grep -q '3 unreadable sector range' "${TMP}/perl.log"
 check "note says data was lost"         grep -q 'could not be reconstructed' "${TMP}/perl.log"
-check "note recommends a Scrub"         grep -q "The periodic scrub's phase 2 will name the files" "${TMP}/perl.log"
+check "note recommends a Scrub"         grep -q "The periodic scrub's phase 2 checks every file's checksum and will name any affected file" "${TMP}/perl.log"
 
 echo "== 2. RebuildFinished with a clean BBL =="
 for m in dev-sda1 dev-sdb1 dev-sdc1; do : > "${SYS}/md127/md/${m}/bad_blocks"; done
@@ -120,7 +120,7 @@ run_hook RebuildFinished /dev/md127
 check "journald has MISMATCHES=384"     grep -q 'MISMATCHES=384' "${TMP}/logger.log"
 check "severity escalated to warning"   grep -q ' warning md check finished' "${TMP}/perl.log"
 check "counts the mismatches"           grep -q '384 parity mismatch' "${TMP}/perl.log"
-check "recommends an ANAS Scrub"        grep -q "the periodic scrub's phase 2 will name the files" "${TMP}/perl.log"
+check "recommends an ANAS Scrub"        grep -q "the periodic scrub's phase 2 checks every file's checksum and will name any affected file" "${TMP}/perl.log"
 
 echo "== 8. Rebuild progress event carries ACTION in journald =="
 run_hook Rebuild20 /dev/md127
@@ -221,7 +221,7 @@ printf '5\n'     > "${SYS}/md127/md/mismatch_cnt"
 run_hook RebuildFinished /dev/md127
 check "journald line is pure ASCII"      bash -c "! LC_ALL=C grep -q '[^[:print:]]' '${TMP}/logger.log'"
 check "notification title+body are pure ASCII" bash -c "! LC_ALL=C grep -q '[^[:print:]]' '${TMP}/perl.log'"
-check "…and the advice still names phase 2"    grep -q "the periodic scrub's phase 2 will name the files" "${TMP}/perl.log"
+check "…and the advice still names phase 2"    grep -q "the periodic scrub's phase 2 checks every file's checksum and will name any affected file" "${TMP}/perl.log"
 printf 'recover\n' > "${SYS}/md127/md/last_sync_action"
 printf '12\n' > "${SYS}/md127/md/dev-sda1/bad_blocks"
 run_hook RebuildFinished /dev/md127

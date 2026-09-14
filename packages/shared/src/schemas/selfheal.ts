@@ -42,6 +42,7 @@ export const SelfhealOutcomeKind = z.enum([
 export type SelfhealOutcomeKind = z.infer<typeof SelfhealOutcomeKind>
 
 /**
+/**
  * A machine-readable qualifier on an `unrepairable` verdict, for the one case
  * where the operator's next step is NOT "restore from backup".
  *
@@ -50,12 +51,20 @@ export type SelfhealOutcomeKind = z.infer<typeof SelfhealOutcomeKind>
  * about the data block: it may be perfectly good. Restoring the file from
  * backup on the strength of this verdict overwrites data that was never proven
  * bad, so the notification and the UI must say "the checksum could not be
- * read", never "restore from backup" (design review 2026-09-14, D3).
+ * read", never "restore from backup" (design review 2026-09-14, D3/D10). The
+ * repair job matches this code to give re-scrub advice ("re-scrub after the
+ * metadata is repaired — a btrfs scrub repairs metadata copies").
  *
  * Absent on every other outcome — `reason` is the operator's sentence and
  * stays the only thing most verdicts carry.
+ *
+ * `SELFHEAL_CSUM_UNREADABLE` is the ONE spelling of the code: the enum is
+ * built from it, and every producer and consumer imports the constant rather
+ * than repeating the literal.
  */
-export const SelfhealReasonCode = z.enum(['csum-unreadable'])
+export const SELFHEAL_CSUM_UNREADABLE = 'csum-unreadable'
+
+export const SelfhealReasonCode = z.enum([SELFHEAL_CSUM_UNREADABLE])
 export type SelfhealReasonCode = z.infer<typeof SelfhealReasonCode>
 
 /**

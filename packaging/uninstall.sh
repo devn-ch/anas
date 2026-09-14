@@ -27,11 +27,14 @@ TIMERS_STAMP_DIR="${TIMERS_STAMP_DIR:-/var/lib/systemd/timers}"
 # its unit files and Persistent stamps removed, and one line names the family
 # and the count.
 #
-# mdcheck is NEVER re-enabled (review F2): ANAS is stateless and cannot know
-# whether mdadm's timers were on before ANAS was installed — for some nodes
-# they were never on at all. When the scrub timer is removed, the printed line
-# says plainly what state the node is left in and how to get the distro default
-# back if the operator wants it.
+# mdcheck IS re-enabled (ruling 2026-09-14, reversing review F2): a node left
+# with no parity check at all is not helping or guarding, and mdadm's
+# `mdcheck_start`/`mdcheck_continue` timers are ENABLED BY DEFAULT on a stock
+# node (SCHEDULES-GROUND-TRUTH). Turning them back on is not a guess about what
+# this node had before ANAS — it is restoring the distro default, which is what
+# a guest leaves behind. The printed line says that is what happened, and how
+# to turn them off again (spindown operators run without a periodic check on
+# purpose).
 #
 # Idempotent: every step is guarded, a partially-uninstalled node is fine.
 remove_schedule_units() {
@@ -56,11 +59,15 @@ remove_schedule_units() {
     rm -f "${SYSTEMD_DIR}/anas-scrub.timer" "${SYSTEMD_DIR}/anas-scrub.service"
     rm -f "${TIMERS_STAMP_DIR}/stamp-anas-scrub.timer"
     info "removed 1 ANAS schedule unit pair (anas-scrub.*)"
-    # Honest, not "restored" (review F2): ANAS cannot know whether mdcheck was
-    # on before ANAS, so it does not guess — it says what is off and how to
-    # turn it back on.
-    info "ANAS periodic scrub removed. mdadm's monthly parity check (mdcheck_start.timer) was disabled by ANAS when the scrub was enabled and has NOT been re-enabled;"
-    info "run \`systemctl enable --now mdcheck_start.timer mdcheck_continue.timer\` if you want it back."
+    # The node goes back to stock (ruling 2026-09-14): ANAS disabled mdadm's
+    # timers when the periodic scrub was enabled, and the distro default is
+    # that they are ON. Best-effort — a node without the mdcheck units (they
+    # ship with mdadm, but a minimal install may not have them) costs the
+    # re-enable and nothing else, and the line still tells the operator where
+    # the node stands.
+    systemctl enable --now mdcheck_start.timer mdcheck_continue.timer >/dev/null 2>&1 || true
+    info "ANAS periodic scrub removed. mdadm's own parity check (mdcheck_start.timer, mdcheck_continue.timer) — the distro default, which ANAS disabled when the scrub was enabled — has been RESTORED;"
+    info "run \`systemctl disable --now mdcheck_start.timer mdcheck_continue.timer\` if you do not want a periodic md parity check on this node."
   fi
 }
 
@@ -125,7 +132,8 @@ if [ "${removed_unit}" -eq 1 ]; then
 fi
 
 # 3a. Remove the ANAS schedule units (periodic scrub + the snapshot/backup/
-# replication schedules) — all four families, never a re-enable of mdcheck.
+# replication schedules) — all four families, and mdcheck restored to the
+# distro default when the scrub timer was one of them.
 # See the function above (review F2/F8).
 remove_schedule_units
 

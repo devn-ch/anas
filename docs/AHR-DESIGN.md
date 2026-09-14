@@ -319,6 +319,8 @@ AHR is the feature that justifies actually wiring the deferred Proxmox notificat
 
 That rule is implemented twice on purpose — `isBuildingMembership` (TypeScript, from /proc/mdstat) and `initial_build_shape()` (POSIX sh, from sysfs) — because the monitor hook runs with no daemon, no socket and no node. They must be kept in step; each carries a comment pointing at the other.
 
+**Parity-only rot** (scrub, self-heal reporting): phase 1 (md parity check) counting `mismatch_cnt > 0` on a band while phase 2 (btrfs checksum scrub) attributes NO corrupt file is not a false alarm — with every data block passing its checksum, the parity (or Q) member is what disagrees with the data. Nothing in ANAS repairs parity (the repair-verb question is a deliberate operator decision, not a default), so the scrub reports it and says the standing consequence plainly: at the NEXT disk failure in that band, md would reconstruct from the wrong parity. The per-band verdicts ride the scrub result (`parityMismatches`), phase 1's warning promises only what phase 2 can deliver (it checks every file's checksum and names an affected file), and the parity-only case gets its own second notification so the promised attribution never dies in silence.
+
 Routed through PVE's own notification targets/matchers (email/Gotify/etc. the operator already configured) — ANAS emits, PVE delivers. Leverage, not a new alerting system. **Mechanism (GT-17, proven live):** `PVE::Notify::<severity>('anas-ahr', {title, message}, fields)` with ANAS-shipped handlebars templates in `/usr/share/pve-manager/templates/default/` (apt-hook reinstalls after pve-manager upgrades); `fields` carries `type=anas-ahr` for operator matcher rules. **Evaluate first (per 9.4):** does ZED/mdadm's own `MAILADDR`/monitor already cover the disk-failure cases? Wire only the genuinely-missing events; don't duplicate `mdadm --monitor` if PVE can consume it directly.
 
 ### 7.3 Dashboard
@@ -444,6 +446,12 @@ unmounted after each op — nothing new stays mounted):
 | `POST /v1/ahr/:name/snapshots/:snap/rollback` | **409 confirm**; brief unmount of the pool; current `@data` is PRESERVED as `@snapshots/pre-rollback-<ts>` (rename — instant), the chosen snapshot becomes the new writable `@data`, remount. Nothing is destroyed by a rollback, ever |
 | 202 job |
 
+- **Transient repair pins:** the self-heal engine takes its cold read through a
+  read-only snapshot named `anas-selfheal-<ts>` (under `@snapshots` on §12
+  pools; inside the served tree on a flat pool) and deletes it in its `finally`
+  — a leftover from a failed cleanup shows in the Snapshots manager labelled
+  "transient — ANAS repair pin; safe to delete if no repair is running", and is
+  never offered as a rollback target.
 - **Schema:** `AhrSnapshot { name, createdAt, readonly }`; `AhrPool` gains
   `subvolLayout: boolean`. Snapshot sizes need qgroups — OUT of v1 (never show
   an unlabeled or wrong number).

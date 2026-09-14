@@ -173,7 +173,7 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, res.json().job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(job.result, { scrubbed: 'ahr0', btrfsErrors: null, checkedArrays: 2 })
+    assert.deepEqual(job.result, { scrubbed: 'ahr0', btrfsErrors: null, checkedArrays: 2, bandsChecked: ['ahr0-r1', 'ahr0-r2'] })
   })
 })
 
@@ -672,7 +672,7 @@ describe('POST /v1/ahr/:name/parity-rewrite', () => {
   }
 
   /** The proof: mismatches on r1, a clean checksum pass across the pool. */
-  const CLEAN_WITH_MISMATCH = { scrubbed: 'ahr0', btrfsErrors: null, checkedArrays: 2, parityMismatches: [{ band: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8 }] }
+  const CLEAN_WITH_MISMATCH = { scrubbed: 'ahr0', btrfsErrors: null, checkedArrays: 2, parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8 }] }
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-parity-'))
@@ -774,14 +774,14 @@ describe('POST /v1/ahr/:name/parity-rewrite', () => {
   })
 
   it('409 no-parity-mismatch when the scrub counted mismatches on ANOTHER band', async () => {
-    await completedScrub({ scrubbed: 'ahr0', btrfsErrors: null, parityMismatches: [{ band: 2, mismatchCnt: 4 }] })
+    await completedScrub({ scrubbed: 'ahr0', btrfsErrors: null, parityMismatches: [{ band: 'ahr0-r2', bandIndex: 2, array: '/dev/md/ahr0-r2', mismatchCnt: 4 }] })
     const res = await post({ band: 1 })
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.reason, 'no-parity-mismatch')
   })
 
   it('409 data-findings-present when the last scrub found data corruption', async () => {
-    await completedScrub({ scrubbed: 'ahr0', btrfsErrors: 'csum_errors=3', parityMismatches: [{ band: 1, mismatchCnt: 8 }] })
+    await completedScrub({ scrubbed: 'ahr0', btrfsErrors: 'csum_errors=3', parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8 }] })
     const res = await post({ band: 1 })
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.reason, 'data-findings-present')

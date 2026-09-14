@@ -4,10 +4,11 @@
 # uninstaller removes ALL FOUR ANAS schedule unit families (anas-snap-*,
 # anas-backup-*, anas-repl-*, anas-scrub.*) — their runners are gone with
 # /opt/anas, and a timer firing a missing runner is worse than a lost schedule —
-# and NEVER re-enables mdadm's mdcheck timers: ANAS is stateless and cannot
-# know whether mdcheck was on before ANAS, so re-enabling it would arm a
-# monthly parity check the operator may never have had. The scrub removal
-# prints an honest line saying mdcheck is off and how to restore it.
+# and RESTORES mdadm's mdcheck timers when it removed the scrub timer (ruling
+# 2026-09-14, reversing review F2): those timers are enabled by default on a
+# stock node, so turning them back on returns the node to the distro default
+# rather than guessing at its history. The scrub removal prints that it did,
+# and how to turn them off again.
 #
 # uninstall.sh is sourced in ANAS_UNINSTALL_LIB_ONLY mode (the install.sh
 # pattern) with a throwaway SYSTEMD_DIR/stamp dir and a faked systemctl that
@@ -89,20 +90,24 @@ for fam in snap backup repl; do
     grep -q "disable --now anas-${fam}-nightly.timer" "${WORK}/systemctl.log"
 done
 
-echo "== 2. mdcheck is NEVER re-enabled =="
-check "no mdcheck enable, ever" \
-  bash -c "! grep -qE 'enable.*mdcheck' '${WORK}/systemctl.log'"
+echo "== 2. mdcheck is RESTORED to the distro default =="
+check "both mdcheck timers re-enabled, --now" \
+  grep -q 'enable --now mdcheck_start.timer mdcheck_continue.timer' "${WORK}/systemctl.log"
+check "…and never disabled on the way out" \
+  bash -c "! grep -qE 'disable.*mdcheck' '${WORK}/systemctl.log'"
 
-echo "== 3. the honest mdcheck line is printed =="
+echo "== 3. the restore line is printed =="
 make_units
 PATH="$(dirname "${SYSTEMCTL}"):$PATH" SYSTEMD_DIR="${SYSTEMD_DIR}" TIMERS_STAMP_DIR="${STAMPS}" \
   ANAS_UNINSTALL_LIB_ONLY=1 bash -c "source '${UNINSTALL}'; remove_schedule_units" > "${WORK}/out.log" 2>&1
 check "scrub removal line names the family and count" \
   grep -F 'removed 1 ANAS schedule unit pair (anas-scrub.*)' "${WORK}/out.log"
-check "NOT-been-re-enabled admission printed" \
-  grep -q "has NOT been re-enabled" "${WORK}/out.log"
-check "restore command printed" \
-  grep -q 'systemctl enable --now mdcheck_start.timer mdcheck_continue.timer' "${WORK}/out.log"
+check "the restore is stated, and named as the distro default" \
+  bash -c "grep -q 'has been RESTORED' '${WORK}/out.log' && grep -q 'distro default' '${WORK}/out.log'"
+check "no stale NOT-been-re-enabled admission" \
+  bash -c "! grep -q 'has NOT been re-enabled' '${WORK}/out.log'"
+check "the way to turn it back OFF is printed" \
+  grep -q 'systemctl disable --now mdcheck_start.timer mdcheck_continue.timer' "${WORK}/out.log"
 check "per-family count lines printed" \
   bash -c "grep -q 'anas-snap-\*' '${WORK}/out.log' && grep -q 'anas-backup-\*' '${WORK}/out.log' && grep -q 'anas-repl-\*' '${WORK}/out.log'"
 
@@ -118,6 +123,7 @@ check "other families still removed" \
 echo "== 5. idempotent — a second run is clean =="
 make_units
 source_uninstall >/dev/null 2>&1
+: > "${WORK}/systemctl.log"
 source_uninstall >/dev/null 2>&1
 check "second run issues no mdcheck or anas-scrub systemctl calls" \
   bash -c "! grep -q mdcheck '${WORK}/systemctl.log' && ! grep -q anas-scrub '${WORK}/systemctl.log'"

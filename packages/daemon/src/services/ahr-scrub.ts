@@ -10,6 +10,7 @@ import { SUBVOL_DATA, subvolFromMountOptions } from './ahr-snapshots.js'
 import { pveNotify } from './pve-notify.js'
 import { mismatchCntArgs } from './scrub-schedules.js'
 import {
+  dropCaches,
   MD_DEFAULT_SYNC_MAX,
   MD_DEFAULT_SYNC_MIN,
   mdSysPath,
@@ -62,8 +63,17 @@ import {
  * Error summary): like /proc/mdstat it has no structured alternative on the
  * shipped btrfs-progs, so it joins GT-13's sanctioned text exceptions.
  *
- * Findings notify at `warning` via PVE (§7.2); a clean scrub is silent —
- * healthy/idle shows nothing (dashboard policy §7.3).
+ * The per-band record rides the result (design review 2026-09-14, D1/D8):
+ * `parityMismatches` (phase 1's verdicts), `bandsChecked` and `bandsSkipped`
+ * (what was and was not looked at). A mismatch phase 2 cannot attribute is
+ * PARITY-ONLY ROT — data checksums pass, the parity (or Q) member
+ * disagrees, nothing in ANAS repairs it — and it gets its own second
+ * notification instead of dying in the silence after "phase 2 will name the
+ * files". `checkedArrays` counts bands actually checked, never the pool's
+ * array count.
+ *
+ * Findings notify at `warning` via PVE (§7.2); a clean scrub that checked
+ * every band is silent — healthy/idle shows nothing (dashboard policy §7.3).
  */
 
 const BTRFS = '/usr/bin/btrfs'
@@ -862,8 +872,29 @@ async function probeStripeExtents(
   const stripeStart = Math.floor(stripeLogical / BTRFS_STRIPE_BYTES) * BTRFS_STRIPE_BYTES
   const bad = new Set<number>()
   let extentRange: ExtentBlockRange | null = null
+  /** The page cache is dropped ONCE, lazily — an all-uncompressed stripe never pays for it. */
+  let dropped = false
   for (const extent of candidates) {
     const compressed = extent.compression !== 'none'
+    // D9 (design review 2026-09-14) — O_DIRECT is not enough on a COMPRESSED
+    // extent: btrfs cannot do direct I/O on compressed data and falls back to
+    // the buffered path, so a warm page answers the probe and the block reads
+    // as fine whatever is on the disk. The engine's own cold read drops the
+    // cache for exactly this reason; the attribution probe now does it from
+    // the SAME helper (`dropCaches`, selfheal-io) rather than a second copy.
+    //
+    // A failed drop is not fatal — the probe still runs, and the reason text
+    // for "nothing failed" states the ambiguity rather than claiming the file
+    // was repaired. It is node-wide and cheap; the attribution reads are tiny.
+    if (compressed && !dropped) {
+      dropped = true
+      try {
+        await dropCaches(executor)
+      }
+      catch {
+        // Not root, or a read-only /proc: say nothing, probe anyway.
+      }
+    }
     // The file block range to read: the WHOLE extent when compressed; the
     // part inside the named stripe when not. A range past EOF reads zero
     // bytes and exits 0 — a shrunken file is not a wall of failures.
@@ -1036,7 +1067,7 @@ async function buildFindings(
           extentRange ??= probed.extentRange
         }
         else {
-          unidentifiedReason ??= 'no block of the reported stripe read back with an error — the file was rewritten or repaired since the scrub'
+          unidentifiedReason ??= 'no block failed on re-read: either the file changed since the scrub, or the read was served from cache'
         }
       }
       else {
@@ -1110,9 +1141,10 @@ function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult
   if (findings.length === 0) {
     // Errors with nothing to name: rate-limited kernel warnings, or errors the
     // kernel never attached a path to. Say which, rather than print an empty list.
-    return result.unattributed
-      ? `${head}\n\n${result.unattributed} error(s) name no file (read/IO or metadata errors) — no per-file attribution.`
-      : head
+    const unattributed = result.unattributed
+      ? `\n\n${result.unattributed} error(s) name no file (read/IO or metadata errors) — no per-file attribution.`
+      : ''
+    return `${head}${unattributed}${skippedSection(result.bandsSkipped)}`
   }
   const lines = findings.slice(0, NOTIFY_PATH_LIMIT).map((f) => {
     const blocks = f.outsideMount
@@ -1140,7 +1172,56 @@ function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult
     ...(result.unattributed ? [`${result.unattributed} naming no file`] : []),
     ...(result.truncated ? [`the list is incomplete — the ${AHR_SCRUB_FINDINGS_CAP}-file cap or the kernel-journal read cap was reached`] : []),
   ].join(', ')
-  return `${head}\n\nAffected files (${counts}):\n${lines.join('\n')}`
+  return `${head}\n\nAffected files (${counts}):\n${lines.join('\n')}${skippedSection(result.bandsSkipped)}`
+}
+
+/** The `bandsSkipped` lines a notification carries (D8) — empty when all bands were checked. */
+function skippedSection(skipped: { band: string, reason: string }[] | undefined): string {
+  const list = skipped ?? []
+  if (list.length === 0)
+    return ''
+  return `\n\nNot checked (${list.length} of the pool's bands):\n${
+    list.map(s => `  ${s.band} was not checked: ${s.reason}`).join('\n')}`
+}
+
+/** The parity-only notification's title: the bands, compactly. */
+function parityTitle(parity: { band: string }[]): string {
+  return `AHR scrub: parity mismatch on ${parity.map(p => p.band).join(', ')}`
+}
+
+/**
+ * The parity-only rot notification (design review 2026-09-14, D1).
+ *
+ * Phase 1 counted `mismatch_cnt > 0` on a band and phase 2 attributed no
+ * corrupt file, so the "phase 2 will name the files" promise came back empty.
+ * That silence is itself the finding: with every data block passing its
+ * checksum, the parity (or Q) member is what disagrees with the data — and
+ * nothing in ANAS repairs parity. The one risk to name is the standing one:
+ * at the NEXT disk failure in that band, md reconstructs from the wrong
+ * parity. What the operator does about that is a deliberate decision (no
+ * md-repair advice is given here); the doc anchor records what is known.
+ *
+ * `dataClean` is only ever true when the checksum scrub reported NO errors at
+ * all — then "every file's checksum passes" is a fact. When phase 2 DID
+ * report errors that named no file, the data is not proven clean and the
+ * body says so rather than overclaiming.
+ */
+function parityBody(pool: AhrPool, parity: { band: string, mismatchCnt: number }[], dataClean: boolean): string {
+  const bands = parity.map(p => `${p.band} (${p.mismatchCnt})`).join(', ')
+  const found = dataClean
+    ? 'the checksum scrub found no corrupt files — every file\'s checksum passes'
+    : 'the checksum scrub reported errors but named no file, so this scrub cannot tell whether the rot is in parity or in data'
+  return `Parity mismatch on ${bands}, but ${found}. `
+    + `The rot is in the PARITY (or Q) member of the band, not in the data. `
+    + `Nothing in ANAS repairs parity; at the next disk failure in this band, md would reconstruct from the wrong parity. `
+    + `See docs/AHR-DESIGN.md §7.2 (parity-only rot).`
+}
+
+/** The skipped-bands notification body (D8): what was not looked at, and why. */
+function skippedBody(skipped: { band: string, reason: string }[]): string {
+  return `The scrub did not check every band of the pool:\n${
+    skipped.map(s => `  ${s.band} was not checked: ${s.reason}`).join('\n')
+  }\nThe unchecked band has no verdict from this scrub — run Scrub again once the cause has passed.`
 }
 
 /** One btrfs scrub pass over a filesystem — the scrub's phase 2, on its own. */
@@ -1210,6 +1291,13 @@ export async function scrubAhrPool(
 
   // --- Phase 1/2: md parity checks, one band at a time (sequenced, §4) --------
   // Band-ascending order without copying the pool's array list.
+  // The per-band record (design review 2026-09-14, D1/D8): phase 1's verdicts
+  // and skips ride the result — a parity mismatch phase 2 cannot attribute is
+  // the parity-only-rot case and must survive into the report, and a band the
+  // scrub did not check must never read as coverage.
+  const bandsChecked: string[] = []
+  const bandsSkipped: { band: string, reason: string }[] = []
+  const parityMismatches: { band: string, bandIndex: number, array: string, mismatchCnt: number }[] = []
   const order = pool.arrays.map((_, i) => i)
   order.sort((x, y) => pool.arrays[x].band - pool.arrays[y].band)
   for (const i of order) {
@@ -1253,6 +1341,7 @@ export async function scrubAhrPool(
       const busy = await syncAction(executor, kernelName)
       if (!isIdleAction(busy)) {
         updateProgress(`${label} was not checked (md is running ${busy}) — a parity check would fight the operation md is already running on that band`)
+        bandsSkipped.push({ band: label, reason: `md was running '${busy}' when this band's turn came` })
         continue
       }
       // D4(b): a repair that was killed mid-sequence leaves `sync_max` bounded
@@ -1269,6 +1358,7 @@ export async function scrubAhrPool(
         }
         else {
           updateProgress(`${label} was not checked — its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored, so a check would cover that sliver of the band and suspend there`)
+          bandsSkipped.push({ band: label, reason: `its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored` })
           continue
         }
       }
@@ -1280,6 +1370,7 @@ export async function scrubAhrPool(
     const issue = await executor.exec(MDADM, ['--action=check', array.device])
     if (issue.exitCode !== 0) {
       updateProgress(`${label} was not checked (mdadm --action=check exited ${issue.exitCode}${issue.stderr.trim() ? `: ${issue.stderr.trim()}` : ''})`)
+      bandsSkipped.push({ band: label, reason: `mdadm --action=check exited ${issue.exitCode}${issue.stderr.trim() ? `: ${issue.stderr.trim()}` : ''}` })
       continue
     }
     if (kernelName) {
@@ -1297,6 +1388,7 @@ export async function scrubAhrPool(
       // running, and an unprovable `idle` is the write that aborts a rebuild.
       updateProgress(await cancelBandCheck(executor, array.device, null, label, null))
       updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
+      bandsSkipped.push({ band: label, reason: 'the md device could not be resolved to a kernel name' })
       continue
     }
     // WAIT FOR IT TO START before waiting for it to finish. md takes the write
@@ -1386,6 +1478,14 @@ export async function scrubAhrPool(
             ? `check state unknown on ${label} — not counted (md took a check and is idle again, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing says the check ran to the end)`
             : `check state unknown on ${label} — not counted (md is idle and last ran a check, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing tells this scrub's check from an earlier one)`,
       )
+      // The skip rides the result (D8): the band reads as "not checked", with
+      // the same why the progress line just gave the operator.
+      bandsSkipped.push({
+        band: label,
+        reason: !checkStateUnknown
+          ? 'md never started the check'
+          : 'check state unknown — nothing proves md ran the check to the end',
+      })
       continue
     }
 
@@ -1399,6 +1499,8 @@ export async function scrubAhrPool(
     let checked = true
     /** What md was doing when this band's finish-wait gave up on it (T4). */
     let abandonedOn: string | null = null
+    /** Why the band was not checked, for the result's `bandsSkipped` (D8). */
+    let skippedReason: string | null = null
     if (!alreadyFinished) {
       const finishDeadline = Date.now() + (opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)
       for (;;) {
@@ -1423,12 +1525,14 @@ export async function scrubAhrPool(
           updateProgress(`${label} was not checked (sync_action=${action}) — md is not running this scrub's check on that band`)
           checked = false
           abandonedOn = action
+          skippedReason = `md was running '${action}' instead of this scrub's check`
           break
         }
         if (Date.now() >= finishDeadline) {
           updateProgress(`${label} was not checked (sync_action=${action ?? 'unreadable'}) — still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling; not waiting on it any longer`)
           checked = false
           abandonedOn = action
+          skippedReason = `still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling — the check may still be running`
           break
         }
         updateProgress(`md check on ${label}${md?.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
@@ -1439,6 +1543,7 @@ export async function scrubAhrPool(
       // Never walk away leaving our check armed on the band (T4): the next
       // band's check is issued immediately after this `continue`.
       updateProgress(await cancelBandCheck(executor, array.device, kernelName, label, abandonedOn))
+      bandsSkipped.push({ band: label, reason: skippedReason ?? 'the check was abandoned' })
       continue
     }
 
@@ -1457,12 +1562,17 @@ export async function scrubAhrPool(
       await sleep(mismatchDelay)
       mismatches = await mismatchCount(executor, kernelName)
     }
+    // A verdict exists — the band WAS checked, mismatch or not (D8:
+    // `checkedArrays` counts bands actually checked, either way).
+    bandsChecked.push(label)
     if (mismatches !== null && mismatches > 0) {
+      parityMismatches.push({ band: label, bandIndex: array.band, array: array.device, mismatchCnt: mismatches })
       await pveNotify(
         executor,
         'warning',
         `AHR scrub: parity mismatch on ${label}`,
-        `rot exists in ${label} — phase 2 (running now) will name the files`,
+        `rot exists in ${label} — phase 2 (running now) checks every file's checksum; `
+        + `if a file is affected, it will be named`,
       )
     }
   }
@@ -1487,19 +1597,45 @@ export async function scrubAhrPool(
 
   // Validated at the daemon boundary before it leaves as a job result — the
   // shared schema is the contract, here as at every other boundary (Principle 6).
+  // The per-band record rides with it (D1/D8): parityMismatches,
+  // bandsChecked and bandsSkipped are phase 1's own verdicts, returned —
+  // omitted when empty, like every other additive field on this result.
   const result = AhrScrubResultSchema.parse({
     scrubbed: name,
     btrfsErrors,
-    checkedArrays: pool.arrays.length,
+    checkedArrays: bandsChecked.length,
+    ...(bandsChecked.length > 0 ? { bandsChecked } : {}),
+    ...(bandsSkipped.length > 0 ? { bandsSkipped } : {}),
+    ...(parityMismatches.length > 0 ? { parityMismatches } : {}),
     ...(btrfsErrors !== null ? { errorsReported: countErrorSummary(btrfsErrors) } : {}),
     ...attribution,
   })
 
-  // --- Findings: warn on errors, stay silent when clean (§7.3) ----------------
-  // ONE notification, a richer body: the paths ride the warning the scrub always
-  // sent, never a second message about the same event.
-  if (btrfsErrors !== null)
+  // --- Notifications: one story, in the honest buckets ------------------------
+  // The findings warning is the scrub's own message (§7.3), now carrying the
+  // skipped bands (D8 — a check that skipped a band never reads as coverage).
+  // The PARITY-ONLY case (D1) gets its own notification: phase 1 counted
+  // mismatches and phase 2 named NO file, so the promised attribution never
+  // came and the operator must not read the silence as "false alarm".
+  const findings = result.findings ?? []
+  const parity = result.parityMismatches ?? []
+  const skipped = result.bandsSkipped ?? []
+  if (btrfsErrors !== null) {
     await pveNotify(executor, 'warning', 'AHR scrub found errors', findingsBody(pool, btrfsErrors, result))
+    if (parity.length > 0 && findings.length === 0)
+      await pveNotify(executor, 'warning', parityTitle(parity), parityBody(pool, parity, false))
+  }
+  else if (parity.length > 0) {
+    // Phase 1 said rot exists (its own per-band warning already went out);
+    // this is the SECOND notification that closes the story: phase 2 ran
+    // clean, so the checksum pass has nothing to name — the rot is parity-only.
+    await pveNotify(executor, 'warning', parityTitle(parity), parityBody(pool, parity, true))
+  }
+  else if (skipped.length > 0) {
+    // Nothing found AND something skipped: without this the scrub reports
+    // clean while it never looked at a whole band (D8's false assurance).
+    await pveNotify(executor, 'warning', 'AHR scrub did not check every band', skippedBody(skipped))
+  }
 
   return result
 }

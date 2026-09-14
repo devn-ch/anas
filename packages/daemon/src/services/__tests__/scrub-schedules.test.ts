@@ -197,6 +197,10 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
       assert.equal(st.enabled, false)
       assert.equal(st.mechanism, 'mdcheck-timer')
       assert.match(st.note ?? '', /the OS's monthly md parity check \(mdcheck\) is on/)
+      // Ruling 2026-09-14: the note names it as the DISTRO DEFAULT and says
+      // ANAS puts it back when the last pool's scrub goes off — a rule, not a
+      // claim about this node's history.
+      assert.match(st.note ?? '', /the distro default, and what ANAS puts back when the last pool's periodic scrub is turned off/)
       assert.match(st.note ?? '', /enabling ANAS periodic scrub takes it over \(md parity \+ btrfs checksums, two phases\)/)
       assert.doesNotMatch(st.note ?? '', /double parity check/)
       assert.doesNotMatch(st.note ?? '', /adopted/)
@@ -273,17 +277,55 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
       assert.match(renderScrubTimerUnit((await readScrubSchedule(dir))!), /OnCalendar=Sun \*-01,04,07,10-01\.\.07 03:00:00/)
     })
 
-    it('disabling removes the pool; the units are removed when the list empties; mdcheck stays OFF', async () => {
+    it('disabling one of several removes the pool and leaves mdcheck OFF — ANAS still owns md checks', async () => {
+      await setAhrScrubEnabled(mock, 'ahr0', true, { dir })
+      await setAhrScrubEnabled(mock, 'ahr1', true, { dir })
+      const before = mock.calls.length
+      await setAhrScrubEnabled(mock, 'ahr0', false, { dir })
+      assert.deepEqual((await readScrubSchedule(dir))?.pools, ['ahr1'])
+      const cmds = mock.calls.slice(before).map(c => c.args.join(' '))
+      assert.ok(!cmds.some(c => c.startsWith('enable --now mdcheck')), 'the timer still runs for ahr1 — mdcheck stays off')
+    })
+
+    it('disabling the LAST pool removes the units and RESTORES mdcheck (ruling 2026-09-14)', async () => {
       await setAhrScrubEnabled(mock, 'ahr0', true, { dir })
       await setAhrScrubEnabled(mock, 'ahr1', true, { dir })
       await setAhrScrubEnabled(mock, 'ahr0', false, { dir })
-      assert.deepEqual((await readScrubSchedule(dir))?.pools, ['ahr1'])
-      const cmds = mock.calls.map(c => c.args.join(' '))
-      assert.ok(!cmds.some(c => c.startsWith('enable --now mdcheck')), 'disabling never re-arms mdcheck')
+      const before = mock.calls.length
 
       await setAhrScrubEnabled(mock, 'ahr1', false, { dir })
       assert.equal(await readScrubSchedule(dir), null, 'the empty list removes the units')
       assert.deepEqual(await readdir(dir), [], 'both unit files are gone')
+      // The node is stock again, and a stock node's mdcheck timers are ON: a
+      // node left with NO parity check at all is not helping or guarding.
+      const cmds = mock.calls.slice(before).map(c => c.args.join(' '))
+      assert.ok(
+        cmds.includes('enable --now mdcheck_start.timer mdcheck_continue.timer'),
+        cmds.join(' | '),
+      )
+    })
+
+    it('a FAILED mdcheck restore is logged, not thrown — the toggle still lands', async () => {
+      const lines: string[] = []
+      const origErr = process.stderr.write.bind(process.stderr)
+      process.stderr.write = (s: string | Uint8Array) => {
+        lines.push(String(s))
+        return true
+      }
+      try {
+        await setAhrScrubEnabled(mock, 'ahr0', true, { dir })
+        mock.addFixture({
+          command: SYSTEMCTL,
+          args: mdcheckToggleArgs(true),
+          result: { stdout: '', stderr: 'unit not found', exitCode: 1 },
+        })
+        await setAhrScrubEnabled(mock, 'ahr0', false, { dir })
+        assert.equal(await readScrubSchedule(dir), null, 'the units still went')
+        assert.ok(lines.some(l => l.includes('restore the mdcheck timers')), lines.join(''))
+      }
+      finally {
+        process.stderr.write = origErr
+      }
     })
 
     it('a FAILED mdcheck disable is logged, not thrown — the toggle still lands', async () => {

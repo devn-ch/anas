@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { AhrParityRewriteResult } from '@anas/shared'
+import { AhrParityRewriteResult, AhrScrubParityMismatch } from '@anas/shared'
 import {
   approximateDuration,
   parityRewriteEvidence,
@@ -426,7 +426,7 @@ describe('parityRewriteEvidence — the proof the verb stands on', () => {
   })
 
   it('a scrub that found data corruption refuses with its own code', () => {
-    const answer = parityRewriteEvidence('tank', scrubJob({ btrfsErrors: 'csum_errors=3', parityMismatches: [{ band: 1, mismatchCnt: 8 }] }), 1)
+    const answer = parityRewriteEvidence('tank', scrubJob({ btrfsErrors: 'csum_errors=3', parityMismatches: [{ band: 'tank-r1', bandIndex: 1, array: '/dev/md/tank-r1', mismatchCnt: 8 }] }), 1)
     assert.equal(answer.ok, false)
     assert.equal(answer.ok === false && answer.code, 'data-findings-present')
     assert.ok(answer.ok === false && answer.reason.includes('csum_errors=3'))
@@ -436,13 +436,25 @@ describe('parityRewriteEvidence — the proof the verb stands on', () => {
     const answer = parityRewriteEvidence('tank', scrubJob({
       btrfsErrors: null,
       findings: [],
-      parityMismatches: [{ band: 2, mismatchCnt: 16 }, { band: 1, array: '/dev/md/tank-r1', mismatchCnt: 8 }],
+      parityMismatches: [{ band: 'tank-r2', bandIndex: 2, array: '/dev/md/tank-r2', mismatchCnt: 16 }, { band: 'tank-r1', bandIndex: 1, array: '/dev/md/tank-r1', mismatchCnt: 8 }],
     }), 1)
     assert.deepEqual(answer, { ok: true, mismatchCnt: 8, jobId: 'job-9' })
   })
 
+  it('reads the row shape the SCRUB actually writes — label plus numeric index (merge seam)', () => {
+    // The scrub names the band for the operator (`<pool>-r<n>`) and carries the
+    // index for this verb. Parsing the row through the shared schema first is
+    // the point of the test: the producer and this consumer must agree on ONE
+    // shape, and the evidence gate matches the NUMBER the request body names.
+    const row = AhrScrubParityMismatch.parse({ band: 'tank-r1', bandIndex: 1, array: '/dev/md/tank-r1', mismatchCnt: 8 })
+    const answer = parityRewriteEvidence('tank', scrubJob({ btrfsErrors: null, findings: [], parityMismatches: [row] }), 1)
+    assert.deepEqual(answer, { ok: true, mismatchCnt: 8, jobId: 'job-9' })
+    // …and never matches the label's digits by accident.
+    assert.equal(parityRewriteEvidence('tank', scrubJob({ btrfsErrors: null, findings: [], parityMismatches: [row] }), 2).ok, false)
+  })
+
   it('a clean scrub with a mismatch on ANOTHER band is not', () => {
-    const answer = parityRewriteEvidence('tank', scrubJob({ btrfsErrors: null, parityMismatches: [{ band: 2, mismatchCnt: 16 }] }), 1)
+    const answer = parityRewriteEvidence('tank', scrubJob({ btrfsErrors: null, parityMismatches: [{ band: 'tank-r2', bandIndex: 2, array: '/dev/md/tank-r2', mismatchCnt: 16 }] }), 1)
     assert.equal(answer.ok, false)
     assert.equal(answer.ok === false && answer.code, 'no-parity-mismatch')
   })

@@ -989,6 +989,20 @@
         }
     }
 
+    // Design review 2026-09-14, D15: the self-heal repair engine takes its
+    // cold read through a transient AHR snapshot named `anas-selfheal-<ts>`
+    // (§12 pools put it under @snapshots, where the Snapshots manager lists
+    // it). A leftover — the repair's finally failed to delete it — would sit
+    // here looking like a snapshot an operator made and remembers nothing
+    // about. Rendered as what it is: a transient repair pin, safe to delete
+    // when no repair is running — and never a rollback target, because
+    // rolling back would swap the served @data out from under a repair's
+    // mapping (and it pins one file's subvolume, not the pool).
+    var SELFHEAL_PIN_PREFIX = 'anas-selfheal-';
+    function isSelfhealPin(name) {
+        return (name || '').indexOf(SELFHEAL_PIN_PREFIX) === 0;
+    }
+
     // Format a snapshot's ISO 8601 (local, no timezone) createdAt compactly.
     function fmtSnapCreated(iso) {
         if (!iso) {
@@ -1041,11 +1055,27 @@
             });
         }
         function updateSnapButtons() {
-            var has = !!selectedSnap();
+            var snap = selectedSnap();
+            var has = !!snap;
             var del = win.down('#ahrSnapDelete');
             var rb = win.down('#ahrSnapRollback');
+            // Rollback is disabled FOR a transient repair pin (D15) — it is not
+            // a pool snapshot an operator can travel to; the reason rides the
+            // button's tooltip, never a silent grey-out.
+            var pin = !!snap && isSelfhealPin(snap);
             if (del) { del.setDisabled(!has); }
-            if (rb) { rb.setDisabled(!has); }
+            if (rb) {
+                rb.setDisabled(!has || pin);
+                try {
+                    if (typeof rb.setTooltip === 'function') {
+                        rb.setTooltip(pin
+                            ? t('a transient ANAS repair pin — there is nothing to roll back to; it is deleted when the repair finishes (safe to delete by hand if no repair is running)')
+                            : '');
+                    }
+                } catch (eT) {
+                    // non-fatal
+                }
+            }
         }
 
         function createSnap() {
@@ -1097,22 +1127,81 @@
             if (!snap) {
                 return;
             }
-            // The daemon's 409 warnings state the brief unmount and the
-            // auto-preserved pre-rollback snapshot (nothing is destroyed).
-            ANAS.confirmAndRun({
-                node: node,
-                method: 'post',
-                path: '/ahr/' + encodeURIComponent(name) + '/snapshots/'
-                    + encodeURIComponent(snap) + '/rollback',
-                body: {},
-                view: win,
-                confirmTitle: 'Roll back to snapshot',
-                confirmIntro: t('Rolling') + ' <b>' + enc(name) + '</b> '
-                    + t('back to snapshot') + ' <b>' + enc(snap) + '</b>:',
-                failTitle: 'Rollback failed',
-                successMsg: t('Rollback started on') + ' ' + name,
-                onSubmitted: reload,
-                onComplete: reload,
+            if (isSelfhealPin(snap)) {
+                return; // disabled at the button too — a pin is not a rollback target (D15)
+            }
+            // Design review 2026-09-14, S8: the last completed scrub's findings
+            // are checked for an UNREPAIRED corrupt block inside THIS snapshot
+            // (`outsideMount` paths are filesystem-relative, `@snapshots/<name>/…`)
+            // — rolling back makes that snapshot the served tree, so the rot
+            // rides back in with it. Fail-open: an unreadable job list costs the
+            // warning and nothing else.
+            ANAS.api.get(node, '/jobs?status=completed').then(function (res) {
+                var inside = null;
+                try {
+                    var list = (res && res.data) || [];
+                    var newest = null;
+                    for (var i = 0; i < list.length; i++) {
+                        var job = list[i] || {};
+                        var result = job.result;
+                        if (job.operation !== 'ahr.scrub' || job.status !== 'completed' || !result || result.scrubbed !== name) {
+                            continue;
+                        }
+                        var at = Date.parse(job.completedAt || job.startedAt || job.createdAt || '');
+                        if (!newest || at >= newest.at) {
+                            newest = { at: at, result: result };
+                        }
+                    }
+                    var findings = (newest && newest.result && newest.result.findings) || [];
+                    for (var j = 0; j < findings.length; j++) {
+                        var f = findings[j] || {};
+                        if (f.outsideMount && (f.path || '').indexOf('@snapshots/' + snap + '/') === 0) {
+                            inside = f.path;
+                            break;
+                        }
+                    }
+                } catch (eF) {
+                    inside = null; // non-fatal — the rollback proceeds unwarned
+                }
+                // The daemon's 409 warnings state the brief unmount and the
+                // auto-preserved pre-rollback snapshot (nothing is destroyed).
+                ANAS.confirmAndRun({
+                    node: node,
+                    method: 'post',
+                    path: '/ahr/' + encodeURIComponent(name) + '/snapshots/'
+                        + encodeURIComponent(snap) + '/rollback',
+                    body: {},
+                    view: win,
+                    confirmTitle: 'Roll back to snapshot',
+                    confirmIntro: t('Rolling') + ' <b>' + enc(name) + '</b> '
+                        + t('back to snapshot') + ' <b>' + enc(snap) + '</b>:'
+                        + (inside
+                            ? '<br><br><span style="color:var(--anas-warn,#b06a12);">'
+                                + enc(t('the last scrub found an unrepaired corrupt block inside this snapshot (')
+                                    + inside + t('); rolling back restores it')) + '</span>'
+                            : ''),
+                    failTitle: 'Rollback failed',
+                    successMsg: t('Rollback started on') + ' ' + name,
+                    onSubmitted: reload,
+                    onComplete: reload,
+                });
+            }, function () {
+                // Jobs list unreadable: confirm without the warning (fail-open).
+                ANAS.confirmAndRun({
+                    node: node,
+                    method: 'post',
+                    path: '/ahr/' + encodeURIComponent(name) + '/snapshots/'
+                        + encodeURIComponent(snap) + '/rollback',
+                    body: {},
+                    view: win,
+                    confirmTitle: 'Roll back to snapshot',
+                    confirmIntro: t('Rolling') + ' <b>' + enc(name) + '</b> '
+                        + t('back to snapshot') + ' <b>' + enc(snap) + '</b>:',
+                    failTitle: 'Rollback failed',
+                    successMsg: t('Rollback started on') + ' ' + name,
+                    onSubmitted: reload,
+                    onComplete: reload,
+                });
             });
         }
 
@@ -1136,7 +1225,23 @@
                     border: false,
                     emptyText: t('No snapshots'),
                     columns: [
-                        { text: t('Name'), dataIndex: 'name', flex: 2, renderer: function (v) { return enc(v); } },
+                        {
+                            text: t('Name'),
+                            dataIndex: 'name',
+                            flex: 2,
+                            renderer: function (v) {
+                                // A leftover repair pin is labelled as what it is
+                                // (D15) — never silently indistinguishable from an
+                                // operator snapshot.
+                                if (!isSelfhealPin(v)) {
+                                    return enc(v);
+                                }
+                                return enc(v)
+                                    + ' <span style="color:var(--anas-muted,gray);">('
+                                    + enc(t('transient — ANAS repair pin; safe to delete if no repair is running'))
+                                    + ')</span>';
+                            },
+                        },
                         { text: t('Created'), dataIndex: 'createdAt', flex: 1, renderer: fmtSnapCreated },
                         {
                             text: t('Read-only'),

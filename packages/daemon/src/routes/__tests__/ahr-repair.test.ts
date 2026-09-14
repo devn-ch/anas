@@ -1,4 +1,5 @@
 import type { Job } from '@anas/shared'
+import type { MockFixture } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -42,8 +43,15 @@ const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
  * swappable findmnt — the mount's `subvol=` option is what decides whether the
  * pool is a §12 layout, and therefore whether it has a top-level mount at all.
  */
-function ahrExecutor(mdstat: ExecResult = mockFixtures.ahrMdstat(), findmnt: ExecResult = mockFixtures.ahrFindmnt()): MockExecutor {
+/**
+ * `pre` fixtures register FIRST, so an exact-args fixture here SHADOWS the
+ * helper's own answer for the same argv (mock matching is first-match-wins) —
+ * that is how a test makes a confinement step fail (D12).
+ */
+function ahrExecutor(mdstat: ExecResult = mockFixtures.ahrMdstat(), findmnt: ExecResult = mockFixtures.ahrFindmnt(), pre: MockFixture[] = []): MockExecutor {
   const executor = new MockExecutor()
+  for (const fixture of pre)
+    executor.addFixture(fixture)
   executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mdstat })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
@@ -53,6 +61,12 @@ function ahrExecutor(mdstat: ExecResult = mockFixtures.ahrMdstat(), findmnt: Exe
   executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
   executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: findmnt })
   executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs(MOUNTPOINT), result: mockFixtures.ahrBtrfsUsage() })
+  // D12 confinement: the mountpoint and the pool's LV resolve (no symlinks in
+  // the mock), the LV device identity agrees, and the FILE sits on that LV.
+  executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', MOUNTPOINT], result: { stdout: `${MOUNTPOINT}\n`, stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', '/dev/ahr0/ahr0-vol'], result: { stdout: '/dev/dm-9\n', stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', FILE], result: { stdout: `${FILE}\n`, stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE', '--real', '-T', FILE], result: { stdout: '/dev/ahr0/ahr0-vol\n', stderr: '', exitCode: 0 } })
   return executor
 }
 
@@ -148,6 +162,61 @@ describe('POST /v1/ahr/:name/repair — validation', () => {
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.code, 'CONFLICT')
     assert.match(res.json().error.message, /deleted since the scrub/)
+    await server.close()
+  })
+
+  // Design review 2026-09-14, D12 — lexical confinement is not enough. A
+  // symlink inside the tree passes the string test while pointing somewhere
+  // else; a bind mount laid over part of the tree sits inside the string but
+  // not on the pool's LV; and a path that cannot be resolved at all must never
+  // be written against.
+  it('400 for a symlink that resolves OUTSIDE the pool\'s tree, though the string is inside (D12)', async () => {
+    const LINK = `${MOUNTPOINT}/link.bin`
+    const server = await serverWith(withFiles(ahrExecutor(mockFixtures.ahrMdstat(), mockFixtures.ahrFindmnt(), [
+      { command: '/usr/bin/realpath', args: ['-e', LINK], result: { stdout: '/etc/hosts\n', stderr: '', exitCode: 0 } },
+    ]), [FILE, LINK]))
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: LINK, blocks: [1] }]) })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /resolves to '\/etc\/hosts', which is not a file under/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    await server.close()
+  })
+
+  it('400 for a path whose filesystem is NOT the pool\'s own LV — a bind mount inside the tree is not the pool\'s to write (D12)', async () => {
+    const FOREIGN = `${MOUNTPOINT}/bind-mount.bin`
+    const server = await serverWith(withFiles(ahrExecutor(mockFixtures.ahrMdstat(), mockFixtures.ahrFindmnt(), [
+      { command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE', '--real', '-T', FOREIGN], result: { stdout: '/dev/sdz1\n', stderr: '', exitCode: 0 } },
+      { command: '/usr/bin/realpath', args: ['-e', FOREIGN], result: { stdout: `${FOREIGN}\n`, stderr: '', exitCode: 0 } },
+      { command: '/usr/bin/realpath', args: ['-e', '/dev/sdz1'], result: { stdout: '/dev/sdz1\n', stderr: '', exitCode: 0 } },
+    ]), [FILE, FOREIGN]))
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FOREIGN, blocks: [1] }]) })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /sits on \/dev\/sdz1, not on AHR pool 'ahr0's own device \(\/dev\/dm-9\)/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    await server.close()
+  })
+
+  it('400 for a path that cannot be resolved at all — nothing is written against an unresolvable name (D12)', async () => {
+    const BROKEN = `${MOUNTPOINT}/broken.bin`
+    const server = await serverWith(withFiles(ahrExecutor(mockFixtures.ahrMdstat(), mockFixtures.ahrFindmnt(), [
+      { command: '/usr/bin/realpath', args: ['-e', BROKEN], result: { stdout: '', stderr: 'realpath: No such file or directory', exitCode: 1 } },
+    ]), [FILE, BROKEN]))
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: BROKEN, blocks: [1] }]) })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /could not be resolved on the filesystem \(realpath -e failed\)/)
+    await server.close()
+  })
+
+  it('409 when the MOUNTPOINT itself will not resolve — no repair is minted against it (D12)', async () => {
+    const server = await serverWith(withFiles(ahrExecutor(mockFixtures.ahrMdstat(), mockFixtures.ahrFindmnt(), [
+      { command: '/usr/bin/realpath', args: ['-e', MOUNTPOINT], result: { stdout: '', stderr: 'realpath: No such file or directory', exitCode: 1 } },
+    ]), [FILE]))
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [1] }]) })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.match(res.json().error.message, /could not be resolved on the filesystem — refusing to repair against an unresolvable root/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
     await server.close()
   })
 })
@@ -250,7 +319,11 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
   })
 
   it('a confirm code minted for one selection does not authorize another', async () => {
-    const server = await serverWith(withFiles(ahrExecutor(), [FILE, `${MOUNTPOINT}/other.bin`]))
+    const OTHER = `${MOUNTPOINT}/other.bin`
+    const executor = ahrExecutor()
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', OTHER], result: { stdout: `${OTHER}\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE', '--real', '-T', OTHER], result: { stdout: '/dev/ahr0/ahr0-vol\n', stderr: '', exitCode: 0 } })
+    const server = await serverWith(withFiles(executor, [FILE, OTHER]))
     const first = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
     const code = first.headers['x-anas-confirm-code'] as string
     const swapped = await server.inject({
@@ -261,6 +334,22 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
     })
     assert.equal(swapped.statusCode, 409)
     assert.equal(swapped.json().error.code, 'CONFIRMATION_REQUIRED')
+    await server.close()
+  })
+
+  // Design review 2026-09-14, D13 — "there will be page-cache drops" under
+  // states the cost; the operator decides with numbers. The mock's chunk is
+  // unreadable, so mdadm's 512 KiB default applies: 400 stripes × 512 KiB of
+  // O_DIRECT reads, twice per block, ≈ 200 MiB per sweep.
+  it('the confirm warnings state the per-block cost CONCRETELY (D13)', async () => {
+    const server = await serverWith(withFiles(ahrExecutor(), [FILE]))
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
+    assert.equal(first.statusCode, 409)
+    const warnings = (first.json().error.warnings as string[]).join('\n')
+    assert.match(warnings, /Per block: two node-wide page-cache drops \(drop_caches\), two ~200 MiB read sweeps over the array/)
+    // ahr0's bands are striped (raid5), so the stripe-cache clause rides.
+    assert.match(warnings, /the band's stripe cache at its floor for the duration — a busy node will feel it/)
+    assert.match(warnings, /bring latency-sensitive workloads down first/)
     await server.close()
   })
 })

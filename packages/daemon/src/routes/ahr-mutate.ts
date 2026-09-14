@@ -1,4 +1,4 @@
-import type { AhrRepairFile, IscsiHeldByLun } from '@anas/shared'
+import type { AhrPool, AhrRepairFile, IscsiHeldByLun } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -16,6 +16,7 @@ import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
 import { parityRewriteArray, parityRewriteArrayRefusal, parityRewriteEvidence, parityRewriteWarnings, rewriteBandParity } from '../services/ahr-parity-rewrite.js'
+import { ahrLvPath } from '../services/ahr-paths.js'
 import { repairAhrFiles } from '../services/ahr-repair.js'
 import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../services/ahr-scrub.js'
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
@@ -23,11 +24,13 @@ import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
 import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
+import { mdSysPath, readMdAttrOrNull } from '../services/selfheal-io.js'
 import { readMdGeometry } from '../services/selfheal-map.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
 
 const FINDMNT = '/usr/bin/findmnt'
+const REALPATH = '/usr/bin/realpath'
 const VGS = '/usr/sbin/vgs'
 
 const TRAILING_SLASHES_RE = /\/+$/
@@ -105,6 +108,93 @@ const EXCLUSIVE_OPERATION_NAMES: Record<string, string> = {
   'ahr.scrub': 'a scrub',
   'ahr.repair': 'a repair',
   'ahr.parity-rewrite': 'a parity rewrite',
+}
+
+// ---- Repair path confinement (design review 2026-09-14, D12) ---------------
+//
+// The lexical check (resolvePath + relative) keeps a path STRING under the
+// mountpoint string, and nothing more. A symlink inside the tree, or a bind
+// mount laid over part of it, passes the string test while pointing somewhere
+// else entirely — and this verb writes reconstructed bytes THROUGH md at
+// wherever the path really resolves. So the route resolves the path on the
+// filesystem (`realpath -e`), re-runs the containment check on the canonical
+// form, and then asks findmnt WHICH filesystem the path sits on: it must be
+// the pool's own LV, not a mount that happens to live inside the tree.
+
+/** `realpath -e` — the canonical path, or null when it does not resolve. */
+export async function repairRealPath(executor: CommandExecutor, path: string): Promise<string | null> {
+  try {
+    const r = await executor.exec(REALPATH, ['-e', path])
+    const out = r.exitCode === 0 ? r.stdout.trim() : ''
+    return out === '' ? null : out
+  }
+  catch {
+    return null
+  }
+}
+
+/** `findmnt -T <path>` — the SOURCE device of the filesystem holding the path. */
+export function repairFindmntArgs(path: string): string[] {
+  return ['-n', '-o', 'SOURCE', '--real', '-T', path]
+}
+
+export async function repairMountSource(executor: CommandExecutor, path: string): Promise<string | null> {
+  try {
+    const r = await executor.exec(FINDMNT, repairFindmntArgs(path))
+    const out = r.exitCode === 0 ? r.stdout.trim() : ''
+    return out === '' ? null : out.split('\n')[0]
+  }
+  catch {
+    return null
+  }
+}
+
+// ---- Per-block cost, for the confirm gate (design review 2026-09-14, D13) ---
+
+/** mdadm's default chunk — AHR create passes no `--chunk` flag. */
+export const AHR_MDADM_DEFAULT_CHUNK_BYTES = 512 * 1024
+/** The engine's stripe window on a RAID1 band (selfheal-repair `windowSectors`). */
+export const AHR_RAID1_WINDOW_BYTES = 64 * 1024
+/** Stripes swept either side of the target by the engine's stripe-cache evict. */
+const EVICT_SPAN = 200
+/** A device path's `/dev/` prefix, when resolving to a kernel name. */
+const DEV_PREFIX_RE = /^\/dev\//
+
+/** A band array's chunk in bytes, read live from sysfs; null when unreadable. */
+async function arrayChunkBytes(executor: CommandExecutor, device: string): Promise<number | null> {
+  try {
+    const rp = await executor.exec(REALPATH, [device])
+    const kernel = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : ''
+    if (kernel === '')
+      return null
+    const raw = await readMdAttrOrNull(mdSysPath(kernel), 'chunk_size')
+    const bytes = Number.parseInt(raw ?? '', 10)
+    return Number.isFinite(bytes) && bytes > 0 ? bytes : null
+  }
+  catch {
+    return null
+  }
+}
+
+/**
+ * The O_DIRECT read volume of ONE bounded check's stripe-cache sweep, in MiB
+ * (D13) — the engine sweeps ±{@link EVICT_SPAN} stripes of one chunk each
+ * around every block it repairs, twice per block (pre-check and post-check).
+ * The pool's LARGEST chunk is the honest worst case; a band that cannot be
+ * read falls back to mdadm's own default, which is what the pool was created
+ * with absent a `--chunk` flag.
+ */
+export async function perBlockSweepMiB(executor: CommandExecutor, pool: AhrPool): Promise<number> {
+  let largest = 0
+  for (const array of pool.arrays) {
+    const bytes = array.level === 'raid1'
+      ? AHR_RAID1_WINDOW_BYTES
+      : (await arrayChunkBytes(executor, array.device)) ?? AHR_MDADM_DEFAULT_CHUNK_BYTES
+    largest = Math.max(largest, bytes)
+  }
+  if (largest === 0)
+    largest = AHR_MDADM_DEFAULT_CHUNK_BYTES
+  return Math.max(1, Math.round(EVICT_SPAN * 2 * largest / (1024 * 1024)))
 }
 
 export interface AhrMutationRouteOptions {
@@ -610,11 +700,28 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // `outsideMount` (a corrupt block inside `@snapshots/…` — real, expected,
     // and not reachable through the mounted tree) and `missing` (deleted since
     // the scrub). Both are refused by name, never quietly skipped.
-    const root = resolvePath(pool.mountpoint)
+    //
+    // Confinement is NOT lexical only (design review 2026-09-14, D12): the
+    // string check below is followed by `realpath -e` (a symlink inside the
+    // tree passes the string test while pointing somewhere else), the
+    // containment check re-run on the canonical form, and a findmnt check that
+    // the path's filesystem is the pool's OWN LV (a bind mount laid over part
+    // of the tree fails the string test no better than it fails this one).
+    const lexicalRoot = resolvePath(pool.mountpoint)
+    const root = await repairRealPath(executor, lexicalRoot)
+    if (!root) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `the mountpoint '${pool.mountpoint}' of AHR pool '${name}' could not be resolved on the filesystem — refusing to repair against an unresolvable root` } }
+    }
+    const lvDevice = await repairRealPath(executor, ahrLvPath(pool.name))
+    if (!lvDevice) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `the LV device '${ahrLvPath(pool.name)}' of AHR pool '${name}' could not be resolved — refusing to repair against an unresolvable pool device` } }
+    }
     const files: AhrRepairFile[] = []
     for (const file of parsed.data.files) {
       const abs = resolvePath(file.path)
-      if (abs === root || relative(root, abs).startsWith('..')) {
+      if (abs === lexicalRoot || relative(lexicalRoot, abs).startsWith('..')) {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: `'${file.path}' is not a file under '${pool.mountpoint}' — repair works on the live @data tree only in this cut; a finding outside the mounted tree (a snapshot) cannot be repaired` } }
       }
@@ -622,18 +729,43 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         reply.code(409)
         return { error: { code: 'CONFLICT', message: `'${file.path}' does not exist — the file was deleted since the scrub named it, and there is nothing to repair` } }
       }
+      const real = await repairRealPath(executor, abs)
+      if (!real || real === root || relative(root, real).startsWith('..')) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: real
+          ? `'${file.path}' resolves to '${real}', which is not a file under '${pool.mountpoint}' — repair works on the live @data tree only in this cut`
+          : `'${file.path}' could not be resolved on the filesystem (realpath -e failed) — a repair path must be a real file under '${pool.mountpoint}'` } }
+      }
+      const source = await repairMountSource(executor, real)
+      const sourceReal = source ? await repairRealPath(executor, source) : null
+      if (!source || !sourceReal) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `the filesystem holding '${file.path}' could not be determined (findmnt failed) — refusing to repair a path the pool's own device cannot be confirmed for` } }
+      }
+      if (sourceReal !== lvDevice) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `'${file.path}' sits on ${sourceReal}, not on AHR pool '${name}'s own device (${lvDevice}) — a mount inside the pool's tree does not make its contents the pool's to write` } }
+      }
       // One attempt per block, in ascending order: the same block twice would
       // run the whole sequence twice and the second pass would abort on its own
       // repair ("not corrupt here").
       const unique = [...new Set(file.blocks)]
       unique.sort((a, b) => a - b)
-      files.push({ path: abs, blocks: unique })
+      files.push({ path: real, blocks: unique })
     }
     const blocks = files.reduce((n, f) => n + f.blocks.length, 0)
 
     // Confirm gate: what actually happens to the array, in the operator's terms.
     // The signature carries the exact selection, so a confirm code cannot be
     // replayed against a different set of files or blocks.
+    //
+    // The per-block cost is stated CONCRETELY (design review 2026-09-14, D13):
+    // the engine drops the node's page cache twice per block (probe + cold
+    // read), sweeps ~400 stripes of chunk-sized O_DIRECT reads twice per
+    // block to evict md's stripe cache, and holds the stripe cache at its
+    // floor (17) for the whole run — on a busy node all of that is felt.
+    const sweepMiB = await perBlockSweepMiB(executor, pool)
+    const striped = pool.arrays.some(a => a.level !== 'raid1')
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'ahr.repair',
       params: { name, files },
@@ -642,7 +774,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         'A read-only snapshot of the file\'s subvolume is taken for the duration and removed afterwards',
         `md's rmw_level, sync_min, sync_max and stripe_cache_size on the pool's array(s) are changed for the duration and restored afterwards`,
         'One 4 KiB block per finding is written THROUGH md — and only after the reconstruction from the other members matches the checksum btrfs stored for it',
-        'The node\'s page cache is dropped (drop_caches) once per repaired block, so the verification read afterwards genuinely reaches the disks — a busy node will feel it',
+        `Per block: two node-wide page-cache drops (drop_caches), two ~${sweepMiB} MiB read sweeps over the array, and${striped ? ' the band\'s stripe cache at its floor for the duration — ' : ' '}a busy node will feel it; bring latency-sensitive workloads down first`,
         'Nothing else on the array is touched: no other file, no other block, no parity rewrite beyond the stripes these blocks live in',
         'A block that cannot be proven is left exactly as it is — reported unrepairable, or as corruption that arrived above md, never "fixed"',
       ],

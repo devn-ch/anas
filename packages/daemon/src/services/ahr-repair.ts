@@ -1,7 +1,8 @@
-import type { AhrPool, AhrRepairBlockOutcome, AhrRepairFile, AhrRepairFileOutcome, AhrRepairResult } from '@anas/shared'
+import type { AhrPool, AhrRepairBlockOutcome, AhrRepairFile, AhrRepairFileOutcome, AhrRepairResult, IscsiHeldByLun } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { SelfhealRepairOptions } from './selfheal-repair.js'
-import { AhrRepairResult as AhrRepairResultSchema } from '@anas/shared'
+import { AhrRepairResult as AhrRepairResultSchema, SELFHEAL_CSUM_UNREADABLE } from '@anas/shared'
+import { heldByLunOnce } from './iscsi-held.js'
 import { pveNotify } from './pve-notify.js'
 import { repairBlock } from './selfheal-repair.js'
 
@@ -42,6 +43,16 @@ export interface AhrRepairOptions {
   repair?: RepairBlockFn
   /** Passed straight through to the engine (tests point its runtime dir at a temp path). */
   repairOptions?: SelfhealRepairOptions
+  /**
+   * Does an iSCSI LUN back this file (design review 2026-09-14, D10)? Defaults
+   * to the ONE claims helper (`heldByLunOnce`, the same configfs read every
+   * other gate uses) with the file as the subject — a claim whose backing
+   * path IS the file means the block under repair is a LUN image. Fail-open:
+   * an unreadable configfs answers "not a LUN" and the ordinary restore
+   * advice stands. Tests hand in a fake; a caller may inject the lookup to
+   * share one claims read across a whole request.
+   */
+  lunHeld?: (path: string) => Promise<IscsiHeldByLun | null>
 }
 
 /** Files listed in the notification body before it says "…and N more". */
@@ -51,8 +62,27 @@ const NOTIFY_FILE_LIMIT = 20
 const ABOVE_MD_SENTENCE = 'parity already agreed with the bad data — this implicates something '
   + 'other than the disks (memory, controller, software)'
 
-/** Unrepairable wording — there is one action left, and it is not another repair. */
-const UNREPAIRABLE_SENTENCE = 'restore this file from backup'
+/**
+ * Unrepairable wording (design review 2026-09-14, D10) — there is one action
+ * left, and WHICH one depends on what the file is:
+ *
+ *  - the ordinary case: a file restore;
+ *  - an iSCSI LUN image: restoring "the file" in place is a LUN restore — a
+ *    different verb, refused while a session is live — so the advice names
+ *    the LUN and the two honest sources for it;
+ *  - a `csum-unreadable` block (the D3 code): there was nothing to arbitrate
+ *    against YET — the metadata holding the checksum is itself damaged, and
+ *    metadata is DUP, so a btrfs scrub repairs its copies. Restore advice
+ *    here would overwrite data whose corruption was never confirmed.
+ */
+const RESTORE_FILE_SENTENCE = 'restore this file from backup'
+const CSUM_UNREADABLE_SENTENCE = 'the file\'s checksum could not be read reliably; '
+  + 're-scrub after the metadata is repaired — a btrfs scrub repairs metadata copies'
+
+function lunRestoreSentence(held: IscsiHeldByLun): string {
+  return `this block backs iSCSI LUN ${held.targetIqn}/${held.index} — restore the LUN image `
+    + `from a PBS backup (Backup → Restore as new LUN) or the guest's own backup`
+}
 
 /**
  * Mapping-abort wording (selfheal.7 live proof, F2; its own count since
@@ -86,9 +116,16 @@ function fileLine(file: AhrRepairFileOutcome): string {
 
 /**
  * The notification body: the counts, then the files, then — only when they
- * apply — the two sentences that say what the operator does next.
+ * apply — the sentences that say what the operator does next. Unrepairable
+ * advice is PER FILE (D10): the same bucket can hold a plain data file, a LUN
+ * image and a csum-unreadable block, and the one sentence "restore this file
+ * from backup" was wrong for two of the three.
  */
-function repairBody(pool: string, result: AhrRepairResult): string {
+function repairBody(
+  pool: string,
+  result: AhrRepairResult,
+  unrepairableFiles: { path: string, advice: string }[],
+): string {
   const head = `Repair from parity on AHR pool '${pool}': `
     + `${result.repaired} repaired, ${result.unrepairable} unrepairable, `
     + `${result.aboveMd} above md, ${result.mappingAbort} not corrupt at the mapped location, `
@@ -100,8 +137,14 @@ function repairBody(pool: string, result: AhrRepairResult): string {
   // Each bucket reads ITS OWN count (review R9) — "restore from backup" rides
   // only the true `unrepairable`, never the mapping-aborts that mean the block
   // was fine all along.
-  if (result.unrepairable > 0)
-    tail.push(`Unrepairable blocks have no source of truth left below the checksum tree — ${UNREPAIRABLE_SENTENCE}.`)
+  if (result.unrepairable > 0) {
+    const advice = unrepairableFiles.slice(0, NOTIFY_FILE_LIMIT)
+      .map(f => `  ${f.path} — ${f.advice}`)
+    if (unrepairableFiles.length > NOTIFY_FILE_LIMIT)
+      advice.push(`  …and ${unrepairableFiles.length - NOTIFY_FILE_LIMIT} more`)
+    tail.push('Unrepairable blocks have no source of truth left below the checksum tree'
+      + ` — what to restore, per file:\n${advice.join('\n')}`)
+  }
   if (result.mappingAbort > 0)
     tail.push(MAPPING_ABORT_SENTENCE)
   if (result.aboveMd > 0)
@@ -125,8 +168,20 @@ export async function repairAhrFiles(
   options?: AhrRepairOptions,
 ): Promise<AhrRepairResult> {
   const repair = options?.repair ?? repairBlock
+  // The LUN lookup (D10). Only asked for files that actually came back
+  // unrepairable — the one bucket whose advice names a restore verb.
+  const lunHeld = options?.lunHeld ?? (async (path: string): Promise<IscsiHeldByLun | null> => {
+    try {
+      return await heldByLunOnce(executor, { path })
+    }
+    catch {
+      return null
+    }
+  })
   const total = files.reduce((n, f) => n + f.blocks.length, 0)
   const outcomes: AhrRepairFileOutcome[] = []
+  /** Per-file restore advice for the notification (D10), in request order. */
+  const unrepairableFiles: { path: string, advice: string }[] = []
   let repaired = 0
   let unrepairable = 0
   let aboveMd = 0
@@ -145,7 +200,17 @@ export async function repairAhrFiles(
           { mountpoint: pool.mountpoint, file: file.path, block, pool },
           options?.repairOptions,
         )
-        entry = { block, outcome: outcome.outcome, reason: outcome.reason }
+        // The engine's reason CODE rides through untouched (D3/D10). It is the
+        // one thing in the verdict a parser may key on — the job result, the
+        // notification and the Scrubs window all tell a `csum-unreadable`
+        // block from one that genuinely needs a restore by this field, never
+        // by grepping the operator's sentence.
+        entry = {
+          block,
+          outcome: outcome.outcome,
+          reason: outcome.reason,
+          ...(outcome.reasonCode ? { reasonCode: outcome.reasonCode } : {}),
+        }
       }
       catch (error) {
         // The engine threw rather than reaching a verdict. That block cannot be
@@ -169,6 +234,28 @@ export async function repairAhrFiles(
       blocks.push(entry)
     }
     outcomes.push({ path: file.path, blocks })
+    // Advice classification (D10), once per file that needs it. LUN-ness is a
+    // property of the FILE (its blocks all live in the image); csum-unreadable
+    // is per BLOCK — a file whose unrepairable blocks ALL carry the code gets
+    // the re-scrub advice, a mixed one gets the ordinary restore advice
+    // (which is still true of it: nothing else can prove those blocks).
+    //
+    // The classification reads `reasonCode`, not the reason TEXT: the sentence
+    // is the operator's and may be reworded, the code is the contract.
+    const unrepairableBlocks = blocks.filter(b => b.outcome === 'unrepairable')
+    if (unrepairableBlocks.length > 0) {
+      const held = await lunHeld(file.path)
+      const allCsumUnreadable = unrepairableBlocks
+        .every(b => b.reasonCode === SELFHEAL_CSUM_UNREADABLE)
+      unrepairableFiles.push({
+        path: file.path,
+        advice: held
+          ? lunRestoreSentence(held)
+          : allCsumUnreadable
+            ? CSUM_UNREADABLE_SENTENCE
+            : RESTORE_FILE_SENTENCE,
+      })
+    }
   }
 
   const result = AhrRepairResultSchema.parse({
@@ -191,7 +278,7 @@ export async function repairAhrFiles(
     executor,
     clean ? 'info' : 'warning',
     clean ? 'AHR repair from parity completed' : 'AHR repair from parity left blocks unrepaired',
-    repairBody(pool.name, result),
+    repairBody(pool.name, result, unrepairableFiles),
   )
 
   return result

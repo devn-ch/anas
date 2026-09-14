@@ -1159,9 +1159,21 @@ on the new one. No new captures were needed.
 
 ### Design review (2026-09-14)
 
-A two-altitude read of the arc against `docs/DESIGN.md`, looking for systems-level gaps rather than
-line bugs. Everything below was fixed at the source with a failing-before test.
+A two-altitude read of the arc against `docs/DESIGN.md`, looking for systems-level gaps
+rather than line bugs, together with a review of the shipped scrub/repair reporting.
+Everything below was fixed at the source with a failing-before test.
 
+- **D1 — parity-only rot was invisible (the data-loser's reporting half).** Phase 1 counted
+  `mismatch_cnt > 0`, phase 2 attributed nothing, and the story ended: no record, no attribution,
+  no second notification — a clean-sounding scrub sitting on wrong parity. The result now carries
+  `parityMismatches` (band, array, mismatchCnt) plus `bandsChecked`, the per-band warning promises
+  phase 2's attribution in its new wording ("checks every file's checksum; if a file is affected,
+  it will be named"), and a SECOND notification fires exactly when parity mismatches stand and no
+  file was named: the rot is in the PARITY (or Q) member, nothing in ANAS repairs it, and md would
+  reconstruct from the wrong parity at the next disk failure (docs/AHR-DESIGN.md §7.2). The
+  md-event hook's two promises use the same wording. *(`ahr-scrub.test.ts`: record carried, the
+  second notification fires only in the mismatch-without-findings case — not when a file was
+  named; `md-event.test.sh`; harness: the amber row indicator and the findings-window line.)*
 - **D2 (LOSE-DATA) — never interrupt an md operation ANAS did not start.** `echo idle >
   sync_action` and `mdadm --action=idle` do not mean "cancel my check" — they mean "stop whatever
   you are doing", and what md is very often doing after a member fails is REBUILDING ONTO A SPARE.
@@ -1223,6 +1235,52 @@ line bugs. Everything below was fixed at the source with a failing-before test.
   the Q solve; RAID1 drops the leg from the candidates. *(`selfheal-repair.test.ts`: a sibling
   kicked between the precheck and the reconstruction → `unrepairable` naming the device, nothing
   written; `reconstructionPlan` asserted level by level.)*
+- **D8 — `checkedArrays` claimed coverage it did not have.** It read `pool.arrays.length` however
+  many bands md never checked (never started, taken over, ceiling). It now counts bands ACTUALLY
+  checked, `bandsSkipped` rides the result with the per-band why, a clean-but-incomplete scrub is
+  not silent (its own notification), and the Scrubs row says "N band(s) not checked" with the
+  reasons as the tooltip. *(`ahr-scrub.test.ts`: honest counts + the skipped-band notification;
+  harness: the muted row indicator.)*
+- **D9 — a warm page made a corrupt compressed block read as fine.** btrfs cannot do direct I/O
+  on COMPRESSED data: the read falls back to the buffered path, so `iflag=direct` does not make
+  the attribution probe a real read, and a cached page answers "fine" whatever is on the disk —
+  the same trap GT-9a records for the engine's cold read. The probe now drops the page cache
+  before it reads a compressed extent, through the engine's OWN helper (`dropCaches`,
+  selfheal-io) rather than a second copy of it, once per stripe and only when an extent in it is
+  compressed (an all-uncompressed stripe pays nothing). The "nothing failed" sentence was wrong
+  for the same reason and now states the ambiguity instead of picking a story: "no block failed
+  on re-read: either the file changed since the scrub, or the read was served from cache" — the
+  Scrubs window's tooltip with it. A drop that fails (not root, read-only /proc) costs the drop
+  and nothing else: the probe still runs, and that sentence is already honest about a warm read.
+  *(`ahr-scrub.test.ts`: the drop lands before the first probe read and writes 3, once per
+  stripe; an all-uncompressed stripe drops nothing; the reworded reason. Harness: the tooltip.)*
+- **D10 — unrepairable advice was wrong for two shapes.** "restore this file from backup" was
+  told to an iSCSI LUN image (a different restore verb, refused while a session is live) and to a
+  `csum-unreadable` block (nothing was confirmed yet — the metadata holding the checksum is
+  damaged, and a btrfs scrub repairs metadata copies). The advice is now per file: a LUN-backed
+  file names its LUN and the two honest sources (PBS Backup → Restore as new LUN, or the guest's
+  own backup); an all-csum-unreadable file gets the re-scrub sentence; a mixed file keeps the
+  ordinary restore advice. *(`services/__tests__/ahr-repair.test.ts`: all three classifications,
+  the LUN looked up only for files with unrepairable blocks.)*
+- **D12 — lexical confinement was the only confinement.** A symlink inside the tree passes the
+  string test while pointing somewhere else, and a bind mount laid over part of the tree sits
+  inside the string but not on the pool's LV. The repair route now resolves the mountpoint and
+  every path with `realpath -e`, re-runs the containment check on the canonical form, and asks
+  `findmnt -T <path>` which filesystem the path sits on — it must be the pool's own LV device —
+  refusing 400 (409 for an unresolvable root) with the resolution in the message.
+  *(`routes/__tests__/ahr-repair.test.ts`: symlink escape, wrong-device bind mount, unresolvable
+  path, unresolvable mountpoint.)*
+- **D13 — the confirm gate said "there will be page-cache drops" and left the rest out.** The
+  warning now states the per-block cost: two node-wide page-cache drops, two ~N MiB read sweeps
+  (the engine's ±200-stripe evict twice per block; N from the pool's largest chunk, mdadm's 512 KiB
+  default when unreadable, the 64 KiB mirror window on RAID1) and — on striped bands — the stripe
+  cache at its floor for the duration. *(`routes/__tests__/ahr-repair.test.ts`: the concrete line,
+  ~200 MiB on the mock's 512 KiB fallback.)*
+- **D15 — a leftover repair pin read as a snapshot nobody made.** The engine's transient
+  `anas-selfheal-<ts>` snapshot (AHR-DESIGN §12) is now labelled in the Snapshots manager as
+  "transient — ANAS repair pin; safe to delete if no repair is running", and Rollback is disabled
+  for it with the reason in the tooltip — a pin is not a rollback target. *(harness
+  dialog-contracts: label, tooltip, disabled/enabled edges.)*
 - **S2 — the final cold read is bounded, and says so.** `withTopLevelMount` serialises every holder
   of one pool's top-level mount, so the engine's cold read could join a queue behind a backup run
   for hours — with the block ALREADY WRITTEN and `rmw_level=0` still set on a live array. The read
@@ -1250,6 +1308,25 @@ line bugs. Everything below was fixed at the source with a failing-before test.
   same disks. *(`ahr-scrub.test.ts`: `runningAhrCheck` over two pools, a DELAYED check, a non-AHR
   array ignored, one mdstat read. `ahr-mutate.test.ts`: the route answers 409 with that message and
   no confirm code.)*
+- **S8 — rollback could restore rot without saying so.** Rolling back makes the snapshot the
+  served tree, so an unrepaired corrupt block the last scrub found INSIDE that snapshot rides back
+  in. The rollback confirm now warns, naming the path, when the newest completed scrub for the pool
+  carries an `outsideMount` finding under `@snapshots/<snapshot>/`; fail-open — an unreadable job
+  list costs the warning and nothing else. *(harness dialog-contracts: the warned confirm, the
+  negative case, and the fail-open shape.)*
+- **selfheal.10 (UI) — the parity indicator became the verb's door, and one field seam closed.** The
+  Scrubs row already stated parity-only rot (D1); it now opens `anas-win-scrub-parity`, which lists
+  the bands md counted mismatches on and takes ONE (md repairs a whole array), then the confirm-code
+  flow, then the run's own numbers — `mismatchBefore`/`mismatchAfter` and the outcome by name — back
+  into that window. `still-mismatched` is rendered as "not proven good", never as a finish. With
+  corrupt files on the same scrub the button is dark carrying the daemon's own 409 sentence, and the
+  handler refuses if it is clicked anyway. The seam: the scrub wrote the band as the LABEL
+  `<pool>-r<n>` while the rewrite's evidence gate matched a number, so every rewrite would have
+  refused "did not report a result this verb can read" — the row now carries `bandIndex` beside the
+  label and producer, gate and UI all read that one field rather than a regex over the label.
+  *(harness: the door, the enablement rules, the request body `{ "band": 1 }`, the three result
+  shapes and the running case, and the refused-with-findings window.
+  `ahr-parity-rewrite.test.ts`: the gate reads the row the scrub actually writes.)*
 - **selfheal.10 — Rewrite parity rides these rules rather than reopening them.** The one verb that
   runs `mdadm --action=repair` (`services/ahr-parity-rewrite.ts`) reuses D2's ownership helper, the
   repair engine's own gates and pre-write re-check, and the scrub's phase-2 pass verbatim: both its

@@ -27,8 +27,9 @@ import { DEFAULT_SYSTEMD_DIR } from './snapshot-schedule-units.js'
  * by ONE node-level `anas-scrub.timer` (services/scrub-schedule-units.ts) whose
  * embedded schedule lists the enabled pools. Enabling a pool adds it to that
  * list AND disables mdadm's mdcheck timers (ANAS owns md checks on the node —
- * never double-scheduled); disabling the last pool removes the units and leaves
- * mdcheck OFF (the operator asked for no scrubbing). The `cadence` is
+ * never double-scheduled); disabling the last pool removes the units and puts
+ * mdcheck BACK ON (ruling 2026-09-14): with no ANAS scrub left the node is
+ * stock again, and the stock node has those timers enabled. The `cadence` is
  * node-level: monthly (1st Sunday 03:00) or quarterly.
  *
  * The per-pool toggle is the ONLY thing that writes units and disables mdcheck
@@ -183,7 +184,8 @@ async function isTimerEnabled(executor: CommandExecutor): Promise<boolean> {
  * (mdcheck off, the two-phase timer on) is a decision for the toggle, never
  * something the daemon does by itself.
  */
-const MDCHECK_LEGACY_SENTENCE = 'the OS\'s monthly md parity check (mdcheck) is on; '
+const MDCHECK_LEGACY_SENTENCE = 'the OS\'s monthly md parity check (mdcheck) is on — the distro '
+  + 'default, and what ANAS puts back when the last pool\'s periodic scrub is turned off; '
   + 'enabling ANAS periodic scrub takes it over (md parity + btrfs checksums, two phases)'
 
 /**
@@ -282,13 +284,19 @@ export async function readAhrScrubState(
  *             AND disable the mdcheck timers — ANAS owns md checks on this node,
  *             never double-scheduled.
  *   disable → remove the pool from the list; units removed when the list
- *             empties; mdcheck stays OFF either way.
+ *             empties, and the LAST pool going off RE-ENABLES mdcheck: with no
+ *             ANAS scrub left, the node returns to stock, and the distro
+ *             default is that mdadm's timers are on (ruling 2026-09-14,
+ *             reversing round-2 F2 — a node with no parity check at all is not
+ *             helping or guarding). Turning off one pool out of several leaves
+ *             mdcheck alone: ANAS still owns md checks on the node.
  *
  * `cadence` (optional, node-level) rewrites the one timer from any pool;
  * absent means keep the current one (default `monthly`). Throws on unit-write
- * failure so the mutation surfaces it. The mdcheck disable is best-effort —
+ * failure so the mutation surfaces it. BOTH mdcheck writes are best-effort —
  * with our timer already on, a failed mdcheck disable must still be surfaced
- * (journald line) rather than leave the job "failed" with BOTH mechanisms on.
+ * (journald line) rather than leave the job "failed" with BOTH mechanisms on,
+ * and a failed re-enable costs the distro default, not the toggle.
  */
 export async function setAhrScrubEnabled(
   executor: CommandExecutor,
@@ -309,22 +317,40 @@ export async function setAhrScrubEnabled(
   if (enabled) {
     const nextPools = pools.includes(pool) ? pools : [...pools, pool]
     await writeScrubUnits(executor, dir, { kind: 'ahr-scrub', cadence, pools: nextPools })
-    try {
-      const r = await executor.exec(SYSTEMCTL, mdcheckToggleArgs(false))
-      if (r.exitCode !== 0)
-        console.error(`scrub-schedules: could not disable the mdcheck timers: ${r.stderr.trim() || `exit ${r.exitCode}`}`)
-    }
-    catch (err) {
-      console.error(`scrub-schedules: could not disable the mdcheck timers: ${err instanceof Error ? err.message : String(err)}`)
-    }
+    await setMdcheck(executor, false)
     return
   }
 
   const nextPools = pools.filter(p => p !== pool)
-  if (nextPools.length === 0)
+  if (nextPools.length === 0) {
     await removeScrubUnits(executor, dir)
-  else
+    // The node is back to stock: restore the distro default rather than leave
+    // it with no parity check at all (ruling 2026-09-14).
+    await setMdcheck(executor, true)
+  }
+  else {
     await writeScrubUnits(executor, dir, { kind: 'ahr-scrub', cadence, pools: nextPools })
+  }
+}
+
+/**
+ * Enable or disable mdadm's two mdcheck timers, best-effort.
+ *
+ * ONE helper for both directions (enable takes them over, the last pool going
+ * off gives them back) so the two calls cannot drift, and neither can fail the
+ * toggle: the unit write already happened, and a node whose mdcheck state did
+ * not move is a journald line, not a failed mutation.
+ */
+async function setMdcheck(executor: CommandExecutor, on: boolean): Promise<void> {
+  const verb = on ? 'restore' : 'disable'
+  try {
+    const r = await executor.exec(SYSTEMCTL, mdcheckToggleArgs(on))
+    if (r.exitCode !== 0)
+      console.error(`scrub-schedules: could not ${verb} the mdcheck timers: ${r.stderr.trim() || `exit ${r.exitCode}`}`)
+  }
+  catch (err) {
+    console.error(`scrub-schedules: could not ${verb} the mdcheck timers: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 /**

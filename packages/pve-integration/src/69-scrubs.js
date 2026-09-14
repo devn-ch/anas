@@ -90,12 +90,26 @@
  * already ticked — the toolbar establishes what is repairable, the operator
  * only confirms.
  *
+ * REWRITE PARITY (selfheal.10) is the parity indicator's own verb. When phase 1
+ * counted mismatches on a band and phase 2 named NO corrupt file, the data is
+ * right and the parity is what is wrong — the one case where `mdadm
+ * --action=repair` is the correct thing to run. The indicator on the Scrubs row
+ * is the door: it opens a window listing the bands md counted mismatches on,
+ * one band is picked (md repairs a whole array at a time), the confirm-code
+ * flow states what md will do, and the result — the counter before and after,
+ * and the run's own verdict — comes back into that same window. With corrupt
+ * files on the same scrub the verb is greyed with the reason the daemon would
+ * 409 with: rewriting parity over rot makes it permanent.
+ *
  * Test hooks: view cls 'anas-view anas-view-scrubs', grid cls 'anas-grid-scrub',
  * scrub toggle 'anas-btn-scrub-toggle', run 'anas-btn-scrub-run', stop
  * 'anas-btn-scrub-stop', toolbar repair 'anas-btn-scrub-repair' (selfheal.9),
  * findings window 'anas-win-scrub-findings' with grid
  * 'anas-grid-scrub-findings' (itemId '#findingsGrid'), repair button
- * 'anas-btn-repair-parity' and result panel '#repairResult'.
+ * 'anas-btn-repair-parity' and result panel '#repairResult'; parity window
+ * 'anas-win-scrub-parity' with grid 'anas-grid-scrub-parity' (itemId
+ * '#parityGrid'), button 'anas-btn-parity-rewrite' (itemId '#rewriteParity')
+ * and result panel '#parityResult'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  * Fail-open everywhere: a broken view renders an error panel, never breaks PVE.
@@ -108,6 +122,12 @@
     }
 
     var ANAS = window.ANAS;
+
+    // The ONE reason code a repair verdict carries (shared `SELFHEAL_CSUM_UNREADABLE`).
+    // Spelled once here because this bundle is plain ES5 with no import of the
+    // shared schemas; it must stay identical to the constant in
+    // packages/shared/src/schemas/selfheal.ts.
+    var CSUM_UNREADABLE = 'csum-unreadable';
 
     // Shared schedules helpers (fs-tag chip, pills, poll loop) — ONE copy in
     // 69-schedules-common.js, used by both this view and the Snapshots view.
@@ -235,6 +255,13 @@
             // an AHR pool whose newest scrub was CLEAN — a clean pass displaces
             // an older one's findings — or whose jobs have aged out.
             findings: (kind === 'ahr' && findingsByPool) ? findingsFor(findingsByPool, target.pool) : null,
+            // The per-band record of that same newest scrub (design review
+            // 2026-09-14, D1/D8). PARITY mismatches surface even when phase 2
+            // attributed no file — that is exactly the parity-only-rot case —
+            // and skipped bands surface even when everything else was clean:
+            // neither may read as a clean bill.
+            parity: (kind === 'ahr' && findingsByPool) ? parityFor(findingsByPool, target.pool) : null,
+            skipped: (kind === 'ahr' && findingsByPool) ? skippedFor(findingsByPool, target.pool) : null,
             // A stable per-row key (kind+pool) so selection survives a poll.
             rowKey: kind + ':' + (target.pool || '')
         };
@@ -292,6 +319,23 @@
             return null;
         }
         return entry;
+    }
+
+    // The newest scrub's phase-1 parity verdicts (D1) — present even when the
+    // scrub attributed no corrupt file, because THAT is the parity-only-rot
+    // case: data checksums all passed, the parity member disagrees.
+    function parityFor(byPool, pool) {
+        var entry = byPool[pool];
+        var list = entry && entry.result && entry.result.parityMismatches;
+        return (list && list.length) ? list : null;
+    }
+
+    // The newest scrub's skipped bands (D8) — a band md never checked must not
+    // ride home as coverage.
+    function skippedFor(byPool, pool) {
+        var entry = byPool[pool];
+        var list = entry && entry.result && entry.result.bandsSkipped;
+        return (list && list.length) ? list : null;
     }
 
     // Pool: the shared fs-tag chip ("zfs"/"ahr") + the full pool name — reads
@@ -380,22 +424,68 @@
             return renderRunning(running, rec.get('kind'));
         }
 
-        // An AHR scrub that FOUND something outranks the "md keeps no record"
-        // line: it is the one thing on this row an operator has to act on, and
-        // it is the door to the file list (selfheal.3). The md caveat and the
-        // in-memory scope both ride the tooltip rather than a second cell.
+        // An AHR scrub that FOUND something — or whose phase 1 counted parity
+        // mismatches phase 2 could not attribute (the parity-only-rot case,
+        // D1), or that had to skip a band (D8) — outranks the "md keeps no
+        // record" line: it is the one thing on this row an operator has to act
+        // on. ONE cell, ONE span: the findings link (the door to the file
+        // list), the amber parity indicator, and the muted skipped-band count
+        // share it, each with its own tooltip. The md caveat and the in-memory
+        // scope still ride the trailing muted text rather than a second cell.
         var findings = rec.get('findings');
-        if (findings) {
-            var files = (findings.result.findings || []).length;
-            return '<span class="anas-scrub-findings-link" style="color:var(--anas-warn,#b06a12);'
-                + 'cursor:pointer;text-decoration:underline;" title="'
-                + enc(t('the last AHR scrub that completed since the daemon started found checksum errors — '
-                    + 'click to see the files and their bad blocks. ANAS keeps no scrub history of its own, '
-                    + 'and md records no completion time or result for a check.')) + '">'
-                + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
-                + enc(files + ' ' + (files === 1 ? t('file with checksum errors') : t('files with checksum errors')))
-                + '</span> <span style="color:var(--anas-muted,gray);">'
-                + enc(t('— last completed scrub since the daemon started')) + '</span>';
+        var parity = rec.get('parity');
+        var skipped = rec.get('skipped');
+        if (findings || parity || skipped) {
+            var spans = [];
+            if (findings) {
+                var files = (findings.result.findings || []).length;
+                spans.push('<span class="anas-scrub-findings-link" style="color:var(--anas-warn,#b06a12);'
+                    + 'cursor:pointer;text-decoration:underline;" title="'
+                    + enc(t('the last AHR scrub that completed since the daemon started found checksum errors — '
+                        + 'click to see the files and their bad blocks. ANAS keeps no scrub history of its own, '
+                        + 'and md records no completion time or result for a check.')) + '">'
+                    + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
+                    + enc(files + ' ' + (files === 1 ? t('file with checksum errors') : t('files with checksum errors')))
+                    + '</span>');
+            }
+            if (parity) {
+                var bands = [];
+                for (var p = 0; p < parity.length; p++) {
+                    bands.push(parity[p].band + ' (' + parity[p].mismatchCnt + ')');
+                }
+                // selfheal.10 — the indicator is now a DOOR as well as a
+                // statement: the data-intact/parity-wrong case has a verb
+                // (Rewrite parity), and it lives where the fact is told. With
+                // corrupt files also on the pool the verb is refused (md
+                // repair would bless that rot), and the window says so on a
+                // disabled button rather than hiding the door.
+                var parityTip = findings
+                    ? t('md counted parity mismatches on these bands. The file list names what the checksum '
+                        + 'scrub attributed; a mismatch it cannot attribute is PARITY-ONLY rot — the parity (or Q) '
+                        + 'member disagrees while every file\'s checksum passes. Repair the named files first: '
+                        + 'rewriting parity now would recompute it from corrupt data.')
+                    : t('md counted parity mismatches on these bands, but the checksum scrub found no corrupt '
+                        + 'files — every file\'s checksum passes. The rot is in the PARITY (or Q) member, not in '
+                        + 'the data, and at the next disk failure in this band md would reconstruct from the '
+                        + 'wrong parity. Click to rewrite that band\'s parity from the data as it stands.');
+                spans.push('<span class="anas-scrub-parity-link" style="color:var(--anas-warn,#b06a12);'
+                    + 'cursor:pointer;text-decoration:underline;" title="' + enc(parityTip) + '">'
+                    + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
+                    + enc(t('parity mismatch on') + ' ' + bands.join(', '))
+                    + '</span>');
+            }
+            if (skipped) {
+                var why = [];
+                for (var s = 0; s < skipped.length; s++) {
+                    why.push(skipped[s].band + ': ' + skipped[s].reason);
+                }
+                spans.push('<span style="color:var(--anas-muted,gray);" title="' + enc(why.join('\n')) + '">'
+                    + enc(skipped.length + ' ' + (skipped.length === 1 ? t('band not checked') : t('bands not checked')))
+                    + '</span>');
+            }
+            return '<span>' + spans.join(' ')
+                + ' <span style="color:var(--anas-muted,gray);">'
+                + enc(t('— last completed scrub since the daemon started')) + '</span></span>';
         }
 
         var last = rec.get('lastScrub');
@@ -562,7 +652,11 @@
                 // The toggle's meaning, ON the button (selfheal.4): the ANAS
                 // timer runs the whole two-phase scrub and takes mdcheck over.
                 btnSetTip(btn, !isAhr ? '' : (on
-                    ? t('removes this pool from the node\'s anas-scrub timer; the mdcheck timers stay off')
+                    ? (lastEnabledAhr(scrubGrid, rec)
+                        ? t('removes this pool from the node\'s anas-scrub timer — the last one, so the units go '
+                            + 'and mdadm\'s mdcheck timers are turned back on (the distro default)')
+                        : t('removes this pool from the node\'s anas-scrub timer; the other enabled pools keep it, '
+                            + 'and the mdcheck timers stay off'))
                     : t('adds this pool to the node\'s anas-scrub timer — phase 1 md parity, '
                         + 'then phase 2 btrfs checksums; mdadm\'s mdcheck timers are turned off')));
             }
@@ -641,6 +735,26 @@
         }
     }
 
+    // Is this the LAST enabled AHR pool on the node timer? Turning it off takes
+    // the units with it and hands mdadm's mdcheck timers back (ruling
+    // 2026-09-14) — the operator is told that before they flip it, not after.
+    // Read off the rows the grid already holds; fail-open to "not the last" so
+    // an unreadable store never promises a restore that will not happen.
+    function lastEnabledAhr(scrubGrid, rec) {
+        try {
+            var store = scrubGrid.getStore();
+            var others = 0;
+            store.each(function (r) {
+                if (r !== rec && r.get('kind') === 'ahr' && r.get('enabled')) {
+                    others += 1;
+                }
+            });
+            return others === 0;
+        } catch (e) {
+            return false;
+        }
+    }
+
     function toggleScrub(node, scrubGrid, rec) {
         if (!rec) {
             return;
@@ -684,7 +798,11 @@
                         + (next
                             ? '<br><br>' + enc(t('mdadm\'s mdcheck timers will be turned off.'))
                                 + '<br><br>' + enc(t('The timer is persistent: if this month\'s occurrence was already '
-                                    + 'missed, enabling may START A SCRUB RIGHT AWAY — it can run for many hours.')) : ''),
+                                    + 'missed, enabling may START A SCRUB RIGHT AWAY — it can run for many hours.'))
+                            : (lastEnabledAhr(scrubGrid, rec)
+                                ? '<br><br>' + enc(t('This is the last AHR pool on the timer: the units are removed and '
+                                    + 'mdadm\'s mdcheck timers are turned back on — the node goes back to the distro default.'))
+                                : '')),
                     function (btn) {
                         if (btn === 'yes') { doToggle(); }
                     }
@@ -790,7 +908,7 @@
         var list = rec.get('blockList');
         var tip = n
             ? (t('failing 4 KiB file blocks') + ': ' + list)
-            : t('no block inside the reported stripe failed to read — the file was rewritten or repaired since the scrub');
+            : t('no block failed on re-read: either the file changed since the scrub, or the read was served from cache');
         meta.tdAttr = 'data-qtip="' + enc(tip) + '"';
         return (n
             ? '<span style="color:var(--anas-warn,#b06a12);">' + n + '</span>'
@@ -985,8 +1103,49 @@
         // corrupt at the mapped location — the engine wrote nothing, and the
         // advice is the opposite of a restore.
         if (Number(res.unrepairable || 0) > 0) {
-            lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
-                + 'those blocks — restore this file from backup.')));
+            // D3/D10 — the advice splits on the engine's reason CODE, not on
+            // the reason text: a file whose unrepairable blocks ALL read
+            // `csum-unreadable` had nothing to arbitrate against yet (the
+            // metadata holding the checksum is itself damaged, and metadata is
+            // DUP, so a btrfs scrub repairs its copies). Telling the operator
+            // to restore THAT file overwrites data never proven bad. The same
+            // per-file rule the daemon's notification uses (ahr-repair.ts).
+            var csumFiles = [];
+            var restoreFiles = 0;
+            for (var f = 0; f < files.length; f++) {
+                var bad = [];
+                var fb = files[f].blocks || [];
+                for (var b = 0; b < fb.length; b++) {
+                    if (fb[b].outcome === 'unrepairable') {
+                        bad.push(fb[b]);
+                    }
+                }
+                if (!bad.length) {
+                    continue;
+                }
+                var allCsum = true;
+                for (var c = 0; c < bad.length; c++) {
+                    if (bad[c].reasonCode !== CSUM_UNREADABLE) {
+                        allCsum = false;
+                    }
+                }
+                if (allCsum) {
+                    csumFiles.push(files[f].path);
+                }
+                else {
+                    restoreFiles += 1;
+                }
+            }
+            if (restoreFiles > 0 || !csumFiles.length) {
+                lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
+                    + 'those blocks — restore this file from backup.')));
+            }
+            if (csumFiles.length) {
+                lines.push(enc(t('The checksum could not be read reliably for')
+                    + ' ' + csumFiles.join(', ') + ' — '
+                    + t('nothing about those blocks is known yet, so do NOT restore from backup: '
+                        + 're-scrub after the metadata is repaired — a btrfs scrub repairs metadata copies.')));
+            }
         }
         if (Number(res.mappingAbort || 0) > 0) {
             lines.push(enc(Number(res.mappingAbort || 0) + ' ' + t('block(s) were not corrupt at the mapped location '
@@ -1074,26 +1233,258 @@
     // The row's findings indicator is the door — a click anywhere ELSE on the
     // row is a plain selection. One door, one window.
     function onScrubItemClick(node, view, rec, item, index, e) {
-        var entry = rec ? rec.get('findings') : null;
-        if (!entry) {
+        if (!rec) {
             return;
         }
-        var onLink = true;
+        var entry = rec.get('findings');
+        var parity = rec.get('parity');
+        // Which of the cell's two links was hit. A click anywhere ELSE on the
+        // row is a plain selection; when the event cannot be read, the
+        // findings door is the one that opens (it has always been the default).
+        var hit = entry ? 'findings' : (parity ? 'parity' : '');
         try {
             if (e && typeof e.getTarget === 'function') {
-                onLink = !!e.getTarget('.anas-scrub-findings-link');
+                if (e.getTarget('.anas-scrub-parity-link')) {
+                    hit = 'parity';
+                } else if (e.getTarget('.anas-scrub-findings-link')) {
+                    hit = 'findings';
+                } else {
+                    hit = '';
+                }
             }
         } catch (eT) {
-            onLink = true;
-        }
-        if (!onLink) {
-            return;
+            // unreadable event — keep the default above
         }
         try {
-            showScrubFindings(node, rec.get('pool'), entry.result);
+            if (hit === 'parity' && parity) {
+                showParityMismatches(node, rec.get('pool'), parity, !!entry);
+            } else if (hit === 'findings' && entry) {
+                showScrubFindings(node, rec.get('pool'), entry.result);
+            }
         } catch (eW) {
             ANAS.warn('scrub findings failed: ' + ANAS.errText(eW));
         }
+    }
+
+    // ---- Rewrite parity (selfheal.10) ---------------------------------------
+    //
+    // The ONE verb that runs `mdadm --action=repair`, and it lives where its
+    // evidence is told: the parity-mismatch indicator on the Scrubs row. The
+    // case is narrow on purpose — md counted mismatches on a band AND the
+    // checksum pass found nothing across the pool, so the DATA is right and
+    // the parity is what is wrong. Anything else and md repair would blindly
+    // bless whatever the data says, which is how parity rewrites destroy files.
+    //
+    // The window is one band at a time: `mdadm --action=repair` walks a whole
+    // array, and the operator confirms one array's worth of reading with that
+    // array's own numbers in front of them.
+    //
+    // Test hooks: window 'anas-win-scrub-parity' with grid
+    // 'anas-grid-scrub-parity' (itemId '#parityGrid'), button
+    // 'anas-btn-parity-rewrite' (itemId '#rewriteParity') and result panel
+    // '#parityResult'.
+
+    // Is the verb available at all, and if not, WHY — one rule, used by the
+    // button and by nothing else. `hasFindings` is the pool's last scrub
+    // naming corrupt files; the daemon refuses on it too (409
+    // `data-findings-present`), and saying it here means the operator is not
+    // sent to a refusal to find out.
+    function parityRewriteBlocked(win, hasFindings) {
+        if (hasFindings) {
+            return t('the same scrub named corrupt files — repair those from parity first; rewriting parity now '
+                + 'would recompute it from the corrupt data and make the rot permanent');
+        }
+        var grid = win.down('#parityGrid');
+        var sel = grid && typeof grid.getSelection === 'function' ? grid.getSelection() : [];
+        if (!sel || !sel.length) {
+            return t('select the band to rewrite');
+        }
+        if (sel.length > 1) {
+            return t('one band at a time — md repairs a whole array, and the estimate is that array\'s');
+        }
+        if (!(Number(sel[0].get('bandIndex')) > 0)) {
+            return t('this scrub did not record the band number — scrub the pool again');
+        }
+        return '';
+    }
+
+    function updateParityButton(win, hasFindings) {
+        var btn = win.down('#rewriteParity');
+        if (!btn) {
+            return;
+        }
+        var why = parityRewriteBlocked(win, hasFindings);
+        btn.setDisabled(!!why);
+        btnSetTip(btn, why);
+    }
+
+    // The result, in the same window the request was made from: what md's
+    // counter said before and after, and the run's own verdict. `rewritten` is
+    // the only outcome that means the parity is now proven good.
+    function showParityResult(win, job) {
+        var panel = win.down('#parityResult');
+        if (!panel) {
+            return;
+        }
+        panel.setHidden(false);
+        if (!job || job.status !== 'completed' || !job.result) {
+            panel.update(enc(t('The parity rewrite is still running. It reads every member of the band twice; '
+                + 'its outcome arrives as a PVE notification.')));
+            return;
+        }
+        var res = job.result;
+        var before = (res.mismatchBefore === null || res.mismatchBefore === undefined)
+            ? t('unknown') : String(res.mismatchBefore);
+        var after = (res.mismatchAfter === null || res.mismatchAfter === undefined)
+            ? t('unknown') : String(res.mismatchAfter);
+        var lines = [enc(t('Band') + ' r' + Number(res.band) + ': ' + t('mismatches before') + ' ' + before
+            + ' · ' + t('after') + ' ' + after + ' · ' + t('outcome') + ' ' + String(res.outcome || ''))];
+        if (res.outcome === 'rewritten') {
+            lines.push(enc(t('The band\'s parity was recomputed from the data it holds, and the verifying check '
+                + 'counted 0. Nothing in the data was written.')));
+        } else if (res.outcome === 'still-mismatched') {
+            lines.push(enc(t('md repaired the band and the check afterwards STILL counted mismatches — the parity '
+                + 'is not proven good. Do not treat this band as healthy; the PVE notification has the detail.')));
+        }
+        if (res.reason) {
+            lines.push(enc(String(res.reason)));
+        }
+        if (res.btrfsErrors) {
+            lines.push(enc(t('The fresh checksum scrub found errors and nothing was written to md') + ': '
+                + String(res.btrfsErrors)));
+        }
+        panel.update(lines.join('<br>'));
+    }
+
+    function rewriteParity(node, pool, win, hasFindings) {
+        if (parityRewriteBlocked(win, hasFindings)) {
+            return;
+        }
+        var grid = win.down('#parityGrid');
+        var rec = grid.getSelection()[0];
+        var band = Number(rec.get('bandIndex'));
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/ahr/' + encodeURIComponent(pool) + '/parity-rewrite',
+            body: { band: band },
+            view: win,
+            // Three md passes over a whole band — a fresh checksum scrub, the
+            // repair, and the verifying check. Hours, not the default seconds.
+            maxMs: 120000,
+            confirmTitle: t('Rewrite parity'),
+            confirmIntro: enc(t('Rewriting parity on band') + ' r' + band + ' ' + t('of pool') + ' ' + pool
+                + ' (' + t('md counted') + ' ' + Number(rec.get('mismatchCnt')) + ' ' + t('mismatch(es) there')
+                + '). ' + t('The daemon will:')),
+            confirmButtonText: t('Rewrite parity'),
+            failTitle: t('Rewrite parity failed'),
+            onSubmitted: function () {
+                ANAS.toast(t('Parity rewrite started on') + ' ' + pool + ' r' + band);
+                updateParityButton(win, hasFindings);
+            },
+            onComplete: function (job) {
+                try {
+                    showParityResult(win, job);
+                } catch (e) {
+                    ANAS.warn('parity rewrite result failed: ' + ANAS.errText(e));
+                }
+            }
+        });
+    }
+
+    // The window behind the parity indicator: the bands md counted mismatches
+    // on, and the verb. `hasFindings` is the pool's same-scrub corrupt-file
+    // verdict — it does not hide the window, it disables the verb and says why.
+    function showParityMismatches(node, pool, parity, hasFindings) {
+        var rows = [];
+        for (var i = 0; i < parity.length; i++) {
+            var pm = parity[i] || {};
+            rows.push({
+                band: pm.band || '',
+                bandIndex: Number(pm.bandIndex) || 0,
+                array: pm.array || '',
+                mismatchCnt: Number(pm.mismatchCnt) || 0
+            });
+        }
+        if (!rows.length) {
+            return false;
+        }
+
+        var win = Ext.create('Ext.window.Window', {
+            cls: 'anas-win-scrub-parity',
+            title: t('Parity mismatch') + ' — ' + pool,
+            modal: true,
+            width: 660,
+            height: 340,
+            resizable: true,
+            layout: { type: 'vbox', align: 'stretch' },
+            items: [
+                {
+                    xtype: 'component',
+                    padding: '10 12 6 12',
+                    html: enc(hasFindings
+                        ? t('md counted parity mismatches on these bands, and the same scrub named corrupt files. '
+                            + 'Repair those from parity first — rewriting parity over corrupt data makes the rot permanent.')
+                        : t('md counted parity mismatches on these bands and the checksum pass found nothing: the data '
+                            + 'is right and the parity is what is wrong. Rewriting recomputes that band\'s parity from '
+                            + 'the data as it stands — a fresh checksum scrub runs first, and any finding aborts it.'))
+                },
+                {
+                    xtype: 'gridpanel',
+                    itemId: 'parityGrid',
+                    cls: 'anas-grid-scrub-parity',
+                    flex: 1,
+                    border: false,
+                    // One band at a time: md repairs a whole array.
+                    selModel: { selType: 'checkboxmodel', mode: 'SINGLE' },
+                    store: Ext.create('Ext.data.Store', {
+                        fields: ['band', 'bandIndex', 'array', 'mismatchCnt'],
+                        data: rows
+                    }),
+                    columns: [
+                        { text: t('Band'), dataIndex: 'band', flex: 1, minWidth: 160,
+                            sortable: false, menuDisabled: true,
+                            renderer: function (v) { return '<span style="font-family:monospace;">' + enc(v) + '</span>'; } },
+                        { text: t('md array'), dataIndex: 'array', flex: 1, minWidth: 160,
+                            sortable: false, menuDisabled: true,
+                            renderer: function (v) { return '<span style="font-family:monospace;">' + enc(v) + '</span>'; } },
+                        { text: t('Mismatches'), dataIndex: 'mismatchCnt', width: 130, align: 'center',
+                            sortable: false, menuDisabled: true,
+                            renderer: function (v) {
+                                return '<span style="color:var(--anas-warn,#b06a12);">' + Number(v) + '</span>';
+                            } }
+                    ],
+                    listeners: {
+                        selectionchange: function () { updateParityButton(win, hasFindings); }
+                    }
+                },
+                {
+                    xtype: 'component',
+                    itemId: 'parityResult',
+                    cls: 'anas-scrub-parity-result',
+                    hidden: true,
+                    padding: '6 12 10 12',
+                    html: ''
+                }
+            ],
+            buttons: [
+                {
+                    text: t('Rewrite parity'),
+                    itemId: 'rewriteParity',
+                    cls: 'anas-btn-parity-rewrite',
+                    iconCls: 'fa fa-refresh',
+                    disabled: true,
+                    handler: function () { rewriteParity(node, pool, win, hasFindings); }
+                },
+                {
+                    text: t('Close'),
+                    handler: function () { win.close(); }
+                }
+            ]
+        });
+        win.show();
+        updateParityButton(win, hasFindings);
+        return true;
     }
 
     // `preselect` (selfheal.9) — the toolbar Repair opens this same window with
@@ -1134,6 +1525,20 @@
             });
         }
 
+        // The per-band record rides the window too (design review D1): when the
+        // scrub's phase 1 counted parity mismatches, say so here — the result
+        // does not map findings to bands, so the line stays neutral about what
+        // was attributed and points at the notification for the explanation.
+        var parity = (result && result.parityMismatches) || [];
+        var parityBands = [];
+        for (var pm = 0; pm < parity.length; pm++) {
+            parityBands.push(parity[pm].band + ' (' + parity[pm].mismatchCnt + ')');
+        }
+        var parityLine = parityBands.length
+            ? '<br>' + enc(t('md counted parity mismatches on') + ' ' + parityBands.join(', ')
+                + ' — ' + t('a mismatch the checksum scrub cannot attribute is parity-only rot; the PVE notification explains it'))
+            : '';
+
         var win = Ext.create('Ext.window.Window', {
             cls: 'anas-win-scrub-findings',
             title: t('Scrub findings') + ' — ' + pool,
@@ -1146,7 +1551,7 @@
                 {
                     xtype: 'component',
                     padding: '10 12 6 12',
-                    html: enc(t('These files failed checksum verification.') + ' ' + findingsCounts(result, rows.length))
+                    html: enc(t('These files failed checksum verification.') + ' ' + findingsCounts(result, rows.length)) + parityLine
                 },
                 {
                     xtype: 'gridpanel',
@@ -1295,7 +1700,9 @@
                 { name: 'phases', type: 'auto' },
                 { name: 'lastScrub', type: 'auto' },
                 { name: 'running', type: 'auto' },
-                { name: 'findings', type: 'auto' }],
+                { name: 'findings', type: 'auto' },
+                { name: 'parity', type: 'auto' },
+                { name: 'skipped', type: 'auto' }],
             data: [],
             sorters: [{ property: 'kind', direction: 'ASC' }, { property: 'pool', direction: 'ASC' }]
         });

@@ -208,7 +208,10 @@ export function parityRewriteWarnings(poolName: string, array: ParityRewriteArra
  * hiding is a type import.
  */
 const ParityMismatchRow = z.object({
-  band: z.number().int().positive(),
+  /** The band LABEL (`<pool>-r<n>`) — the operator's name for it. */
+  band: z.string().min(1),
+  /** The same band as the number this verb's body names. */
+  bandIndex: z.number().int().positive(),
   array: z.string().optional(),
   mismatchCnt: z.number().int().nonnegative(),
 })
@@ -265,7 +268,7 @@ export function parityRewriteEvidence(poolName: string, job: Job | undefined, ba
       reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) reports no per-band parity counts — scrub the pool again and rewrite parity from that run's findings`,
     }
   }
-  const row = rows.find(r => r.band === band)
+  const row = rows.find(r => r.bandIndex === band)
   if (!row || row.mismatchCnt <= 0) {
     return {
       ok: false,

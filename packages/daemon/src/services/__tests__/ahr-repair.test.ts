@@ -1,7 +1,7 @@
-import type { AhrPool, SelfhealOutcome, SelfhealOutcomeKind } from '@anas/shared'
+import type { AhrPool, SelfhealOutcome, SelfhealOutcomeKind, SelfhealReasonCode } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { AhrRepairRequest, AhrRepairResult } from '@anas/shared'
+import { AhrRepairRequest, AhrRepairResult, SELFHEAL_CSUM_UNREADABLE } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { repairAhrFiles } from '../ahr-repair.js'
 
@@ -34,8 +34,8 @@ function pool(over?: Partial<AhrPool>): AhrPool {
   } as unknown as AhrPool
 }
 
-function outcome(file: string, block: number, kind: SelfhealOutcomeKind, reason: string): SelfhealOutcome {
-  return { outcome: kind, reason, file, block, pool: 'tank', array: '/dev/md127', member: '/dev/sdb1', stripe: 1, steps: [] }
+function outcome(file: string, block: number, kind: SelfhealOutcomeKind, reason: string, code?: SelfhealReasonCode): SelfhealOutcome {
+  return { outcome: kind, reason, ...(code ? { reasonCode: code } : {}), file, block, pool: 'tank', array: '/dev/md127', member: '/dev/sdb1', stripe: 1, steps: [] }
 }
 
 /** An executor that answers everything (the notification's perl call included). */
@@ -253,6 +253,126 @@ describe('AHR repair job — the one notification', () => {
     // "restore from backup" belongs to the TRUE unrepairable only.
     assert.match(notify.body, /restore this file from backup/)
     assert.match(notify.body, /they need no restore/)
+  })
+
+  // Design review 2026-09-14, D10 — "restore this file from backup" was wrong
+  // for two shapes: an iSCSI LUN image (a different restore verb, refused while
+  // a session is live) and a csum-unreadable block (nothing was confirmed yet).
+  it('a LUN-backed unrepairable file is told to restore the LUN, not the file (D10)', async () => {
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: `${MOUNTPOINT}/lun-images/win.lun`, blocks: [4] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(req.file, req.block, 'unrepairable', 'both legs unreadable'),
+        lunHeld: async path => path === `${MOUNTPOINT}/lun-images/win.lun`
+          ? {
+              targetIqn: 'iqn.2026-01.org.anas:storage.tank',
+              index: 3,
+              name: 'win-lun-3',
+              backingPath: `${MOUNTPOINT}/lun-images/win.lun`,
+              connectedInitiators: [],
+              detail: 'held by iqn.1998-01.com.vmware:esx1',
+            }
+          : null,
+      },
+    )
+    const notify = notification(exec)!
+    assert.match(
+      notify.body,
+      new RegExp(`${MOUNTPOINT.replace(/\//g, '\\/')}/lun-images\\/win\\.lun — this block backs iSCSI LUN iqn\\.2026-01\\.org\\.anas:storage\\.tank/3`),
+    )
+    assert.match(notify.body, /Restore as new LUN/)
+    assert.doesNotMatch(notify.body, /restore this file from backup/)
+  })
+
+  it('a csum-unreadable unrepairable block is told to re-scrub, not restore (D10)', async () => {
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(
+          req.file,
+          req.block,
+          'unrepairable',
+          'the metadata copy holding the checksum is damaged',
+          SELFHEAL_CSUM_UNREADABLE,
+        ),
+        // No LUN claim is even consulted: csum-unreadable classification stands
+        // on its own, and the default configfs lookup fail-opens to null.
+      },
+    )
+    const notify = notification(exec)!
+    assert.match(notify.body, /\/a\.bin — the file's checksum could not be read reliably; re-scrub after the metadata is repaired/)
+    assert.doesNotMatch(notify.body, /restore this file from backup/)
+  })
+
+  it('the engine\'s reason CODE rides into the per-block entry — the result is what a parser reads', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1, 2] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(
+          req.file,
+          req.block,
+          req.block === 1 ? 'unrepairable' : 'repaired',
+          req.block === 1 ? 'the metadata copy holding the checksum is damaged' : 'written back and read cold',
+          req.block === 1 ? SELFHEAL_CSUM_UNREADABLE : undefined,
+        ),
+      },
+    )
+    // Carried through, and ONLY on the block that earned it — the other entry
+    // has no code at all rather than a null.
+    assert.equal(result.files[0].blocks[0].reasonCode, SELFHEAL_CSUM_UNREADABLE)
+    assert.equal(result.files[0].blocks[1].reasonCode, undefined)
+    // And it survives the shared schema on the way out (Principle 6).
+    assert.equal(AhrRepairResult.parse(result).files[0].blocks[0].reasonCode, SELFHEAL_CSUM_UNREADABLE)
+  })
+
+  it('the advice keys on the CODE, not on the reason text — a reworded sentence still classifies', async () => {
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1] }],
+      () => {},
+      {
+        // The sentence says nothing a grep could match; only the code does.
+        repair: async (_e, req) => outcome(req.file, req.block, 'unrepairable', 'nothing arbitrated this block', SELFHEAL_CSUM_UNREADABLE),
+      },
+    )
+    const notify = notification(exec)!
+    assert.match(notify.body, /re-scrub after the metadata is repaired/)
+    assert.doesNotMatch(notify.body, /restore this file from backup/)
+  })
+
+  it('a MIXED unrepairable file (one csum-unreadable, one other) keeps the ordinary restore advice (D10)', async () => {
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1, 2] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(
+          req.file,
+          req.block,
+          'unrepairable',
+          req.block === 1 ? 'the metadata copy holding the checksum is damaged' : 'both legs unreadable',
+          req.block === 1 ? SELFHEAL_CSUM_UNREADABLE : undefined,
+        ),
+      },
+    )
+    const notify = notification(exec)!
+    assert.match(notify.body, /\/a\.bin — restore this file from backup/)
   })
 
   it('the notification names all four counts, and they add up (review R9)', async () => {

@@ -683,6 +683,43 @@ export const AhrScrubFinding = z.object({
 export type AhrScrubFinding = z.infer<typeof AhrScrubFinding>
 
 /**
+ * One band's phase-1 parity verdict, carried into the result (design review
+ * 2026-09-14, D1): `mismatch_cnt > 0` on a band whose phase 2 finds nothing is
+ * the PARITY-ONLY ROT case, and the per-band verdict phase 1 already computes
+ * must survive into the result — otherwise the "phase 2 will name the files"
+ * promise dies silently when phase 2 has nothing to name.
+ *
+ * `band` is the band label the scrub uses everywhere else
+ * (`<pool>-r<band>`); `array` is the md device the check ran on; `mismatchCnt`
+ * is the counter as md finalized it.
+ *
+ * `bandIndex` is the SAME band as a number — what `POST /ahr/:name/
+ * parity-rewrite` names in its body (selfheal.10) and what the rewrite's
+ * evidence gate matches on. It is carried rather than parsed back out of the
+ * label: the scrub has the index in hand when it writes the row, and a
+ * consumer digging it out of `<pool>-r<n>` with a regex would be a second,
+ * breakable definition of the same fact.
+ */
+export const AhrScrubParityMismatch = z.object({
+  band: z.string().min(1),
+  bandIndex: z.number().int().positive(),
+  array: z.string().min(1),
+  mismatchCnt: z.number().int().nonnegative(),
+})
+export type AhrScrubParityMismatch = z.infer<typeof AhrScrubParityMismatch>
+
+/**
+ * A band this scrub did NOT check (design review 2026-09-14, D8). `band` is
+ * the same label form as {@link AhrScrubParityMismatch.band}; `reason` is the
+ * operator-facing why, verbatim from the phase-1 walk.
+ */
+export const AhrScrubSkippedBand = z.object({
+  band: z.string().min(1),
+  reason: z.string().min(1),
+})
+export type AhrScrubSkippedBand = z.infer<typeof AhrScrubSkippedBand>
+
+/**
  * The result of an AHR scrub job (POST /v1/ahr/:name/scrub).
  *
  * Everything past `checkedArrays` is story selfheal.3 and OPTIONAL: a result
@@ -698,8 +735,35 @@ export const AhrScrubResult = z.object({
   scrubbed: PoolName,
   /** btrfs `Error summary:` line when errors were found, else null (raw, verbatim). */
   btrfsErrors: z.string().nullable(),
-  /** Number of md arrays checked. */
+  /**
+   * How many bands the scrub ACTUALLY checked (design review 2026-09-14, D8)
+   * — never the pool's array count, which a band md never started, took
+   * another sync op on, or froze under makes a lie. What was skipped is said
+   * in `bandsSkipped`; `checkedArrays + bandsSkipped.length` is the pool's
+   * array count.
+   */
   checkedArrays: z.number().int().nonnegative(),
+  /**
+   * The bands whose phase-1 check ran and delivered a verdict (D8). Present
+   * on every result from a daemon that records it; absent from an older one.
+   */
+  bandsChecked: z.array(z.string()).optional(),
+  /**
+   * The bands NOT checked, each with its why (D8) — md never started the
+   * check, took a resync/recover/reshape instead, froze, hit the wait
+   * ceiling, or its device would not resolve. A non-empty list rides the
+   * scrub notification and the Scrubs row: a check that silently skipped a
+   * band reads as coverage it does not have.
+   */
+  bandsSkipped: z.array(AhrScrubSkippedBand).optional(),
+  /**
+   * The phase-1 parity verdicts that counted mismatches (D1). When phase 2
+   * attributes NO corrupt file against these, the rot is PARITY-ONLY: data
+   * passed every checksum, the parity (or Q) member is what disagrees, and
+   * nothing in ANAS repairs it — the second notification and the Scrubs
+   * indicator say so. Absent from an older daemon.
+   */
+  parityMismatches: z.array(AhrScrubParityMismatch).optional(),
   /** The corrupt files, grouped per file, capped at the first 200 (see `truncated`). */
   findings: z.array(AhrScrubFinding).optional(),
   /** Total errors the btrfs scrub summary counted (the sum of its `key=N` counters). */

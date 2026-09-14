@@ -285,7 +285,10 @@ function makeComponent(cfg, parent) {
       if (attr[2] === undefined) { return v !== undefined && v !== null }
       return String(v) === attr[2]
     }
-    return sel.charAt(0) === '#' ? cmp.itemId === sel.slice(1) : cmp.xtype === sel
+    // 'grid' is ExtJS's alias for gridpanel (the AHR toolbar's handlers walk
+    // up('grid') from a tbar button to a gridpanel) — model the alias.
+    if (sel.charAt(0) === '#') { return cmp.itemId === sel.slice(1) }
+    return cmp.xtype === sel || (sel === 'grid' && cmp.xtype === 'gridpanel')
   }
   c.down = function (sel) {
     for (const kid of c.childCmps()) {
@@ -7006,6 +7009,11 @@ const SCRUB_STATES = {
     // pass displaces an older one's findings); its note is the LEGACY mdcheck
     // wording (review R8).
     { target: { kind: 'ahr', pool: 'ahr2' }, enabled: false, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'mdcheck is the only periodic parity check running (the pre-0.4 mdcheck timer) — it is adopted onto the anas-scrub timer at daemon start', lastScrub: null, running: null },
+    // Design review 2026-09-14, D1/D8: ahr3's newest scrub counted parity
+    // mismatches but named no file (parity-only rot); ahr4's newest scrub did
+    // not check a whole band. Both must read on the row.
+    { target: { kind: 'ahr', pool: 'ahr3' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'parity-only rot band', lastScrub: null, running: null },
+    { target: { kind: 'ahr', pool: 'ahr4' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'a band md never checked', lastScrub: null, running: null },
   ],
 }
 
@@ -7099,6 +7107,33 @@ const SCRUB_JOBS = {
       at: '2026-09-11T12:00:00.000Z',
       result: { scrubbed: 'ahr2', btrfsErrors: null, checkedArrays: 2, findings: [] },
     }),
+    // D1 — parity-only rot: md counted mismatches, the checksum scrub named
+    // nothing. The result carries the record even with no findings.
+    scrubJob({
+      id: 'j8',
+      at: '2026-09-12T08:00:00.000Z',
+      result: {
+        scrubbed: 'ahr3',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr3-r1', 'ahr3-r2'],
+        parityMismatches: [{ band: 'ahr3-r1', bandIndex: 1, array: '/dev/md/ahr3-r1', mismatchCnt: 12 }],
+        findings: [],
+      },
+    }),
+    // D8 — a band md never checked is said, not counted as coverage.
+    scrubJob({
+      id: 'j9',
+      at: '2026-09-12T09:00:00.000Z',
+      result: {
+        scrubbed: 'ahr4',
+        btrfsErrors: null,
+        checkedArrays: 1,
+        bandsChecked: ['ahr4-r1'],
+        bandsSkipped: [{ band: 'ahr4-r2', reason: 'md never started the check' }],
+        findings: [],
+      },
+    }),
   ],
 }
 
@@ -7119,6 +7154,8 @@ function rowFor(grid, pool) {
 
 /** A click that landed ON the findings link, and one that did not. */
 const onLink = { getTarget: sel => (sel === '.anas-scrub-findings-link' ? { dom: true } : null) }
+/** A click on the parity indicator — the OTHER door in the same cell (selfheal.10). */
+const onParityLink = { getTarget: sel => (sel === '.anas-scrub-parity-link' ? { dom: true } : null) }
 const offLink = { getTarget: () => null }
 
 async function scrubFindingsChecks() {
@@ -7139,9 +7176,11 @@ async function scrubFindingsChecks() {
   const ahr0 = rowFor(grid, 'ahr0')
   const ahr1 = rowFor(grid, 'ahr1')
   const ahr2 = rowFor(grid, 'ahr2')
+  const ahr3 = rowFor(grid, 'ahr3')
+  const ahr4 = rowFor(grid, 'ahr4')
   const tank = rowFor(grid, 'tank')
-  ok('scrubs: every pool is a row', !!ahr0 && !!ahr1 && !!ahr2 && !!tank)
-  if (!ahr0 || !ahr1 || !ahr2 || !tank) { return }
+  ok('scrubs: every pool is a row', !!ahr0 && !!ahr1 && !!ahr2 && !!ahr3 && !!ahr4 && !!tank)
+  if (!ahr0 || !ahr1 || !ahr2 || !ahr3 || !ahr4 || !tank) { return }
 
   const found = ahr0.get('findings')
   ok('scrubs: the AHR row carries its last scrub\'s findings', !!found)
@@ -7154,6 +7193,30 @@ async function scrubFindingsChecks() {
   eq('scrubs: a LATER clean scrub clears an older one\'s findings', ahr2.get('findings'), null)
   ok('scrubs: …and that row falls back to the honest md-keeps-no-record line',
     /md keeps no completion record/.test(scrubCell(grid, ahr2)), scrubCell(grid, ahr2))
+
+  // D1 — parity-only rot reads on the row, amber, with the explanation as the
+  // tooltip; the checksum scrub named nothing, so there is no findings link.
+  const parityCell = scrubCell(grid, ahr3)
+  ok('scrubs: a parity-only rot row shows the amber parity indicator',
+    /parity mismatch on ahr3-r1 \(12\)/.test(parityCell), parityCell)
+  ok('scrubs: …the parity indicator carries the full explanation as its tooltip',
+    /PARITY \(or Q\) member/.test(parityCell) && /reconstruct from the wrong parity/.test(parityCell), parityCell)
+  // selfheal.10 — the indicator is also the DOOR to the Rewrite parity verb.
+  ok('scrubs: …and it is a link, not just a statement',
+    /anas-scrub-parity-link/.test(parityCell), parityCell)
+  ok('scrubs: …whose tooltip names the verb rather than sending the operator to the notification',
+    /Click to rewrite that band's parity/.test(parityCell), parityCell)
+  ok('scrubs: …and a parity-only scrub names no file, so there is no findings link',
+    !/anas-scrub-findings-link/.test(parityCell), parityCell)
+
+  // D8 — a band the scrub did not check is said on the row, muted, count first.
+  const skippedCell = scrubCell(grid, ahr4)
+  ok('scrubs: a scrub that skipped a band says how many, labelled',
+    /1 band not checked/.test(skippedCell), skippedCell)
+  ok('scrubs: …with the band and the why as the tooltip',
+    /ahr4-r2: md never started the check/.test(skippedCell), skippedCell)
+  ok('scrubs: …and no findings link when nothing was named',
+    !/anas-scrub-findings-link/.test(skippedCell), skippedCell)
 
   const cell = scrubCell(grid, ahr0)
   ok('scrubs: the row says how many files, labelled', /3 files with checksum errors/.test(cell), cell)
@@ -7215,7 +7278,7 @@ async function scrubFindingsChecks() {
   const grid2 = view2.down('#scrubGrid')
   view2.fireEvent('afterrender', view2)
   await settle()
-  eq('scrubs: an unreadable job list still renders every row', grid2.getStore().getCount(), 4)
+  eq('scrubs: an unreadable job list still renders every row', grid2.getStore().getCount(), 6)
   eq('scrubs: …and simply has no findings to show', rowFor(grid2, 'ahr0').get('findings'), null)
 }
 
@@ -7268,6 +7331,377 @@ async function scrubUnverifiedWindowCheck() {
     /title="[^"]*extent could not be resolved/.test(cell), cell)
 }
 
+// Design review 2026-09-14, D1 — the findings WINDOW says the parity story too:
+// when the newest scrub's result carries parityMismatches, the window's head
+// gains one line naming the bands and pointing at the PVE notification.
+async function scrubParityWindowCheck() {
+  const PARITY_JOBS = {
+    data: [scrubJob({
+      id: 'jpar',
+      at: '2026-09-12T10:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=2',
+        checkedArrays: 2,
+        bandsChecked: ['ahr0-r1', 'ahr0-r2'],
+        parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 4 }],
+        findings: [FINDING_A],
+        errorsReported: 2,
+        errorsAttributed: 1,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': PARITY_JOBS })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  const ahr0 = rowFor(grid, 'ahr0')
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, ahr0, null, 0, onLink)
+  await settle()
+  const win = openWindow()
+  if (!win) { ok('scrubs: the parity window opens', false); return }
+  const head = (win.items.getAt(0) || {}).html || ''
+  ok('scrubs: the findings window names the parity-mismatch bands',
+    /md counted parity mismatches on ahr0-r1/.test(head), head)
+  ok('scrubs: …and points at the notification for the explanation',
+    /PVE notification/.test(head), head)
+}
+
+// Story selfheal.10 — the Rewrite parity ACTION, behind the parity indicator.
+//
+// The narrow case is the whole feature: md counted mismatches on a band AND
+// the same scrub named no corrupt file. Anything else and `mdadm
+// --action=repair` would bless whatever the data says, so the verb is greyed
+// with the reason rather than hidden.
+async function rewriteParityChecks() {
+  // ahr3 is the parity-only row (j8): mismatches on r1, no findings.
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': SCRUB_JOBS })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  // --- the door: the parity indicator, not the findings one -----------------
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr3'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('rewrite: the parity indicator opens the parity window', !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+
+  const pGrid = win.down('#parityGrid')
+  const btn = win.down('#rewriteParity')
+  ok('rewrite: the window lists the bands md counted mismatches on', !!pGrid && pGrid.getStore().getCount() === 1)
+  ok('rewrite: …with the band label, its md array and the count',
+    !!pGrid && pGrid.getStore().getAt(0).get('band') === 'ahr3-r1'
+      && pGrid.getStore().getAt(0).get('array') === '/dev/md/ahr3-r1'
+      && pGrid.getStore().getAt(0).get('mismatchCnt') === 12)
+  ok('rewrite: …and the band NUMBER the request names, carried not parsed',
+    !!pGrid && pGrid.getStore().getAt(0).get('bandIndex') === 1)
+  ok('rewrite: the head says the data is right and the parity is what is wrong',
+    /the data is right and the parity is what is wrong/.test((win.items.getAt(0) || {}).html || ''),
+    (win.items.getAt(0) || {}).html)
+
+  // --- enablement -----------------------------------------------------------
+  ok('rewrite: the verb is dark until a band is picked', !!btn && btn.disabled === true)
+  ok('rewrite: …and says so', /select the band to rewrite/.test(btn.tooltip || ''), btn.tooltip)
+  pGrid.selectRows([0])
+  await settle()
+  ok('rewrite: one band ticked lights the verb', btn.disabled === false)
+
+  // --- the confirm-gated request -------------------------------------------
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('rewrite: the verb goes through the confirm-code door', !!sent)
+  if (!sent) { return }
+  ok('rewrite: …to the pool\'s own parity-rewrite endpoint', sent.path === '/ahr/ahr3/parity-rewrite')
+  ok('rewrite: …as a POST', sent.method === 'post')
+  ok('rewrite: the body names ONE band, as a number', JSON.stringify(sent.body) === '{"band":1}')
+  ok('rewrite: the confirm names the band and md\'s own count',
+    /band r1/.test(sent.confirmIntro || '') && /12 mismatch\(es\) there/.test(sent.confirmIntro || ''), sent.confirmIntro)
+  ok('rewrite: the poll budget is raised past the default (three md passes over a band)',
+    Number(sent.maxMs) > 15000, sent.maxMs)
+  ok('rewrite: the poll rides the window, not a component that closes', sent.view === win)
+
+  // --- the result, in the same window --------------------------------------
+  const panel = win.down('#parityResult')
+  ok('rewrite: the result panel is hidden until there is a result', !!panel && panel.hidden === true)
+  sent.onComplete({
+    id: 'pj1',
+    status: 'completed',
+    operation: 'ahr.parity-rewrite',
+    result: {
+      pool: 'ahr3',
+      band: 1,
+      array: '/dev/md/ahr3-r1',
+      mismatchBefore: 12,
+      mismatchAfter: 0,
+      outcome: 'rewritten',
+      durations: { scrubMs: 1000, repairMs: 2000, checkMs: 3000, totalMs: 6000 },
+    },
+  })
+  await settle()
+  ok('rewrite: the result appears in the window the request was made from', panel.hidden === false)
+  ok('rewrite: the before and after counts are both said',
+    /mismatches before 12/.test(panel.html) && /after 0/.test(panel.html), panel.html)
+  ok('rewrite: …and the outcome by name', /outcome rewritten/.test(panel.html), panel.html)
+  ok('rewrite: a rewritten band says the check afterwards counted 0',
+    /counted 0/.test(panel.html), panel.html)
+
+  // still-mismatched is NOT a success — say it plainly.
+  sent.onComplete({
+    id: 'pj2',
+    status: 'completed',
+    operation: 'ahr.parity-rewrite',
+    result: {
+      pool: 'ahr3',
+      band: 1,
+      array: '/dev/md/ahr3-r1',
+      mismatchBefore: 12,
+      mismatchAfter: 4,
+      outcome: 'still-mismatched',
+      reason: 'the verifying check still counted 4 mismatch(es)',
+      durations: { scrubMs: 1, repairMs: 1, checkMs: 1, totalMs: 3 },
+    },
+  })
+  await settle()
+  ok('rewrite: a still-mismatched run refuses to read as healthy',
+    /is not proven good/.test(panel.html) && /Do not treat this band as healthy/.test(panel.html), panel.html)
+  ok('rewrite: …and carries the run\'s own sentence', /still counted 4 mismatch/.test(panel.html), panel.html)
+
+  // A refusal on the fresh scrub names what it found instead of writing.
+  sent.onComplete({
+    id: 'pj3',
+    status: 'completed',
+    operation: 'ahr.parity-rewrite',
+    result: {
+      pool: 'ahr3',
+      band: 1,
+      array: '/dev/md/ahr3-r1',
+      mismatchBefore: 12,
+      mismatchAfter: null,
+      outcome: 'refused',
+      reason: 'the fresh checksum scrub found data corruption — nothing was written',
+      reasonCode: 'data-corruption-found',
+      btrfsErrors: 'csum=3',
+      durations: { scrubMs: 1, repairMs: 0, checkMs: 0, totalMs: 1 },
+    },
+  })
+  await settle()
+  ok('rewrite: an unknown after-count is said as unknown, never as 0',
+    /after unknown/.test(panel.html), panel.html)
+  ok('rewrite: a refusal on the fresh scrub names the errors and says nothing was written',
+    /found errors and nothing was written to md/.test(panel.html) && /csum=3/.test(panel.html), panel.html)
+
+  // --- a job still running claims no result --------------------------------
+  sent.onComplete({ id: 'pj4', status: 'running' })
+  await settle()
+  ok('rewrite: a job still running claims no result', /still running/.test(panel.html), panel.html)
+  ok('rewrite: …and says where the answer will arrive', /notification/.test(panel.html), panel.html)
+}
+
+// Story selfheal.10 — the verb is REFUSED when the same scrub named corrupt
+// files: md repair would recompute parity from that rot and make it permanent.
+// The door still opens (the mismatch is a real fact the operator must see);
+// the button is dark with the reason on it.
+async function rewriteParityRefusedChecks() {
+  const MIXED = {
+    data: [scrubJob({
+      id: 'jmix',
+      at: '2026-09-12T11:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=2',
+        checkedArrays: 2,
+        bandsChecked: ['ahr0-r1', 'ahr0-r2'],
+        parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 4 }],
+        findings: [FINDING_A],
+        errorsReported: 2,
+        errorsAttributed: 1,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIXED })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('rewrite: the parity door opens even when files are also corrupt',
+    !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+  const pGrid = win.down('#parityGrid')
+  const btn = win.down('#rewriteParity')
+  pGrid.selectRows([0])
+  await settle()
+  ok('rewrite: …but the verb stays dark with a band ticked', btn.disabled === true)
+  ok('rewrite: …and the reason is the one the daemon would 409 with',
+    /repair those from parity first/.test(btn.tooltip || '')
+      && /make the rot permanent/.test(btn.tooltip || ''), btn.tooltip)
+  ok('rewrite: the head says the same thing, before the operator reaches the button',
+    /Repair those from parity first/.test((win.items.getAt(0) || {}).html || ''),
+    (win.items.getAt(0) || {}).html)
+
+  // Clicking it anyway does nothing — the gate is not only cosmetic.
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('rewrite: the handler itself refuses, not just the disabled state', sent === null)
+}
+
+// Design review 2026-09-14, D15 + S8 — the AHR Snapshots manager meets the
+// repair engine's transient pin. A leftover `anas-selfheal-<ts>` snapshot (the
+// repair's finally failed to delete it) is labelled as what it is and is never
+// a rollback target; and rolling back to a snapshot whose contents the last
+// scrub found UNREPAIRED rot in says so before the operator confirms.
+async function ahrSnapshotPinChecks() {
+  const SNAPS = {
+    data: [
+      { name: 'nightly', createdAt: '2026-09-12T00:00:00Z', readonly: true },
+      { name: 'anas-selfheal-20260913T120000Z', createdAt: '2026-09-13T12:00:00Z', readonly: true },
+    ],
+  }
+  const S8_JOBS = {
+    data: [scrubJob({
+      id: 'js8',
+      at: '2026-09-12T09:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=1',
+        checkedArrays: 2,
+        findings: [{
+          path: '@snapshots/nightly/movies/x.mkv',
+          subvolume: '@snapshots/nightly',
+          inode: 601,
+          stripes: [],
+          badBlocks: [],
+          outsideMount: true,
+        }],
+        errorsReported: 1,
+        errorsAttributed: 1,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  }
+  const ANAS = loadSources(['15-gfx.js', '39-ahr.js'], {
+    'GET /ahr': { data: [ahrPoolRow('ahr0')] },
+    'GET /ahr/ahr0/snapshots': SNAPS,
+    'GET /jobs': S8_JOBS,
+  })
+  const view = makeComponent(ANAS.views.ahr.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.itemId === 'ahrGrid' ? view : view.down('#ahrGrid')
+  if (!grid) { ok('snappin: the AHR grid exists', false); return }
+  grid.selectRow(grid.getStore().findExact('name', 'ahr0'))
+  const snapBtn = grid.down('#snapshots')
+  ok('snappin: the Snapshots verb exists for a §12 pool', !!snapBtn && !snapBtn.disabled)
+  if (!snapBtn) { return }
+  created.windows.length = 0
+  snapBtn.handler(snapBtn)
+  await settle()
+  const win = openWindow()
+  ok('snappin: the manager window opens', !!win && win.cls === 'anas-win-ahr-snapshots')
+  if (!win) { return }
+  const snapGrid = win.down('#ahrSnapGrid')
+  ok('snappin: both snapshots list, pin included', !!snapGrid && snapGrid.getStore().getCount() === 2)
+  if (!snapGrid) { return }
+
+  // D15 — the pin is LABELLED in the row, never silently indistinguishable.
+  const nameCol = (snapGrid.columns || []).find(c => c.dataIndex === 'name')
+  const pinCell = nameCol.renderer(SNAPS.data[1].name)
+  ok('snappin: a leftover repair pin is labelled as what it is',
+    /transient — ANAS repair pin; safe to delete if no repair is running/.test(pinCell), pinCell)
+  ok('snappin: an operator snapshot carries no pin label',
+    !/repair pin/.test(nameCol.renderer(SNAPS.data[0].name)))
+
+  // D15 — and it is never a rollback target; the reason rides the tooltip.
+  const rb = win.down('#ahrSnapRollback')
+  ok('snappin: the Rollback verb exists', !!rb)
+  if (!rb) { return }
+  snapGrid.selectRow(1)
+  await settle()
+  ok('snappin: Rollback DISABLED for the pin', rb.disabled === true)
+  ok('snappin: …and the tooltip says why (nothing to roll back to)',
+    /transient ANAS repair pin/.test(rb.tooltip || ''), rb.tooltip)
+  snapGrid.selectRow(0)
+  await settle()
+  ok('snappin: Rollback ENABLED for an operator snapshot', rb.disabled === false)
+  ok('snappin: …with no leftover reason', rb.tooltip === '', rb.tooltip)
+
+  // S8 — rolling back to a snapshot the last scrub found UNREPAIRED rot inside
+  // says so in the confirm, before the code is minted.
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  rb.handler(rb)
+  await settle()
+  ok('snaps8: the rollback goes through the confirm door', !!sent)
+  if (!sent) { return }
+  ok('snaps8: the confirm warns of the unrepaired finding inside THIS snapshot',
+    /the last scrub found an unrepaired corrupt block inside this snapshot \(@snapshots\/nightly\/movies\/x\.mkv\)/
+      .test(sent.confirmIntro || ''), sent.confirmIntro)
+  ok('snaps8: …and says what rollback does with it',
+    /rolling back restores it/.test(sent.confirmIntro || ''), sent.confirmIntro)
+
+  // The negative: the newest scrub found nothing inside THIS snapshot — the
+  // confirm carries no warning (and the fail-open path reads as the same).
+  const OTHER_JOBS = {
+    data: [scrubJob({
+      id: 'js8b',
+      at: '2026-09-12T09:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=1',
+        checkedArrays: 2,
+        findings: [{ path: '@snapshots/other/y.bin', subvolume: '@snapshots/other', inode: 7, stripes: [], badBlocks: [], outsideMount: true }],
+        errorsReported: 1,
+        errorsAttributed: 1,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  }
+  const ANAS2 = loadSources(['15-gfx.js', '39-ahr.js'], {
+    'GET /ahr': { data: [ahrPoolRow('ahr0')] },
+    'GET /ahr/ahr0/snapshots': SNAPS,
+    'GET /jobs': OTHER_JOBS,
+  })
+  const view2 = makeComponent(ANAS2.views.ahr.factory('harness'), null)
+  view2.fireEvent('afterrender', view2)
+  await settle()
+  const grid2 = view2.itemId === 'ahrGrid' ? view2 : view2.down('#ahrGrid')
+  if (!grid2) { ok('snaps8: (negative) the grid exists', false); return }
+  grid2.selectRow(grid2.getStore().findExact('name', 'ahr0'))
+  const snapBtn2 = grid2.down('#snapshots')
+  created.windows.length = 0
+  snapBtn2.handler(snapBtn2)
+  await settle()
+  const win2 = openWindow()
+  if (!win2) { ok('snaps8: (negative) the window opens', false); return }
+  const snapGrid2 = win2.down('#ahrSnapGrid')
+  sent = null
+  ANAS2.confirmAndRun = (cfg) => { sent = cfg }
+  snapGrid2.selectRow(0)
+  await settle()
+  win2.down('#ahrSnapRollback').handler(win2.down('#ahrSnapRollback'))
+  await settle()
+  ok('snaps8: rot in a DIFFERENT snapshot does not warn this rollback',
+    sent && !/unrepaired corrupt block/.test(sent.confirmIntro || ''), sent && sent.confirmIntro)
+}
+
 // ============================================================================
 //  Scrubs: Repair from parity, in the findings window (story selfheal.6)
 // ============================================================================
@@ -7311,7 +7745,7 @@ const FINDING_F = {
   stripes: [{ logical: 953283584, offset: 0, length: 4096 }],
   badBlocks: [],
   unidentified: true,
-  reason: 'no block of the reported stripe read back with an error — the file was rewritten or repaired since the scrub',
+  reason: 'no block failed on re-read: either the file changed since the scrub, or the read was served from cache',
 }
 
 const REPAIR_ROUTES = {
@@ -7395,14 +7829,16 @@ async function repairFromParityChecks() {
   ok('repair: …and its tooltip names the failing blocks', /failing 4 KiB file blocks: 32/.test(blockCell(4)), blockCell(4))
   ok('repair: an UNIDENTIFIED corruption says so instead of showing 0',
     /corrupt, block not identified/.test(blockCell(5)) && !/>0</.test(blockCell(5)), blockCell(5))
-  ok('repair: …and carries the reason as its tooltip',
-    /rewritten or repaired since the scrub/.test(blockCell(5)), blockCell(5))
+  ok('repair: …and carries the reason as its tooltip, stating the AMBIGUITY (D9)',
+    /no block failed on re-read: either the file changed since the scrub, or the read was served from cache/.test(blockCell(5)), blockCell(5))
+  ok('repair: …and never claims the file was repaired',
+    !/was repaired/.test(blockCell(5)), blockCell(5))
 
   eq('repair: a COMPRESSED extent ticks — the engine repairs the blob from any block of it',
     fGrid.selectRows([4]).length, 1)
   eq('repair: an UNIDENTIFIED finding cannot be ticked', fGrid.selectRows([5]).length, 0)
   ok('repair: …and says why, with the reason', /no bad block could be named/.test(repairCell(5)) &&
-    /rewritten or repaired since the scrub/.test(repairCell(5)), repairCell(5))
+    /either the file changed since the scrub, or the read was served from cache/.test(repairCell(5)), repairCell(5))
 
   eq('repair: two repairable files tick', fGrid.selectRows([0, 3]).length, 2)
   eq('repair: …and the verb lights up', btn.disabled, false)
@@ -7477,6 +7913,51 @@ async function repairFromParityChecks() {
     /1 block\(s\) were not corrupt at the mapped location — nothing was written, nothing to restore/.test(panel.html), panel.html)
   ok('repair: …and the restore advice stays reserved for the TRUE unrepairable',
     !/restore this file from backup/.test(panel.html), panel.html)
+
+  // --- D3/D10 — the csum-unreadable verdict does NOT say restore -------------
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [
+        { block: 300, outcome: 'unrepairable', reason: 'the metadata copy holding the checksum is damaged', reasonCode: 'csum-unreadable' },
+      ] },
+    ],
+    repaired: 0,
+    unrepairable: 1,
+    aboveMd: 0,
+    mappingAbort: 0,
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: a csum-unreadable file says the checksum could not be read',
+    /checksum could not be read reliably/.test(panel.html), panel.html)
+  ok('repair: …and says re-scrub after the metadata is repaired',
+    /re-scrub after the metadata is repaired/.test(panel.html), panel.html)
+  ok('repair: …and NEVER tells the operator to restore data never proven bad',
+    !/restore this file from backup/.test(panel.html), panel.html)
+  ok('repair: …naming the file it applies to', panel.html.includes(FINDING_A.path), panel.html)
+
+  // A MIXED file keeps the ordinary restore advice: only one of its blocks
+  // carries the code, and nothing else can prove the other one.
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_D.path, blocks: [
+        { block: 12, outcome: 'unrepairable', reason: 'the metadata copy holding the checksum is damaged', reasonCode: 'csum-unreadable' },
+        { block: 13, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' },
+      ] },
+    ],
+    repaired: 0,
+    unrepairable: 2,
+    aboveMd: 0,
+    mappingAbort: 0,
+    blocks: 2,
+  }))
+  await settle()
+  ok('repair: a MIXED unrepairable file keeps the ordinary restore advice',
+    /restore this file from backup/.test(panel.html), panel.html)
+  ok('repair: …and does not claim the checksum was unreadable for it',
+    !/checksum could not be read reliably/.test(panel.html), panel.html)
 
   // --- The honest "not finished" --------------------------------------------
   sent.onComplete({ id: 'rj2', status: 'running' })
@@ -7798,6 +8279,21 @@ warnings.length = 0
 created.windows.length = 0
 // Fourth pass — the unverified-window suffix is rendered in the bad-block cell.
 await scrubUnverifiedWindowCheck()
+// Design review 2026-09-14 — the parity line in the findings window (D1), and
+// the AHR Snapshots manager's pin labelling + rollback warning (D15, S8).
+warnings.length = 0
+created.windows.length = 0
+await scrubParityWindowCheck()
+// Story selfheal.10 — the Rewrite parity action behind that indicator.
+warnings.length = 0
+created.windows.length = 0
+await rewriteParityChecks()
+warnings.length = 0
+created.windows.length = 0
+await rewriteParityRefusedChecks()
+warnings.length = 0
+created.windows.length = 0
+await ahrSnapshotPinChecks()
 // Story selfheal.4 — the two-phase surface: phases + next run on the row, the
 // cadence selector beside the toggle, the toggle body and its confirm.
 warnings.length = 0
