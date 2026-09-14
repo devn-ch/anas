@@ -1339,3 +1339,99 @@ Everything below was fixed at the source with a failing-before test.
   `--action=repair` issued at all, a foreign op replacing the repair and the check, and a check that
   still counts mismatches reported as `still-mismatched`. Suite case 8 + its control on the stunt
   node: `test/self-heal/suite/LAST-RUN-parity.md`.)*
+
+### Sixth pass
+
+A sixth narrow review of the same arc (`2296447..b26eadc`, 2026-09-14) found twelve more. All are
+fixed at the source with a regression test that fails on the old code and passes on the new one; no
+new captures were needed, and the suite was re-run on the stunt node against both entry points
+(`LAST-RUN-engine.md`, `LAST-RUN-parity.md`: **SUITE: PASS (48/48 cases, 17/17 negative controls)**
+each).
+
+- **N1 — LOSE-DATA — Rewrite parity ran `mdadm --action=repair` on a RAID1 band.** md's `repair` on
+  a mirror has no parity to recompute: it copies the FIRST in-sync leg over the others without
+  looking at which one is right, so on a band whose legs disagree it overwrote the good copy half
+  the time — from the verb that exists to prevent exactly that. `parityRewriteArrayRefusal` now
+  refuses `geo.raid1` first and for good, with reason code `not-a-parity-band`; the route 409s with
+  it, the scrub's `parityMismatches` rows carry the band's `level` (additive, optional), and the UI
+  greys Rewrite with the same sentence — a mirror mismatch is arbitrated by Repair from parity per
+  block, never by md repair. *(`ahr-parity-rewrite.test.ts` on the `md-sysfs-raid1.txt` fixture:
+  outcome `refused`, `reasonCode` `not-a-parity-band`, `md.actions() === []` and not even the fresh
+  scrub ran. Harness: the row indicator stops offering the verb, the window's head drops the
+  parity claim, the button is dark with the reason, and the handler refuses a click anyway.)*
+- **N2 — every repair on a §12 pool 400'd.** `findmnt -o SOURCE` appends the filesystem root in
+  brackets for a btrfs subvolume mount (`/dev/mapper/ahr0-ahr0--vol[/@data]`), and every §12 pool
+  mounts `subvol=@data` — so `realpath` of that string failed and the confinement check answered
+  "the filesystem holding this path could not be determined" for every file of every subvol-layout
+  pool. `repairFindmntArgs` now passes `--nofsroot`, and `repairMountSource` strips a trailing
+  `[…]` as the second line of defence. *(`routes/__tests__/ahr-repair.test.ts`: a SOURCE fixture of
+  `/dev/mapper/ahr0-ahr0--vol[/@data]` reaches the confirm gate and then 202.)*
+- **N3 — D2 regression: issued-check tokens were never retired on the success or skip paths.**
+  `markCheckIssued` is what licenses ANAS to write `idle` to an array, and it was taken back only
+  inside `cancelBandCheck` — the abandonment path. Every band a scrub checked normally left its
+  token in the set for the life of the daemon, and a later FOREIGN check (mdcheck's) on that array
+  then read as ours. The scrub retires per band in a `finally` around the loop body, the bounded
+  check's non-settle throw ends its own op through `restoreSyncKnobs` and then drops the token, and
+  `restoreSyncKnobs` retires in every branch that ends our op. *(`ahr-scrub.test.ts`: a clean
+  two-band scrub leaves no `hasIssuedCheck`, and `ownsSyncOp` then reads a `check` on that array as
+  foreign; the skip path too. `selfheal-repair.test.ts`: the non-settle throw, and the idle/foreign
+  branches.)*
+- **N4 — disabling a pool that was never enabled turned mdcheck ON with `--now`.** Filtering an
+  absent pool out of the list left it empty, which read as "the LAST pool just went off" — so a
+  toggle that changed nothing started a node-wide md parity check. `setAhrScrubEnabled` returns
+  before the disable branch when the pool is not in the list: mdcheck is given back only when ANAS
+  took it. *(`scrub-schedules.test.ts`: a no-op disable issues no `systemctl` at all, on an empty
+  schedule and on one that names another pool.)*
+- **N5 — a LUN image whose unrepairable blocks were all `csum-unreadable` was told to restore.**
+  LUN-ness was tested first, so the "which restore verb" fact beat the "a restore is the wrong
+  action" one — and restoring a LUN image overwrites a guest's disk on no evidence, since the
+  checksum that would have proven the block corrupt is itself damaged. `csum-unreadable` now wins,
+  with the LUN identity composed into that sentence and no restore verb in it.
+  *(`services/__tests__/ahr-repair.test.ts`: the all-csum-unreadable LUN gets neither restore
+  sentence, and a MIXED LUN file still gets the LUN one.)*
+- **N6 — the parity-only notification asserted the parity member in both arms, and said nothing
+  repairs parity.** The second claim stopped being true when selfheal.10 shipped, and the first only
+  follows when the checksum pass was clean. The `dataClean` arm keeps the assertion and names the
+  verb ("Scrubs → parity mismatch → Rewrite parity (a fresh checksum scrub runs first)"); the
+  not-clean arm drops the assertion and says what to do first — repair from parity what a scrub
+  names, then scrub again, because the rewrite is refused while a finding stands.
+  *(`ahr-scrub.test.ts`: both arms' wording, including the absence of the old clause.)*
+- **N7 — the uninstaller printed "has been RESTORED" after a call ending in `|| true`.** A masked or
+  missing mdcheck unit left the node with no periodic md parity check at all while the uninstaller
+  said the opposite. It now branches on the exit status and says which happened, plus how to put it
+  right by hand. *(`packaging/test/uninstall-schedules.test.sh`: a faked `systemctl` that fails only
+  the mdcheck enable.)*
+- **N8 — the confirm estimate omitted phase 1's full-pool checksum scrub.** On a pool with real data
+  in it that pass is usually the dominant term, and the gate quoted only the two md passes over the
+  band. The warning now carries the pool's used bytes at the same conservative 60 MiB/s, and says
+  which term dominates; a pool that cannot report them says so rather than quoting a number it does
+  not have. The UI's window wording matches. *(`ahr-parity-rewrite.test.ts`: both arms.)*
+- **N9 — the daemon-start reconcile ran while a repair could already be in flight.** It runs after
+  the socket is listening, behind a boot scan that takes minutes on a real node — and a live run's
+  narrow sync window, `rmw_level=0`, floored stripe cache and `anas-selfheal-<ts>` pin are exactly
+  what this walk calls leftovers. Reconcile now skips any pool with an active `ahr.repair` /
+  `ahr.parity-rewrite` / `ahr.scrub` job (the queue's own `findActive`) and names the job in its
+  journald line; the ordering is unchanged. *(`selfheal-reconcile.test.ts`: nothing written, the pin
+  not swept, one line naming the job — and normal reconciliation when nothing is in flight.)*
+- **N10 — only the scrub route asked `runningAhrCheck`.** The job-queue exclusion is in-process, so
+  a check left by a previous daemon or started by mdcheck's timer was invisible to Repair and to
+  Rewrite parity — the first would have fought it for md's one sync thread, the second would have
+  handed md a whole-band `repair` on an array md was already busy re-reading. All three routes call
+  it now and 409 with the same sentence. *(`routes/__tests__/ahr-repair.test.ts`: a queued
+  (`resync=PENDING`) check — the shape that leaves the pool reading `healthy` — 409s both verbs.)*
+- **N11 — `restoreSyncKnobs` retired the token and wrote the window open after an EBUSY widen.**
+  EBUSY means the op has NOT reached the boundary, so it is still running and still ours: widening
+  `sync_max` under it resumes it over the whole band. And the trailing `sync_min`/`sync_max` pair
+  was written unconditionally, which is a raw throw out of a `finally`-driven cleanup when `sync_min`
+  is itself EBUSY. The bounce now keeps the token and writes nothing more, and the pair is wrapped
+  in the same `ownsSyncOp` re-read with failures recorded into `cleanupErrors`.
+  *(`selfheal-repair.test.ts`: a read-only `sync_max` for the bounce, a read-only `sync_min` for the
+  recorded-not-thrown case.)*
+- **N12 — an unreadable `mismatch_cnt` counted as coverage.** `bandsChecked.push` ran before the
+  `mismatches !== null` test, so a band whose check ran but whose counter came back unreadable got a
+  clean bill it had not earned. It lands in `bandsSkipped` now ("checked, but its mismatch_cnt could
+  not be read"), which also means the scrub is not silent about it. *(`ahr-scrub.test.ts`: one band
+  checked of two, the skip reason verbatim, and the did-not-check-every-band notification.)*
+
+The suite has no RAID1 parity-rewrite case — the rig's case 8 is a RAID5 band — so N1's refusal is
+proven by the unit test against the captured `md-sysfs-raid1.txt` geometry rather than on the node.

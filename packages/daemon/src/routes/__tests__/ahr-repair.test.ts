@@ -15,7 +15,7 @@ import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
-import { ahrMutationRoutes } from '../ahr-mutate.js'
+import { ahrMutationRoutes, repairFindmntArgs } from '../ahr-mutate.js'
 import { jobRoutes } from '../jobs.js'
 
 /**
@@ -66,7 +66,7 @@ function ahrExecutor(mdstat: ExecResult = mockFixtures.ahrMdstat(), findmnt: Exe
   executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', MOUNTPOINT], result: { stdout: `${MOUNTPOINT}\n`, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', '/dev/ahr0/ahr0-vol'], result: { stdout: '/dev/dm-9\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', FILE], result: { stdout: `${FILE}\n`, stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE', '--real', '-T', FILE], result: { stdout: '/dev/ahr0/ahr0-vol\n', stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/findmnt', args: repairFindmntArgs(FILE), result: { stdout: '/dev/ahr0/ahr0-vol\n', stderr: '', exitCode: 0 } })
   return executor
 }
 
@@ -186,7 +186,7 @@ describe('POST /v1/ahr/:name/repair — validation', () => {
   it('400 for a path whose filesystem is NOT the pool\'s own LV — a bind mount inside the tree is not the pool\'s to write (D12)', async () => {
     const FOREIGN = `${MOUNTPOINT}/bind-mount.bin`
     const server = await serverWith(withFiles(ahrExecutor(mockFixtures.ahrMdstat(), mockFixtures.ahrFindmnt(), [
-      { command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE', '--real', '-T', FOREIGN], result: { stdout: '/dev/sdz1\n', stderr: '', exitCode: 0 } },
+      { command: '/usr/bin/findmnt', args: repairFindmntArgs(FOREIGN), result: { stdout: '/dev/sdz1\n', stderr: '', exitCode: 0 } },
       { command: '/usr/bin/realpath', args: ['-e', FOREIGN], result: { stdout: `${FOREIGN}\n`, stderr: '', exitCode: 0 } },
       { command: '/usr/bin/realpath', args: ['-e', '/dev/sdz1'], result: { stdout: '/dev/sdz1\n', stderr: '', exitCode: 0 } },
     ]), [FILE, FOREIGN]))
@@ -194,6 +194,32 @@ describe('POST /v1/ahr/:name/repair — validation', () => {
     assert.equal(res.statusCode, 400)
     assert.match(res.json().error.message, /sits on \/dev\/sdz1, not on AHR pool 'ahr0's own device \(\/dev\/dm-9\)/)
     assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    await server.close()
+  })
+
+  it('202 when findmnt reports the btrfs fs root in brackets — every §12 pool\'s SOURCE looks like that (N2)', async () => {
+    // `findmnt -o SOURCE` appends the filesystem root for a btrfs subvolume
+    // mount, and EVERY §12 AHR pool mounts `subvol=@data`:
+    //     /dev/mapper/ahr0-ahr0--vol[/@data]
+    // `realpath` of that string fails, so the confinement check answered "the
+    // filesystem holding this path could not be determined" and the route 400'd
+    // on every file of every subvol-layout pool — Repair was dead there.
+    const BRACKETED = '/dev/mapper/ahr0-ahr0--vol[/@data]'
+    const executor = ahrExecutor(mockFixtures.ahrMdstat(), mockFixtures.ahrFindmnt(), [
+      { command: '/usr/bin/findmnt', args: repairFindmntArgs(FILE), result: { stdout: `${BRACKETED}\n`, stderr: '', exitCode: 0 } },
+    ])
+    // The pool's LV and the bracket-stripped source resolve to the same device.
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', '/dev/mapper/ahr0-ahr0--vol'], result: { stdout: '/dev/dm-9\n', stderr: '', exitCode: 0 } })
+    const server = await serverWith(withFiles(executor, [FILE]))
+    const payload = body([{ path: FILE, blocks: [300] }])
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload })
+    assert.equal(first.statusCode, 409, JSON.stringify(first.json()))
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    const code = first.headers['x-anas-confirm-code'] as string
+    const second = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload })
+    assert.equal(second.statusCode, 202, JSON.stringify(second.json()))
+    // The flag is what does it — the bracket strip is only the second line.
+    assert.ok(repairFindmntArgs(FILE).includes('--nofsroot'), repairFindmntArgs(FILE).join(' '))
     await server.close()
   })
 
@@ -269,6 +295,68 @@ describe('POST /v1/ahr/:name/repair — hard refusals, before any confirm code',
   })
 })
 
+/**
+ * A QUEUED check (`resync=PENDING`) on band r1 — md has taken the check and
+ * parked it until the array's first write (GT-9).
+ *
+ * It is the one shape that separates the node-wide exclusion from the pool's
+ * own state: `anyCheck` needs a progress line, so the pool still reads
+ * `healthy` and the state gate lets the request through, while
+ * `runningAhrCheck` sees the pending check for exactly what it is.
+ */
+const MDSTAT_PENDING_CHECK = [
+  'Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] ',
+  'md126 : active raid1 sdd2[1] sdc2[0]',
+  '      523200 blocks super 1.2 [2/2] [UU]',
+  '      ',
+  'md127 : active raid5 sdd1[3] sdc1[1] sdb1[0]',
+  '      2089984 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]',
+  '      \tresync=PENDING',
+  '      ',
+  'unused devices: <none>',
+  '',
+].join('\n')
+
+describe('the node-wide md-check exclusion reaches all three verbs (N10)', () => {
+  it('409s a REPAIR while md holds a queued check on a band — the job queue cannot see that check', async () => {
+    // The queue's exclusion is in-process. A check left running by a previous
+    // daemon, or started by mdcheck's timer, survives it — and the repair's own
+    // bounded check would fight it for md's one sync thread. Only the scrub
+    // route used to ask /proc/mdstat; all three do now.
+    const executor = ahrExecutor({ stdout: MDSTAT_PENDING_CHECK, stderr: '', exitCode: 0 })
+    const server = await serverWith(withFiles(executor, [FILE]))
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
+    assert.equal(res.statusCode, 409, JSON.stringify(res.json()))
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.match(res.json().error.message, /an md check is running on ahr0-r1/)
+    assert.match(res.json().error.message, /one parity check at a time across the node's AHR bands/)
+    // "Unsafe now" has no bypass (Principle 14).
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    await server.close()
+  })
+
+  it('409s a PARITY REWRITE on the same check, with the same sentence', async () => {
+    const executor = ahrExecutor({ stdout: MDSTAT_PENDING_CHECK, stderr: '', exitCode: 0 })
+    const server = await serverWith(withFiles(executor, [FILE]))
+    // The evidence gate runs first, so the pool needs a completed scrub whose
+    // phase 1 counted a mismatch on r1 and whose phase 2 was clean.
+    server.jobQueue.submit('ahr.scrub', { user: 'root@pam', uid: 0, params: { name: 'ahr0' } }, async () => ({
+      scrubbed: 'ahr0',
+      btrfsErrors: null,
+      checkedArrays: 2,
+      parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+    }))
+    for (let i = 0; i < 200 && !server.jobQueue.findLastCompleted('ahr.scrub', 'ahr0'); i++)
+      await new Promise(resolve => setTimeout(resolve, 10))
+
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/parity-rewrite', headers: JSON_HEADERS, payload: JSON.stringify({ band: 1 }) })
+    assert.equal(res.statusCode, 409, JSON.stringify(res.json()))
+    assert.match(res.json().error.message, /an md check is running on ahr0-r1/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    await server.close()
+  })
+})
+
 describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
   it('409 CONFIRMATION_REQUIRED saying exactly what the repair does, then 202', async () => {
     const executor = withFiles(ahrExecutor(), [FILE])
@@ -322,7 +410,7 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
     const OTHER = `${MOUNTPOINT}/other.bin`
     const executor = ahrExecutor()
     executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', OTHER], result: { stdout: `${OTHER}\n`, stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE', '--real', '-T', OTHER], result: { stdout: '/dev/ahr0/ahr0-vol\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: repairFindmntArgs(OTHER), result: { stdout: '/dev/ahr0/ahr0-vol\n', stderr: '', exitCode: 0 } })
     const server = await serverWith(withFiles(executor, [FILE, OTHER]))
     const first = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
     const code = first.headers['x-anas-confirm-code'] as string

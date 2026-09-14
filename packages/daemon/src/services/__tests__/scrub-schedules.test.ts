@@ -305,6 +305,27 @@ describe('scrub schedules — AHR node-level anas-scrub timer (selfheal.4)', () 
       )
     })
 
+    it('disabling a pool that was never enabled changes NOTHING — and never turns mdcheck on (N4)', async () => {
+      // The node has no ANAS schedule at all, so the list is empty. Filtering
+      // an absent pool out of it left an empty list, which read as "the LAST
+      // pool just went off" — and the toggle then ran
+      // `systemctl enable --now mdcheck_*.timer`, starting a node-wide md
+      // parity check nobody asked for. mdcheck is given back only when ANAS
+      // took it.
+      await setAhrScrubEnabled(mock, 'ahr0', false, { dir })
+      assert.equal(await readScrubSchedule(dir), null)
+      assert.deepEqual(await readdir(dir), [])
+      assert.deepEqual(mock.calls, [], 'a no-op disable issues no systemctl at all')
+
+      // Same with a schedule that exists but does not name this pool: ahr1's
+      // timer keeps running, and ahr0 was never on it.
+      await setAhrScrubEnabled(mock, 'ahr1', true, { dir })
+      const before = mock.calls.length
+      await setAhrScrubEnabled(mock, 'ahr0', false, { dir })
+      assert.deepEqual((await readScrubSchedule(dir))?.pools, ['ahr1'], 'ahr1 is untouched')
+      assert.deepEqual(mock.calls.slice(before), [])
+    })
+
     it('a FAILED mdcheck restore is logged, not thrown — the toggle still lands', async () => {
       const lines: string[] = []
       const origErr = process.stderr.write.bind(process.stderr)

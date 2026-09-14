@@ -450,8 +450,18 @@
             }
             if (parity) {
                 var bands = [];
+                // A mismatch on a RAID1 band is legs disagreeing with each
+                // other, not parity disagreeing with data, and it has no
+                // Rewrite-parity verb (sixth pass). The tooltip offers the verb
+                // unless EVERY mismatching band is a known mirror — a result
+                // from an older daemon carries no level, and the daemon is the
+                // authority either way (409 `not-a-parity-band`).
+                var rewritable = false;
                 for (var p = 0; p < parity.length; p++) {
                     bands.push(parity[p].band + ' (' + parity[p].mismatchCnt + ')');
+                    if (parity[p].level !== 'raid1') {
+                        rewritable = true;
+                    }
                 }
                 // selfheal.10 — the indicator is now a DOOR as well as a
                 // statement: the data-intact/parity-wrong case has a verb
@@ -464,10 +474,14 @@
                         + 'scrub attributed; a mismatch it cannot attribute is PARITY-ONLY rot — the parity (or Q) '
                         + 'member disagrees while every file\'s checksum passes. Repair the named files first: '
                         + 'rewriting parity now would recompute it from corrupt data.')
-                    : t('md counted parity mismatches on these bands, but the checksum scrub found no corrupt '
-                        + 'files — every file\'s checksum passes. The rot is in the PARITY (or Q) member, not in '
-                        + 'the data, and at the next disk failure in this band md would reconstruct from the '
-                        + 'wrong parity. Click to rewrite that band\'s parity from the data as it stands.');
+                    : (rewritable
+                        ? t('md counted parity mismatches on these bands, but the checksum scrub found no corrupt '
+                            + 'files — every file\'s checksum passes. On a parity band the rot is in the PARITY (or Q) '
+                            + 'member, not in the data, and at the next disk failure md would reconstruct from the '
+                            + 'wrong parity. Click to rewrite that band\'s parity from the data as it stands.')
+                        : t('md counted mismatches on these bands, but the checksum scrub found no corrupt files. '
+                            + 'No band here is a parity band, so there is no parity to rewrite — a RAID1 mirror\'s '
+                            + 'legs disagree and are arbitrated per block by Repair from parity. Click for the detail.'));
                 spans.push('<span class="anas-scrub-parity-link" style="color:var(--anas-warn,#b06a12);'
                     + 'cursor:pointer;text-decoration:underline;" title="' + enc(parityTip) + '">'
                     + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
@@ -1289,6 +1303,15 @@
     // naming corrupt files; the daemon refuses on it too (409
     // `data-findings-present`), and saying it here means the operator is not
     // sent to a refusal to find out.
+    // A RAID1 band has no parity to rewrite, and md's `repair` on a mirror
+    // copies the first in-sync leg over the others without arbitrating — a
+    // coin flip that overwrites the good copy half the time. The daemon
+    // refuses it (409 `not-a-parity-band`); the button says so first, so the
+    // operator is not sent to a refusal to find out.
+    var MIRROR_BAND_REASON = 'a RAID1 mirror band has no parity to rewrite — md\'s repair on a mirror '
+        + 'copies the first in-sync leg over the others without looking at which one is right. A mirror '
+        + 'mismatch is arbitrated by Repair from parity per block, never by md repair';
+
     function parityRewriteBlocked(win, hasFindings) {
         if (hasFindings) {
             return t('the same scrub named corrupt files — repair those from parity first; rewriting parity now '
@@ -1304,6 +1327,9 @@
         }
         if (!(Number(sel[0].get('bandIndex')) > 0)) {
             return t('this scrub did not record the band number — scrub the pool again');
+        }
+        if (String(sel[0].get('level') || '') === 'raid1') {
+            return t(MIRROR_BAND_REASON);
         }
         return '';
     }
@@ -1403,8 +1429,23 @@
                 band: pm.band || '',
                 bandIndex: Number(pm.bandIndex) || 0,
                 array: pm.array || '',
-                mismatchCnt: Number(pm.mismatchCnt) || 0
+                mismatchCnt: Number(pm.mismatchCnt) || 0,
+                // Additive (sixth pass): a result from an older daemon omits
+                // the level, and an unknown level is not offered the verb.
+                level: pm.level || ''
             });
+        }
+        // Does this pool have a mirror band among the mismatching ones? The
+        // window's prose must not tell the operator "the parity is what is
+        // wrong" about a band that has no parity.
+        var anyMirror = false;
+        var allMirror = rows.length > 0;
+        for (var r = 0; r < rows.length; r++) {
+            if (rows[r].level === 'raid1') {
+                anyMirror = true;
+            } else {
+                allMirror = false;
+            }
         }
         if (!rows.length) {
             return false;
@@ -1425,9 +1466,19 @@
                     html: enc(hasFindings
                         ? t('md counted parity mismatches on these bands, and the same scrub named corrupt files. '
                             + 'Repair those from parity first — rewriting parity over corrupt data makes the rot permanent.')
-                        : t('md counted parity mismatches on these bands and the checksum pass found nothing: the data '
-                            + 'is right and the parity is what is wrong. Rewriting recomputes that band\'s parity from '
-                            + 'the data as it stands — a fresh checksum scrub runs first, and any finding aborts it.'))
+                        : (allMirror
+                            ? t('md counted mismatches on these bands and the checksum pass found nothing. These are '
+                                + 'RAID1 mirror bands: md counted legs that disagree with each other, not parity that '
+                                + 'disagrees with the data, and there is nothing here to rewrite. Repair from parity '
+                                + 'arbitrates a mirror per block, against the checksum btrfs stored for it.')
+                            : t('md counted parity mismatches on these bands and the checksum pass found nothing: on a '
+                                + 'parity band the data is right and the parity is what is wrong. Rewriting recomputes '
+                                + 'that band\'s parity from the data as it stands — a fresh checksum scrub of the whole '
+                                + 'pool runs first (usually the longest part of the run), and any finding aborts it.')
+                            + (anyMirror
+                                ? ' ' + t('A RAID1 band in this list has no parity to rewrite; its mismatch is arbitrated '
+                                    + 'by Repair from parity per block.')
+                                : '')))
                 },
                 {
                     xtype: 'gridpanel',
@@ -1438,7 +1489,7 @@
                     // One band at a time: md repairs a whole array.
                     selModel: { selType: 'checkboxmodel', mode: 'SINGLE' },
                     store: Ext.create('Ext.data.Store', {
-                        fields: ['band', 'bandIndex', 'array', 'mismatchCnt'],
+                        fields: ['band', 'bandIndex', 'array', 'mismatchCnt', 'level'],
                         data: rows
                     }),
                     columns: [
@@ -1448,6 +1499,12 @@
                         { text: t('md array'), dataIndex: 'array', flex: 1, minWidth: 160,
                             sortable: false, menuDisabled: true,
                             renderer: function (v) { return '<span style="font-family:monospace;">' + enc(v) + '</span>'; } },
+                        // The level is what says whether the verb applies at all.
+                        { text: t('Level'), dataIndex: 'level', width: 90, align: 'center',
+                            sortable: false, menuDisabled: true,
+                            renderer: function (v) {
+                                return v ? enc(String(v)) : '<span style="opacity:.6;">' + enc(t('unknown')) + '</span>';
+                            } },
                         { text: t('Mismatches'), dataIndex: 'mismatchCnt', width: 130, align: 'center',
                             sortable: false, menuDisabled: true,
                             renderer: function (v) {

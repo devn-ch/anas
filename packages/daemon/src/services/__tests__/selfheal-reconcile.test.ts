@@ -162,6 +162,49 @@ describe('selfheal reconcile — knobs a killed repair left turned aside', () =>
   })
 })
 
+describe('selfheal reconcile — a pool with a self-heal job in flight (N9)', () => {
+  use(() => new FakeNode([{ kernel: 'md127', knobs: killedMidRepair() }]))
+
+  /**
+   * The reconciliation runs from `index.ts` AFTER the socket is listening, and
+   * the boot scan it chains off takes minutes on a real node. A Repair
+   * submitted in that window has EXACTLY the state this walk calls leftovers:
+   * `sync_min`/`sync_max` bounded to one stripe, `rmw_level` at 0, the stripe
+   * cache at its floor, and an `anas-selfheal-<ts>` snapshot pinning the extent
+   * it is reconstructing from. Widening the window and sweeping the pin out
+   * from under that run is not a reconciliation, it is a collision.
+   */
+  it('leaves every knob and the transient snapshot alone, and says which job', async () => {
+    node.subvolList = `ID 300 gen 40 top level 5 path ${SELFHEAL_SNAPSHOT_PREFIX}1757000000000\n`
+    const report = await reconcileSelfhealState(node, {
+      pools: [pool(node)],
+      activeJob: name => (name === 'tank' ? { operation: 'ahr.repair', id: 'job-7' } : null),
+    })
+
+    // Nothing was written: the knobs read exactly as the live run left them.
+    assert.equal(node.knob('md127', 'sync_min'), '6272')
+    assert.equal(node.knob('md127', 'sync_max'), '6400')
+    assert.equal(node.knob('md127', 'rmw_level'), '0')
+    assert.equal(node.knob('md127', 'stripe_cache_size'), '17')
+    assert.deepEqual(report.restored, [])
+    // …and the run's own pin is still there.
+    assert.deepEqual(node.deleted, [])
+    assert.deepEqual(report.snapshots, [])
+    // One journald line that names the job, so the skip is never silent.
+    assert.equal(report.skipped.length, 1, report.skipped.join(' | '))
+    assert.ok(report.skipped[0].includes('tank: not reconciled'), report.skipped[0])
+    assert.ok(report.skipped[0].includes('ahr.repair job job-7'), report.skipped[0])
+    assert.deepEqual(report.errors, [])
+  })
+
+  it('reconciles normally when nothing is in flight — the guard is the only difference', async () => {
+    const report = await reconcileSelfhealState(node, { pools: [pool(node)], activeJob: () => null })
+    assert.equal(node.knob('md127', 'sync_max'), 'max')
+    assert.ok(report.restored.length > 0)
+    assert.deepEqual(report.skipped, [])
+  })
+})
+
 describe('selfheal reconcile — a band md is already working on', () => {
   use(() => new FakeNode([{ kernel: 'md127', knobs: { ...killedMidRepair(), sync_action: 'recover' } }]))
 

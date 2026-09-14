@@ -67,7 +67,17 @@ async function main() {
           server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
       }).catch((err) => {
         server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
-      }).then(() => reconcileSelfhealState(decorated.executor)).then((report) => {
+      }).then(() => reconcileSelfhealState(decorated.executor, {
+        // The socket is already listening (it has to be — the boot scan above
+        // takes minutes on a real node), so a Repair or a Rewrite parity can
+        // be in flight by the time this runs. Its md knobs and its transient
+        // snapshot are in USE; reconciling over them sweeps the pin and widens
+        // the window under a live run (sixth pass, N9).
+        activeJob: pool => decorated.jobQueue.findActive(
+          ['ahr.repair', 'ahr.parity-rewrite', 'ahr.scrub'],
+          pool,
+        ) ?? null,
+      })).then((report) => {
         if (reconcileWasQuiet(report))
           return
         for (const line of report.restored)

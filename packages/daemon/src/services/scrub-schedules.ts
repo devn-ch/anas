@@ -321,6 +321,16 @@ export async function setAhrScrubEnabled(
     return
   }
 
+  // Disabling a pool that was never enabled is a NO-OP, and saying so is the
+  // whole fix (sixth pass, N4). Without this line a pool absent from the list
+  // — including a node with no ANAS schedule at all, where `pools` is empty —
+  // filtered to an empty list, which read as "the LAST pool just went off" and
+  // turned mdadm's mdcheck timers ON with `--now`. That started a node-wide md
+  // parity check nobody asked for, from a toggle that changed nothing.
+  // mdcheck is given back only when ANAS actually took it.
+  if (!pools.includes(pool))
+    return
+
   const nextPools = pools.filter(p => p !== pool)
   if (nextPools.length === 0) {
     await removeScrubUnits(executor, dir)

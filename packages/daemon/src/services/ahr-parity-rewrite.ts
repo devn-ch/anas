@@ -182,13 +182,26 @@ function gib(bytes: number): string {
  * preallocates, so a file without checksums on an AHR pool got there by hand,
  * and this verb would bless rot inside it exactly as it would bless data rot.
  */
-export function parityRewriteWarnings(poolName: string, array: ParityRewriteArray): string[] {
+export function parityRewriteWarnings(
+  poolName: string,
+  array: ParityRewriteArray,
+  poolUsedBytes: number | null = null,
+): string[] {
   const perPass = array.heightBytes / PARITY_REWRITE_RATE_BYTES_S
+  // Phase 1 is a scrub of the WHOLE POOL, not of this band, and on a pool with
+  // real data in it that is usually the longest part of the run by a wide
+  // margin — a confirm gate that quotes only the two md passes understates the
+  // wait it is asking the operator to agree to (sixth pass, N8). The pool's
+  // used bytes come from the topology the route already read; a pool that
+  // cannot report them says so rather than quoting a number it does not have.
+  const scrub = poolUsedBytes !== null && poolUsedBytes > 0
+    ? `after a full checksum scrub of the pool (${gib(poolUsedBytes)} of data, ≈${approximateDuration(poolUsedBytes / PARITY_REWRITE_RATE_BYTES_S)}, usually the dominant term)`
+    : 'after a full checksum scrub of the pool, whose duration this node could not estimate — on a pool with real data in it that pass is usually the dominant term'
   return [
     `Parity on band r${array.band} is recomputed from the data AS IT IS NOW — md counts mismatching stripes, it never says which member is wrong, so whatever the data members hold becomes the truth for this band`,
     `A fresh btrfs scrub of the whole pool runs FIRST and any finding aborts the run before md is touched: data rot has to be repaired (Repair from parity) before parity is rewritten, because md repair would make that rot permanent and invisible`,
     `Files WITHOUT checksums are not protected — a hand-set NOCOW (chattr +C) file or a preallocated range has no checksum to prove it right, so rot inside one would be blessed by this run. ANAS creates neither, and cannot see into one it did not create`,
-    `The run reads every member of band r${array.band} twice — the repair pass, then a verifying check: ${gib(array.heightBytes)} per member each time across ${array.members} member(s), about ${approximateDuration(perPass)} per pass (~${approximateDuration(perPass * 2)} in total) assuming a deliberately conservative 60 MiB/s per member. Real disks are usually faster; the pool stays usable throughout, slower`,
+    `The run reads every member of band r${array.band} twice — the repair pass, then a verifying check: ${gib(array.heightBytes)} per member each time across ${array.members} member(s), about ${approximateDuration(perPass)} per pass (~${approximateDuration(perPass * 2)} in total), ${scrub}. All of it assumes a deliberately conservative 60 MiB/s per member; real disks are usually faster, and the pool stays usable throughout, slower`,
     `Nothing else is touched: no file is written, no other band of pool '${poolName}' is read, and no md knob is left changed`,
     `This is never automatic — nothing in ANAS rewrites parity unless an operator asks for this band, with this proof in hand`,
   ]
@@ -279,11 +292,40 @@ export function parityRewriteEvidence(poolName: string, job: Job | undefined, ba
   return { ok: true, mismatchCnt: row.mismatchCnt, jobId: job.id }
 }
 
+/** A refusal with the code a parser keys on, or null when the band may be rewritten. */
+export interface ParityRewriteRefusal {
+  reason: string
+  code: AhrParityRewriteReasonCode
+}
+
+/**
+ * The sentence a RAID1 band is refused with (sixth pass, N1).
+ *
+ * md's `repair` does not arbitrate. On a parity level it recomputes P (and Q)
+ * from the data members, which is why the data-intact case has a verb at all.
+ * On a MIRROR there is no parity to recompute: md copies the first in-sync leg
+ * over every other leg, and nothing in that choice looks at which leg is right.
+ * Running it on a band whose legs disagree is a coin flip that writes the
+ * rotten copy over the good one half the time — the exact data loss this epic
+ * exists to prevent.
+ *
+ * A mirror mismatch is not unrepairable, it is repaired by a DIFFERENT verb:
+ * Repair from parity reads the block, arbitrates the legs against the checksum
+ * btrfs stored for it, and writes back only the leg that matches.
+ */
+export function mirrorBandRefusal(device: string): string {
+  return `${device} is a RAID1 mirror band — there is no parity on it to rewrite. md's repair on a mirror copies the first in-sync leg over the others without looking at which one is right, so on a band whose legs disagree it overwrites the good copy half the time. A mirror mismatch is arbitrated by Repair from parity per block, never by md repair`
+}
+
 /** Why this band cannot be rewritten right now (precondition 2), or null. */
-export async function parityRewriteArrayRefusal(geo: MdGeometry): Promise<string | null> {
+export async function parityRewriteArrayRefusal(geo: MdGeometry): Promise<ParityRewriteRefusal | null> {
+  // FIRST, and not a state that can pass: every other refusal here is "not
+  // now", this one is "not this band, ever".
+  if (geo.raid1)
+    return { reason: mirrorBandRefusal(geo.device), code: 'not-a-parity-band' }
   const refusal = await arrayRefusal(geo)
   if (refusal)
-    return refusal
+    return { reason: refusal, code: 'array-busy' }
   // GT-13's trap: an interrupted repair leaves `sync_min`/`sync_max` bounded to
   // ONE STRIPE and the knob PERSISTS. A whole-band repair issued under it would
   // cover that sliver, suspend there, and report a `mismatch_cnt` that means
@@ -292,7 +334,10 @@ export async function parityRewriteArrayRefusal(geo: MdGeometry): Promise<string
   const min = await readMdAttrOrNull(geo.sys, 'sync_min')
   const max = await readMdAttrOrNull(geo.sys, 'sync_max')
   if ((max !== null && max !== MD_DEFAULT_SYNC_MAX) || (min !== null && min !== MD_DEFAULT_SYNC_MIN)) {
-    return `${geo.device}'s sync window is bounded to ${min ?? '?'}..${max ?? '?'} (an interrupted repair or check left it there) — a whole-band repair under it would cover only that sliver. A scrub of the pool restores the window`
+    return {
+      reason: `${geo.device}'s sync window is bounded to ${min ?? '?'}..${max ?? '?'} (an interrupted repair or check left it there) — a whole-band repair under it would cover only that sliver. A scrub of the pool restores the window`,
+      code: 'array-busy',
+    }
   }
   return null
 }
@@ -452,7 +497,7 @@ export async function rewriteBandParity(
   const geo = await readMdGeometry(executor, array.device)
   const busy = await parityRewriteArrayRefusal(geo)
   if (busy)
-    return finish('refused', array.device, { reason: busy, reasonCode: 'array-busy' })
+    return finish('refused', array.device, { reason: busy.reason, reasonCode: busy.code })
 
   // --- Phase 1/3: the fresh btrfs scrub -------------------------------------
   // The evidence scrub can be hours old. md repair recomputes parity from the
@@ -490,9 +535,14 @@ export async function rewriteBandParity(
   const conflictNow = opts.jobConflict?.()
   if (conflictNow)
     return finish('refused', array.device, { reason: `${conflictNow} (re-checked immediately before the md write)`, reasonCode: 'job-active' })
-  const busyNow = (await parityRewriteArrayRefusal(geo)) ?? (await preWriteRefusal(geo))
+  let busyNow: ParityRewriteRefusal | null = await parityRewriteArrayRefusal(geo)
+  if (!busyNow) {
+    const preWrite = await preWriteRefusal(geo)
+    if (preWrite)
+      busyNow = { reason: preWrite, code: 'array-busy' }
+  }
   if (busyNow)
-    return finish('refused', array.device, { reason: `${busyNow} — nothing was written`, reasonCode: 'array-busy' })
+    return finish('refused', array.device, { reason: `${busyNow.reason} — nothing was written`, reasonCode: busyNow.code })
 
   // md zeroes `mismatch_cnt` when a sync op starts, so this read — taken with
   // the array idle, immediately before the repair — is the last completed

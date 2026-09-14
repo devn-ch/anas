@@ -1194,26 +1194,32 @@ function parityTitle(parity: { band: string }[]): string {
  *
  * Phase 1 counted `mismatch_cnt > 0` on a band and phase 2 attributed no
  * corrupt file, so the "phase 2 will name the files" promise came back empty.
- * That silence is itself the finding: with every data block passing its
- * checksum, the parity (or Q) member is what disagrees with the data — and
- * nothing in ANAS repairs parity. The one risk to name is the standing one:
- * at the NEXT disk failure in that band, md reconstructs from the wrong
- * parity. What the operator does about that is a deliberate decision (no
- * md-repair advice is given here); the doc anchor records what is known.
- *
  * `dataClean` is only ever true when the checksum scrub reported NO errors at
- * all — then "every file's checksum passes" is a fact. When phase 2 DID
- * report errors that named no file, the data is not proven clean and the
- * body says so rather than overclaiming.
+ * all — then "every file's checksum passes" is a fact, and only then does the
+ * parity assertion follow from it: every block md would recompute parity FROM
+ * is proven right, so the member that disagrees is the parity one. That arm
+ * also has a VERB now (selfheal.10) and says so.
+ *
+ * When phase 2 DID report errors that named no file, neither of those holds
+ * (sixth pass, N6). The body used to assert the parity conclusion in both arms
+ * and then tell the operator "nothing in ANAS repairs parity", which stopped
+ * being true when Rewrite parity shipped. The not-clean arm now says what to
+ * do FIRST instead: the rewrite is refused while any finding stands, because
+ * md would recompute parity from the corrupt data and make the rot permanent.
  */
 function parityBody(pool: AhrPool, parity: { band: string, mismatchCnt: number }[], dataClean: boolean): string {
   const bands = parity.map(p => `${p.band} (${p.mismatchCnt})`).join(', ')
-  const found = dataClean
-    ? 'the checksum scrub found no corrupt files — every file\'s checksum passes'
-    : 'the checksum scrub reported errors but named no file, so this scrub cannot tell whether the rot is in parity or in data'
-  return `Parity mismatch on ${bands}, but ${found}. `
-    + `The rot is in the PARITY (or Q) member of the band, not in the data. `
-    + `Nothing in ANAS repairs parity; at the next disk failure in this band, md would reconstruct from the wrong parity. `
+  if (dataClean) {
+    return `Parity mismatch on ${bands}, but the checksum scrub found no corrupt files — every file's checksum passes. `
+      + `The rot is in the PARITY (or Q) member of the band, not in the data. `
+      + `Rewrite it from the pool's Scrubs row: Scrubs → parity mismatch → Rewrite parity (a fresh checksum scrub runs first, and any finding aborts the run before md is touched). `
+      + `Until that runs, at the next disk failure in this band md would reconstruct from the wrong parity. `
+      + `See docs/AHR-DESIGN.md §7.2 (parity-only rot).`
+  }
+  return `Parity mismatch on ${bands}. The checksum scrub reported errors but named no file, so this scrub cannot tell whether the rot is in parity or in data. `
+    + `Do the data first: repair from parity any file a scrub names (Scrubs → the pool's findings), then scrub pool '${pool.name}' again and see what the second run says. `
+    + `Rewrite parity is refused while a finding stands — md recomputes parity from the data as it is, so running it over rot would make that rot permanent and invisible. `
+    + `At the next disk failure in this band, md would reconstruct from parity nothing has proven right. `
     + `See docs/AHR-DESIGN.md §7.2 (parity-only rot).`
 }
 
@@ -1297,283 +1303,319 @@ export async function scrubAhrPool(
   // scrub did not check must never read as coverage.
   const bandsChecked: string[] = []
   const bandsSkipped: { band: string, reason: string }[] = []
-  const parityMismatches: { band: string, bandIndex: number, array: string, mismatchCnt: number }[] = []
+  const parityMismatches: { band: string, bandIndex: number, array: string, mismatchCnt: number, level: string }[] = []
   const order = pool.arrays.map((_, i) => i)
   order.sort((x, y) => pool.arrays[x].band - pool.arrays[y].band)
   for (const i of order) {
     const array = pool.arrays[i]
     const label = `${name}-r${array.band}`
-    updateProgress(`phase 1/2: md parity check on ${label}`)
+    /**
+     * This band's md kernel name, once it resolves — the key the `finally`
+     * below retires (sixth pass, N3).
+     *
+     * `markCheckIssued` is what licenses ANAS to write `idle` to an array
+     * (D2), and it used to be taken back only inside `cancelBandCheck` —
+     * the abandonment path. Every band checked SUCCESSFULLY, and every band
+     * skipped before that cancel, left its token in the set for the life of
+     * the daemon. A later check on that array — mdcheck's, or one an
+     * operator started — then read as ours, and the next thing to ask
+     * `ownsSyncOp` would have written `idle` over somebody else's op.
+     */
+    let bandKernel: string | null = null
+    try {
+      updateProgress(`phase 1/2: md parity check on ${label}`)
 
-    // /proc/mdstat keys arrays by transient kernel names (GT-2). Resolve the
-    // CURRENT kernel name from the stable pin symlink (array.device is always
-    // /dev/md/<pool>-r<band>) at point-of-use — NEVER trust array.kernelName
-    // from the route-time topology read: md kernel numbers re-enumerate AND get
-    // reused across any reassembly between the route read and this check, so a
-    // stale md127 could match a DIFFERENT array in mdstat and make us wait on
-    // the wrong device (or none). Resolved BEFORE the check is issued so the
-    // pre-check snapshot below is genuinely "before"; the check is issued
-    // either way, so an unresolvable name costs the wait, never the check.
-    const rp = await executor.exec(REALPATH, [array.device])
-    const kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
-    // What md had last run here BEFORE this check, AND the counter it left —
-    // together, the only evidence that says whether a check no poll ever saw
-    // was ours and ran to the end (F11, third pass).
-    //
-    // `last_sync_action` on its own proves nothing about THIS check. It is
-    // PERSISTENT: any node that has ever run mdcheck reads `check` there for
-    // ever, so "idle and last_sync_action=check" is the resting state of a
-    // perfectly ordinary array and matches a check that was aborted two
-    // seconds in by a member failure exactly as well as one that completed.
-    // `mismatch_cnt` is the discriminator — md ZEROES it when a sync op
-    // starts, so a counter that MOVED since this snapshot is proof a sync op
-    // ran here after we issued ours.
-    const priorAction = kernelName ? await lastSyncAction(executor, kernelName) : null
-    const priorMismatch = kernelName ? await mismatchCount(executor, kernelName) : null
+      // /proc/mdstat keys arrays by transient kernel names (GT-2). Resolve the
+      // CURRENT kernel name from the stable pin symlink (array.device is always
+      // /dev/md/<pool>-r<band>) at point-of-use — NEVER trust array.kernelName
+      // from the route-time topology read: md kernel numbers re-enumerate AND get
+      // reused across any reassembly between the route read and this check, so a
+      // stale md127 could match a DIFFERENT array in mdstat and make us wait on
+      // the wrong device (or none). Resolved BEFORE the check is issued so the
+      // pre-check snapshot below is genuinely "before"; the check is issued
+      // either way, so an unresolvable name costs the wait, never the check.
+      const rp = await executor.exec(REALPATH, [array.device])
+      const kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
+      bandKernel = kernelName
+      // What md had last run here BEFORE this check, AND the counter it left —
+      // together, the only evidence that says whether a check no poll ever saw
+      // was ours and ran to the end (F11, third pass).
+      //
+      // `last_sync_action` on its own proves nothing about THIS check. It is
+      // PERSISTENT: any node that has ever run mdcheck reads `check` there for
+      // ever, so "idle and last_sync_action=check" is the resting state of a
+      // perfectly ordinary array and matches a check that was aborted two
+      // seconds in by a member failure exactly as well as one that completed.
+      // `mismatch_cnt` is the discriminator — md ZEROES it when a sync op
+      // starts, so a counter that MOVED since this snapshot is proof a sync op
+      // ran here after we issued ours.
+      const priorAction = kernelName ? await lastSyncAction(executor, kernelName) : null
+      const priorMismatch = kernelName ? await mismatchCount(executor, kernelName) : null
 
-    if (kernelName) {
-      // S3: the route read the pool's state once, and bands are checked one at
-      // a time over hours. A member that failed since then has md recovering
-      // onto a spare RIGHT NOW, and issuing a check into that either bounces
-      // (mdadm exits non-zero and `run` throws, failing the whole scrub) or —
-      // worse, once the cancel path runs — aborts the rebuild. Re-read what md
-      // is doing immediately before issuing, per band.
-      const busy = await syncAction(executor, kernelName)
-      if (!isIdleAction(busy)) {
-        updateProgress(`${label} was not checked (md is running ${busy}) — a parity check would fight the operation md is already running on that band`)
-        bandsSkipped.push({ band: label, reason: `md was running '${busy}' when this band's turn came` })
-        continue
-      }
-      // D4(b): a repair that was killed mid-sequence leaves `sync_max` bounded
-      // to ONE STRIPE, and the knob PERSISTS (GT-13's trap) — a check issued
-      // under it covers that stripe, suspends, and the finish-wait then holds
-      // the pool's job exclusion for the full ceiling. The band is idle (just
-      // proven), so the window can simply be put back.
-      const syncMax = await readSyncValue(kernelName, 'sync_max')
-      const syncMin = await readSyncValue(kernelName, 'sync_min')
-      if ((syncMax !== null && syncMax !== MD_DEFAULT_SYNC_MAX) || (syncMin !== null && syncMin !== MD_DEFAULT_SYNC_MIN)) {
-        const widened = await restoreSyncWindow(kernelName)
-        if (widened) {
-          updateProgress(`${label}: sync window was bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} (an interrupted repair left it there) — restored to ${MD_DEFAULT_SYNC_MIN}..${MD_DEFAULT_SYNC_MAX} before issuing the check`)
-        }
-        else {
-          updateProgress(`${label} was not checked — its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored, so a check would cover that sliver of the band and suspend there`)
-          bandsSkipped.push({ band: label, reason: `its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored` })
+      if (kernelName) {
+        // S3: the route read the pool's state once, and bands are checked one at
+        // a time over hours. A member that failed since then has md recovering
+        // onto a spare RIGHT NOW, and issuing a check into that either bounces
+        // (mdadm exits non-zero and `run` throws, failing the whole scrub) or —
+        // worse, once the cancel path runs — aborts the rebuild. Re-read what md
+        // is doing immediately before issuing, per band.
+        const busy = await syncAction(executor, kernelName)
+        if (!isIdleAction(busy)) {
+          updateProgress(`${label} was not checked (md is running ${busy}) — a parity check would fight the operation md is already running on that band`)
+          bandsSkipped.push({ band: label, reason: `md was running '${busy}' when this band's turn came` })
           continue
         }
-      }
-    }
-
-    // Issued without `run`: a band that entered recovery in the few
-    // milliseconds since the read above makes mdadm exit non-zero, and one
-    // band's refusal must not fail the whole scrub (S3).
-    const issue = await executor.exec(MDADM, ['--action=check', array.device])
-    if (issue.exitCode !== 0) {
-      updateProgress(`${label} was not checked (mdadm --action=check exited ${issue.exitCode}${issue.stderr.trim() ? `: ${issue.stderr.trim()}` : ''})`)
-      bandsSkipped.push({ band: label, reason: `mdadm --action=check exited ${issue.exitCode}${issue.stderr.trim() ? `: ${issue.stderr.trim()}` : ''}` })
-      continue
-    }
-    if (kernelName) {
-      // From here on THIS scrub owns the check on this band, and only now may
-      // it write `idle` there (D2).
-      markCheckIssued(kernelName)
-    }
-
-    if (!kernelName) {
-      // A FOURTH abandonment path (fourth pass): the check above WAS issued —
-      // the comment before the resolution says so deliberately — so walking
-      // away without taking it back would leave it armed beside the next
-      // band's check. It cannot be taken back safely either: with no kernel
-      // name there is no `sync_action` to prove the check is still what md is
-      // running, and an unprovable `idle` is the write that aborts a rebuild.
-      updateProgress(await cancelBandCheck(executor, array.device, null, label, null))
-      updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
-      bandsSkipped.push({ band: label, reason: 'the md device could not be resolved to a kernel name' })
-      continue
-    }
-    // WAIT FOR IT TO START before waiting for it to finish. md takes the write
-    // to `sync_action` asynchronously; a first mdstat read that lands before
-    // the sync thread is running shows no check, which the finish-wait below
-    // would read as "already done" — and then the mismatch_cnt read belongs to
-    // an earlier check and phase 2 runs while md's check is under it.
-    let started = false
-    let observable = true
-    let alreadyFinished = false
-    /** The proven verdict of a check that finished before the first poll. */
-    let finishedMismatch: number | null = null
-    /** md is idle and last ran a check, but nothing proves it was THIS one. */
-    let checkStateUnknown = false
-    const startDeadline = Date.now() + (opts?.checkStartTimeoutMs ?? AHR_SCRUB_CHECK_START_TIMEOUT_MS)
-    for (;;) {
-      const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
-        .find(a => a.kernelName === kernelName)
-      if (md && (md.sync?.action === 'check' || md.syncDelayed || md.syncPending)) {
-        started = true
-        break
-      }
-      const action = await syncAction(executor, kernelName)
-      if (action === null) {
-        // No `sync_action` to watch — there is no signal here to wait on, so
-        // this band keeps the plain mdstat wait rather than burning the window.
-        observable = false
-        break
-      }
-      if (!isIdleAction(action)) {
-        started = true
-        break
-      }
-      if (Date.now() >= startDeadline) {
-        // Three states look identical here — a small band's check that RAN TO
-        // COMPLETION between mdadm returning and the first poll (F11), a check
-        // md never took at all, and a check that started and died two seconds
-        // in — and md is idle in all three. They are told apart from md's own
-        // records, and a band is counted only when all of the evidence agrees
-        // (third pass, T2):
-        //
-        //   · `last_sync_action` = check  — the last op md RAN here was a check
-        //   · `mismatch_cnt` MOVED        — md zeroed it at a sync start, so
-        //                                   the number is a new one, not the
-        //                                   stale one this band already held
-        //   · `sync_action` idle          — whatever ran, it is over
-        //
-        // Anything short of that is "unknown", NOT a verdict: no rot is
-        // claimed from a counter that may be a previous check's, and no clean
-        // bill is given to a band whose check may have died at 2%.
-        const lastAction = await lastSyncAction(executor, kernelName)
-        if (lastAction !== 'check')
-          break // md's last op here was not a check at all: ours never started.
-        // The counter finalizes as the sync thread winds down, the same settle
-        // the verdict read below takes.
-        await sleep(mismatchDelay)
-        const nowMismatch = await mismatchCount(executor, kernelName)
-        if (priorMismatch !== null && nowMismatch !== null && nowMismatch !== priorMismatch) {
-          alreadyFinished = true
-          finishedMismatch = nowMismatch
-          updateProgress(
-            `md check on ${label} finished before the first poll`
-            + `${priorAction !== null && priorAction !== 'check' ? ` (md was last running '${priorAction}')` : ''}`
-            + ` — its counter moved from ${priorMismatch} to ${nowMismatch}`,
-          )
+        // D4(b): a repair that was killed mid-sequence leaves `sync_max` bounded
+        // to ONE STRIPE, and the knob PERSISTS (GT-13's trap) — a check issued
+        // under it covers that stripe, suspends, and the finish-wait then holds
+        // the pool's job exclusion for the full ceiling. The band is idle (just
+        // proven), so the window can simply be put back.
+        const syncMax = await readSyncValue(kernelName, 'sync_max')
+        const syncMin = await readSyncValue(kernelName, 'sync_min')
+        if ((syncMax !== null && syncMax !== MD_DEFAULT_SYNC_MAX) || (syncMin !== null && syncMin !== MD_DEFAULT_SYNC_MIN)) {
+          const widened = await restoreSyncWindow(kernelName)
+          if (widened) {
+            updateProgress(`${label}: sync window was bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} (an interrupted repair left it there) — restored to ${MD_DEFAULT_SYNC_MIN}..${MD_DEFAULT_SYNC_MAX} before issuing the check`)
+          }
+          else {
+            updateProgress(`${label} was not checked — its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored, so a check would cover that sliver of the band and suspend there`)
+            bandsSkipped.push({ band: label, reason: `its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored` })
+            continue
+          }
         }
-        else {
-          checkStateUnknown = true
-        }
-        break
       }
-      updateProgress(`md check on ${label} (waiting for md to start it)`)
-      await sleep(interval)
-    }
-    if (!started && observable && !alreadyFinished) {
-      // Say it, and read NO counter as a verdict: `mismatch_cnt` still holds
-      // whatever the last check that DID run left there, and reporting it as
-      // this scrub's verdict would invent rot (or, worse, clear a real
-      // finding). `priorAction` earns its snapshot here — md updates
-      // `last_sync_action` when an op BEGINS, so a value that changed under us
-      // says md did take a check, and an unmoved counter then says that check
-      // did not run to the end.
-      updateProgress(
-        !checkStateUnknown
-          ? `md never started the check on ${label} — this band was not checked (its mismatch_cnt belongs to an earlier check)`
-          : priorAction !== 'check'
-            ? `check state unknown on ${label} — not counted (md took a check and is idle again, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing says the check ran to the end)`
-            : `check state unknown on ${label} — not counted (md is idle and last ran a check, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing tells this scrub's check from an earlier one)`,
-      )
-      // The skip rides the result (D8): the band reads as "not checked", with
-      // the same why the progress line just gave the operator.
-      bandsSkipped.push({
-        band: label,
-        reason: !checkStateUnknown
-          ? 'md never started the check'
-          : 'check state unknown — nothing proves md ran the check to the end',
-      })
-      continue
-    }
 
-    // FINISH-WAIT, with a deadline policy (second-pass review F3). A `check`
-    // in progress is waited on for as long as it takes — hours or days on a
-    // real band. What is NOT waited on is md doing something else: `frozen`,
-    // or a resync/recover/reshape/repair that replaced our check, means this
-    // band is not being checked for us and never will be in this run. Waiting
-    // on those spun the job forever, and with the active-job exclusion (R7)
-    // that refused every later scrub and repair on the pool until a restart.
-    let checked = true
-    /** What md was doing when this band's finish-wait gave up on it (T4). */
-    let abandonedOn: string | null = null
-    /** Why the band was not checked, for the result's `bandsSkipped` (D8). */
-    let skippedReason: string | null = null
-    if (!alreadyFinished) {
-      const finishDeadline = Date.now() + (opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)
+      // Issued without `run`: a band that entered recovery in the few
+      // milliseconds since the read above makes mdadm exit non-zero, and one
+      // band's refusal must not fail the whole scrub (S3).
+      const issue = await executor.exec(MDADM, ['--action=check', array.device])
+      if (issue.exitCode !== 0) {
+        updateProgress(`${label} was not checked (mdadm --action=check exited ${issue.exitCode}${issue.stderr.trim() ? `: ${issue.stderr.trim()}` : ''})`)
+        bandsSkipped.push({ band: label, reason: `mdadm --action=check exited ${issue.exitCode}${issue.stderr.trim() ? `: ${issue.stderr.trim()}` : ''}` })
+        continue
+      }
+      if (kernelName) {
+        // From here on THIS scrub owns the check on this band, and only now may
+        // it write `idle` there (D2).
+        markCheckIssued(kernelName)
+      }
+
+      if (!kernelName) {
+        // A FOURTH abandonment path (fourth pass): the check above WAS issued —
+        // the comment before the resolution says so deliberately — so walking
+        // away without taking it back would leave it armed beside the next
+        // band's check. It cannot be taken back safely either: with no kernel
+        // name there is no `sync_action` to prove the check is still what md is
+        // running, and an unprovable `idle` is the write that aborts a rebuild.
+        updateProgress(await cancelBandCheck(executor, array.device, null, label, null))
+        updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
+        bandsSkipped.push({ band: label, reason: 'the md device could not be resolved to a kernel name' })
+        continue
+      }
+      // WAIT FOR IT TO START before waiting for it to finish. md takes the write
+      // to `sync_action` asynchronously; a first mdstat read that lands before
+      // the sync thread is running shows no check, which the finish-wait below
+      // would read as "already done" — and then the mismatch_cnt read belongs to
+      // an earlier check and phase 2 runs while md's check is under it.
+      let started = false
+      let observable = true
+      let alreadyFinished = false
+      /** The proven verdict of a check that finished before the first poll. */
+      let finishedMismatch: number | null = null
+      /** md is idle and last ran a check, but nothing proves it was THIS one. */
+      let checkStateUnknown = false
+      const startDeadline = Date.now() + (opts?.checkStartTimeoutMs ?? AHR_SCRUB_CHECK_START_TIMEOUT_MS)
       for (;;) {
         const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
           .find(a => a.kernelName === kernelName)
+        if (md && (md.sync?.action === 'check' || md.syncDelayed || md.syncPending)) {
+          started = true
+          break
+        }
         const action = await syncAction(executor, kernelName)
-        // Array gone from mdstat, or its check finished (and is not queued/parked
-        // behind another sync): move to the next band. A `resync=PENDING` check
-        // (syncPending, sync still null — e.g. an auto-read-only array parks its
-        // check until first write, GT-9) is IN-FLIGHT, not finished: treating it
-        // as done lets the next band's check start and the pending one later
-        // fires concurrently, breaking the strictly-sequential guarantee (§4).
-        // sysfs is consulted alongside mdstat: an op that has left mdstat's
-        // progress line but not yet gone idle is still running.
-        const mdstatIdle = !md || (md.sync?.action !== 'check' && !md.syncDelayed && !md.syncPending)
-        const sysfsIdle = isIdleAction(action)
-        if (mdstatIdle && sysfsIdle)
-          break
-        if (action !== null && !isIdleAction(action) && action !== 'check') {
-          // No counter read: whatever `mismatch_cnt` holds is not this band's
-          // check verdict, and a resync/recover/reshape overwrites it anyway.
-          updateProgress(`${label} was not checked (sync_action=${action}) — md is not running this scrub's check on that band`)
-          checked = false
-          abandonedOn = action
-          skippedReason = `md was running '${action}' instead of this scrub's check`
+        if (action === null) {
+          // No `sync_action` to watch — there is no signal here to wait on, so
+          // this band keeps the plain mdstat wait rather than burning the window.
+          observable = false
           break
         }
-        if (Date.now() >= finishDeadline) {
-          updateProgress(`${label} was not checked (sync_action=${action ?? 'unreadable'}) — still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling; not waiting on it any longer`)
-          checked = false
-          abandonedOn = action
-          skippedReason = `still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling — the check may still be running`
+        if (!isIdleAction(action)) {
+          started = true
           break
         }
-        updateProgress(`md check on ${label}${md?.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
+        if (Date.now() >= startDeadline) {
+          // Three states look identical here — a small band's check that RAN TO
+          // COMPLETION between mdadm returning and the first poll (F11), a check
+          // md never took at all, and a check that started and died two seconds
+          // in — and md is idle in all three. They are told apart from md's own
+          // records, and a band is counted only when all of the evidence agrees
+          // (third pass, T2):
+          //
+          //   · `last_sync_action` = check  — the last op md RAN here was a check
+          //   · `mismatch_cnt` MOVED        — md zeroed it at a sync start, so
+          //                                   the number is a new one, not the
+          //                                   stale one this band already held
+          //   · `sync_action` idle          — whatever ran, it is over
+          //
+          // Anything short of that is "unknown", NOT a verdict: no rot is
+          // claimed from a counter that may be a previous check's, and no clean
+          // bill is given to a band whose check may have died at 2%.
+          const lastAction = await lastSyncAction(executor, kernelName)
+          if (lastAction !== 'check')
+            break // md's last op here was not a check at all: ours never started.
+          // The counter finalizes as the sync thread winds down, the same settle
+          // the verdict read below takes.
+          await sleep(mismatchDelay)
+          const nowMismatch = await mismatchCount(executor, kernelName)
+          if (priorMismatch !== null && nowMismatch !== null && nowMismatch !== priorMismatch) {
+            alreadyFinished = true
+            finishedMismatch = nowMismatch
+            updateProgress(
+              `md check on ${label} finished before the first poll`
+              + `${priorAction !== null && priorAction !== 'check' ? ` (md was last running '${priorAction}')` : ''}`
+              + ` — its counter moved from ${priorMismatch} to ${nowMismatch}`,
+            )
+          }
+          else {
+            checkStateUnknown = true
+          }
+          break
+        }
+        updateProgress(`md check on ${label} (waiting for md to start it)`)
         await sleep(interval)
       }
-    }
-    if (!checked) {
-      // Never walk away leaving our check armed on the band (T4): the next
-      // band's check is issued immediately after this `continue`.
-      updateProgress(await cancelBandCheck(executor, array.device, kernelName, label, abandonedOn))
-      bandsSkipped.push({ band: label, reason: skippedReason ?? 'the check was abandoned' })
-      continue
-    }
+      if (!started && observable && !alreadyFinished) {
+        // Say it, and read NO counter as a verdict: `mismatch_cnt` still holds
+        // whatever the last check that DID run left there, and reporting it as
+        // this scrub's verdict would invent rot (or, worse, clear a real
+        // finding). `priorAction` earns its snapshot here — md updates
+        // `last_sync_action` when an op BEGINS, so a value that changed under us
+        // says md did take a check, and an unmoved counter then says that check
+        // did not run to the end.
+        updateProgress(
+          !checkStateUnknown
+            ? `md never started the check on ${label} — this band was not checked (its mismatch_cnt belongs to an earlier check)`
+            : priorAction !== 'check'
+              ? `check state unknown on ${label} — not counted (md took a check and is idle again, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing says the check ran to the end)`
+              : `check state unknown on ${label} — not counted (md is idle and last ran a check, but its mismatch_cnt never moved from ${priorMismatch ?? 'unreadable'}, so nothing tells this scrub's check from an earlier one)`,
+        )
+        // The skip rides the result (D8): the band reads as "not checked", with
+        // the same why the progress line just gave the operator.
+        bandsSkipped.push({
+          band: label,
+          reason: !checkStateUnknown
+            ? 'md never started the check'
+            : 'check state unknown — nothing proves md ran the check to the end',
+        })
+        continue
+      }
 
-    // The check's verdict: md counted parity mismatches ⇒ rot EXISTS in this
-    // band. Phase 2 is what names the files, and it starts right now — say so
-    // in one warning rather than leaving the operator staring at a number (§e).
-    // Read only now: idle, plus the settle the counter needs (selfheal.4).
-    // The finished-before-the-first-poll path already took that settle and
-    // read the counter to PROVE the check ran — that read IS the verdict, and
-    // reading again would only risk catching the zero of a newer sync op.
-    let mismatches: number | null
-    if (alreadyFinished) {
-      mismatches = finishedMismatch
+      // FINISH-WAIT, with a deadline policy (second-pass review F3). A `check`
+      // in progress is waited on for as long as it takes — hours or days on a
+      // real band. What is NOT waited on is md doing something else: `frozen`,
+      // or a resync/recover/reshape/repair that replaced our check, means this
+      // band is not being checked for us and never will be in this run. Waiting
+      // on those spun the job forever, and with the active-job exclusion (R7)
+      // that refused every later scrub and repair on the pool until a restart.
+      let checked = true
+      /** What md was doing when this band's finish-wait gave up on it (T4). */
+      let abandonedOn: string | null = null
+      /** Why the band was not checked, for the result's `bandsSkipped` (D8). */
+      let skippedReason: string | null = null
+      if (!alreadyFinished) {
+        const finishDeadline = Date.now() + (opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)
+        for (;;) {
+          const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
+            .find(a => a.kernelName === kernelName)
+          const action = await syncAction(executor, kernelName)
+          // Array gone from mdstat, or its check finished (and is not queued/parked
+          // behind another sync): move to the next band. A `resync=PENDING` check
+          // (syncPending, sync still null — e.g. an auto-read-only array parks its
+          // check until first write, GT-9) is IN-FLIGHT, not finished: treating it
+          // as done lets the next band's check start and the pending one later
+          // fires concurrently, breaking the strictly-sequential guarantee (§4).
+          // sysfs is consulted alongside mdstat: an op that has left mdstat's
+          // progress line but not yet gone idle is still running.
+          const mdstatIdle = !md || (md.sync?.action !== 'check' && !md.syncDelayed && !md.syncPending)
+          const sysfsIdle = isIdleAction(action)
+          if (mdstatIdle && sysfsIdle)
+            break
+          if (action !== null && !isIdleAction(action) && action !== 'check') {
+            // No counter read: whatever `mismatch_cnt` holds is not this band's
+            // check verdict, and a resync/recover/reshape overwrites it anyway.
+            updateProgress(`${label} was not checked (sync_action=${action}) — md is not running this scrub's check on that band`)
+            checked = false
+            abandonedOn = action
+            skippedReason = `md was running '${action}' instead of this scrub's check`
+            break
+          }
+          if (Date.now() >= finishDeadline) {
+            updateProgress(`${label} was not checked (sync_action=${action ?? 'unreadable'}) — still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling; not waiting on it any longer`)
+            checked = false
+            abandonedOn = action
+            skippedReason = `still not idle after the ${ceilingText(opts?.checkFinishCeilingMs ?? AHR_SCRUB_CHECK_FINISH_CEILING_MS)} ceiling — the check may still be running`
+            break
+          }
+          updateProgress(`md check on ${label}${md?.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
+          await sleep(interval)
+        }
+      }
+      if (!checked) {
+        // Never walk away leaving our check armed on the band (T4): the next
+        // band's check is issued immediately after this `continue`.
+        updateProgress(await cancelBandCheck(executor, array.device, kernelName, label, abandonedOn))
+        bandsSkipped.push({ band: label, reason: skippedReason ?? 'the check was abandoned' })
+        continue
+      }
+
+      // The check's verdict: md counted parity mismatches ⇒ rot EXISTS in this
+      // band. Phase 2 is what names the files, and it starts right now — say so
+      // in one warning rather than leaving the operator staring at a number (§e).
+      // Read only now: idle, plus the settle the counter needs (selfheal.4).
+      // The finished-before-the-first-poll path already took that settle and
+      // read the counter to PROVE the check ran — that read IS the verdict, and
+      // reading again would only risk catching the zero of a newer sync op.
+      let mismatches: number | null
+      if (alreadyFinished) {
+        mismatches = finishedMismatch
+      }
+      else {
+        await sleep(mismatchDelay)
+        mismatches = await mismatchCount(executor, kernelName)
+      }
+      // A verdict exists — the band WAS checked, mismatch or not (D8:
+      // `checkedArrays` counts bands actually checked, either way).
+      //
+      // A counter that could NOT BE READ is not a verdict (sixth pass, N12): the
+      // check ran, but nothing came back from it, so the band has no clean bill
+      // and no finding. Counting it as coverage is the same false assurance D8
+      // closed for the bands that were never checked at all.
+      if (mismatches === null) {
+        updateProgress(`${label} was checked, but its mismatch_cnt could not be read — this band has no verdict from this scrub`)
+        bandsSkipped.push({ band: label, reason: 'checked, but its mismatch_cnt could not be read' })
+        continue
+      }
+      bandsChecked.push(label)
+      if (mismatches > 0) {
+        // The band's LEVEL rides the row (N1): md counts mismatching stripes on
+        // a parity band and disagreeing LEGS on a mirror, and only the first has
+        // a Rewrite-parity verb. A consumer that cannot tell them apart must not
+        // offer one.
+        parityMismatches.push({ band: label, bandIndex: array.band, array: array.device, mismatchCnt: mismatches, level: array.level })
+        await pveNotify(
+          executor,
+          'warning',
+          `AHR scrub: parity mismatch on ${label}`,
+          `rot exists in ${label} — phase 2 (running now) checks every file's checksum; `
+          + `if a file is affected, it will be named`,
+        )
+      }
     }
-    else {
-      await sleep(mismatchDelay)
-      mismatches = await mismatchCount(executor, kernelName)
-    }
-    // A verdict exists — the band WAS checked, mismatch or not (D8:
-    // `checkedArrays` counts bands actually checked, either way).
-    bandsChecked.push(label)
-    if (mismatches !== null && mismatches > 0) {
-      parityMismatches.push({ band: label, bandIndex: array.band, array: array.device, mismatchCnt: mismatches })
-      await pveNotify(
-        executor,
-        'warning',
-        `AHR scrub: parity mismatch on ${label}`,
-        `rot exists in ${label} — phase 2 (running now) checks every file's checksum; `
-        + `if a file is affected, it will be named`,
-      )
+    finally {
+      // Ours or not, this scrub is done with this band: the token never
+      // outlives the iteration that took it.
+      if (bandKernel !== null)
+        retireCheckIssued(bandKernel)
     }
   }
 

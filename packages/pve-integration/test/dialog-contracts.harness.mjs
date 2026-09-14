@@ -7561,6 +7561,66 @@ async function rewriteParityRefusedChecks() {
   ok('rewrite: the handler itself refuses, not just the disabled state', sent === null)
 }
 
+// Sixth pass, N1 — a RAID1 band has NO parity to rewrite. md's `repair` on a
+// mirror copies the first in-sync leg over the others without arbitrating, so
+// on a band whose legs disagree it overwrites the good copy half the time. The
+// daemon refuses it outright (409 `not-a-parity-band`); the UI says so first,
+// and never offers the verb.
+async function rewriteParityMirrorChecks() {
+  const MIRROR = {
+    data: [scrubJob({
+      id: 'jmir',
+      at: '2026-09-12T12:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr0-r1', 'ahr0-r2'],
+        parityMismatches: [{ band: 'ahr0-r2', bandIndex: 2, array: '/dev/md/ahr0-r2', mismatchCnt: 6, level: 'raid1' }],
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIRROR })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  // The row's indicator must not promise a verb that does not exist here.
+  const cell = scrubCell(grid, rowFor(grid, 'ahr0'));
+  ok('rewrite: a mirror-only mismatch row does NOT offer "click to rewrite"',
+    !/Click to rewrite/.test(cell), cell)
+  ok('rewrite: …it says there is no parity to rewrite, and names the verb that does arbitrate',
+    /no parity to rewrite/.test(cell) && /Repair from parity/.test(cell), cell)
+
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('rewrite: the mirror row still opens the detail window', !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+  ok('rewrite: the head does not claim the parity member is wrong on a mirror band',
+    !/the parity is what is wrong/.test((win.items.getAt(0) || {}).html || '')
+      && /RAID1 mirror bands/.test((win.items.getAt(0) || {}).html || ''),
+    (win.items.getAt(0) || {}).html)
+
+  const pGrid = win.down('#parityGrid')
+  const btn = win.down('#rewriteParity')
+  ok('rewrite: the band\'s LEVEL rides the row', pGrid.getStore().getAt(0).get('level') === 'raid1')
+  pGrid.selectRows([0])
+  await settle()
+  ok('rewrite: a ticked mirror band leaves the verb dark', btn.disabled === true)
+  ok('rewrite: …with the reason the daemon would 409 with',
+    /no parity to rewrite/.test(btn.tooltip || '')
+      && /never by md repair/.test(btn.tooltip || ''), btn.tooltip)
+
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('rewrite: and the handler refuses it too — nothing is submitted for a mirror band', sent === null)
+}
+
 // Design review 2026-09-14, D15 + S8 — the AHR Snapshots manager meets the
 // repair engine's transient pin. A leftover `anas-selfheal-<ts>` snapshot (the
 // repair's finally failed to delete it) is labelled as what it is and is never
@@ -8291,6 +8351,7 @@ await rewriteParityChecks()
 warnings.length = 0
 created.windows.length = 0
 await rewriteParityRefusedChecks()
+await rewriteParityMirrorChecks()
 warnings.length = 0
 created.windows.length = 0
 await ahrSnapshotPinChecks()

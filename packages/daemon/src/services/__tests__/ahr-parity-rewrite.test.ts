@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { AhrParityRewriteResult, AhrScrubParityMismatch } from '@anas/shared'
 import {
   approximateDuration,
+  PARITY_REWRITE_RATE_BYTES_S,
   parityRewriteEvidence,
   parityRewriteWarnings,
   rewriteBandParity,
@@ -66,14 +67,17 @@ class FakeMd implements CommandExecutor {
   private running: string | null = null
   private left = 0
   private reads = 0
+  /** Which captured band this fake IS — raid5 by default, raid1 for N1. */
+  private readonly level: 'raid1' | 'raid5'
 
-  constructor() {
+  constructor(level: 'raid1' | 'raid5' = 'raid5') {
+    this.level = level
     this.root = mkdtempSync(join(tmpdir(), 'anas-parity-'))
     this.sys = join(this.root, 'sys/block/md127/md')
     this.mountpoint = join(this.root, 'mnt')
     mkdirSync(this.sys, { recursive: true })
     mkdirSync(this.mountpoint, { recursive: true })
-    for (const line of fixture('md-sysfs-raid5.txt').split('\n')) {
+    for (const line of fixture(`md-sysfs-${level}.txt`).split('\n')) {
       const eq = line.indexOf('=')
       if (eq <= 0 || line.slice(eq + 1) === '<absent>')
         continue
@@ -161,7 +165,7 @@ class FakeMd implements CommandExecutor {
         this.set('mismatch_cnt', '0') // md zeroes the counter at a sync start
         return ok()
       }
-      return ok(fixture('mdadm-detail-export-raid5.txt'))
+      return ok(fixture(`mdadm-detail-export-${this.level}.txt`))
     }
     if (command === '/usr/bin/btrfs') {
       if (args[1] === 'start')
@@ -395,6 +399,35 @@ describe('rewriteBandParity — the sequence', () => {
     assert.equal(md.knob('last_sync_action'), 'check')
   })
 
+  it('REFUSES a RAID1 mirror band outright — md repair there is a coin flip on the good copy (N1)', async () => {
+    // The fixture is the captured RAID1 band (`md-sysfs-raid1.txt`): md counts
+    // legs that disagree with each other, and `repair` resolves that by copying
+    // the FIRST in-sync leg over the rest without looking at which one is
+    // right. On a band whose legs disagree that overwrites the good copy half
+    // the time — data loss, from the verb that exists to prevent it.
+    const mirror = new FakeMd('raid1')
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = mirror.root
+    try {
+      const result = await rewriteBandParity(mirror, mirror.pool(), 1, { ...FAST, evidence: () => PROVEN })
+      assert.equal(result.outcome, 'refused')
+      assert.equal(result.reasonCode, 'not-a-parity-band')
+      assert.ok(result.reason?.includes('RAID1 mirror band'), result.reason)
+      assert.ok(
+        result.reason?.includes('arbitrated by Repair from parity per block, never by md repair'),
+        result.reason,
+      )
+      // NOTHING was handed to md — not the repair, not the verifying check.
+      assert.deepEqual(mirror.actions(), [])
+      // And not even the fresh scrub: the band is wrong, so the run stops at
+      // the gate rather than reading the whole pool first.
+      assert.deepEqual(mirror.calls.filter(c => c.command === '/usr/bin/btrfs'), [])
+    }
+    finally {
+      mirror.cleanup()
+      process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+    }
+  })
+
   it('the result is the shared schema, round-trip', async () => {
     const result = await rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN })
     const round = AhrParityRewriteResult.parse(JSON.parse(JSON.stringify(result)))
@@ -482,6 +515,23 @@ describe('the confirm gate\'s warnings', () => {
     // 4 TiB per member at 60 MiB/s is ~19 h a pass — the warning must not
     // round that into something that reads like minutes.
     assert.ok(warnings.some(w => /\d+ h/.test(w)), warnings.join('\n'))
+  })
+
+  it('the estimate INCLUDES phase 1\'s full-pool checksum scrub (N8)', () => {
+    // 30 TiB of data at the same conservative 60 MiB/s is ~145 h — an order of
+    // magnitude more than the two md passes over a 4 TiB band, and the gate
+    // used to quote only the md passes.
+    const used = 30 * 1024 * 1024 * 1024 * 1024
+    const warnings = parityRewriteWarnings('tank', array, used)
+    const line = warnings.find(w => w.includes('after a full checksum scrub of the pool'))
+    assert.ok(line, warnings.join('\n'))
+    assert.ok(line.includes('usually the dominant term'), line)
+    assert.ok(line.includes(approximateDuration(used / PARITY_REWRITE_RATE_BYTES_S)), line)
+
+    // A pool that cannot report its used bytes says so rather than quoting a
+    // number it does not have.
+    const unknown = parityRewriteWarnings('tank', array).find(w => w.includes('full checksum scrub of the pool'))
+    assert.ok(unknown?.includes('could not estimate'), unknown)
   })
 
   it('rounds an estimate the way an estimate should be read', () => {

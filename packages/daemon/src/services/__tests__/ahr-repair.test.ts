@@ -312,6 +312,81 @@ describe('AHR repair job — the one notification', () => {
     assert.doesNotMatch(notify.body, /restore this file from backup/)
   })
 
+  it('a LUN image whose unrepairable blocks are ALL csum-unreadable is NOT told to restore (N5)', async () => {
+    // Both facts are true of this file, and they are not the same kind of fact.
+    // "It is a LUN" says WHICH restore verb would apply; "the checksum could
+    // not be read" says a restore is the wrong action — nothing has confirmed
+    // the block is corrupt, and restoring a LUN image overwrites a guest's
+    // disk on no evidence. LUN-ness used to be tested first and won.
+    const exec = executor()
+    const LUN = `${MOUNTPOINT}/lun-images/win.lun`
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: LUN, blocks: [4, 5] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(
+          req.file,
+          req.block,
+          'unrepairable',
+          'the metadata copy holding the checksum is damaged',
+          SELFHEAL_CSUM_UNREADABLE,
+        ),
+        lunHeld: async path => path === LUN
+          ? {
+              targetIqn: 'iqn.2026-01.org.anas:storage.tank',
+              index: 3,
+              name: 'win-lun-3',
+              backingPath: LUN,
+              connectedInitiators: [],
+              detail: 'held by iqn.1998-01.com.vmware:esx1',
+            }
+          : null,
+      },
+    )
+    const notify = notification(exec)!
+    // No restore verb of any kind…
+    assert.doesNotMatch(notify.body, /restore this file from backup/)
+    assert.doesNotMatch(notify.body, /Restore as new LUN/)
+    assert.doesNotMatch(notify.body, /restore the LUN image/)
+    // …and the re-scrub advice stands, with the LUN identity composed in so the
+    // operator still knows what the file is.
+    assert.match(notify.body, /the file's checksum could not be read reliably; re-scrub after the metadata is repaired/)
+    assert.match(notify.body, /backs iSCSI LUN iqn\.2026-01\.org\.anas:storage\.tank\/3/)
+  })
+
+  it('a LUN image with a MIXED unrepairable file still gets the LUN restore advice (N5, the other side)', async () => {
+    const exec = executor()
+    const LUN = `${MOUNTPOINT}/lun-images/win.lun`
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: LUN, blocks: [4, 5] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(
+          req.file,
+          req.block,
+          'unrepairable',
+          req.block === 4 ? 'the metadata copy holding the checksum is damaged' : 'both legs unreadable',
+          req.block === 4 ? SELFHEAL_CSUM_UNREADABLE : undefined,
+        ),
+        lunHeld: async () => ({
+          targetIqn: 'iqn.2026-01.org.anas:storage.tank',
+          index: 3,
+          name: 'win-lun-3',
+          backingPath: LUN,
+          connectedInitiators: [],
+          detail: 'held by iqn.1998-01.com.vmware:esx1',
+        }),
+      },
+    )
+    const notify = notification(exec)!
+    assert.match(notify.body, /Restore as new LUN/)
+    assert.doesNotMatch(notify.body, /restore this file from backup/)
+  })
+
   it('the engine\'s reason CODE rides into the per-block entry — the result is what a parser reads', async () => {
     const exec = executor()
     const result = await repairAhrFiles(

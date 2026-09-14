@@ -705,6 +705,19 @@ export const AhrScrubParityMismatch = z.object({
   bandIndex: z.number().int().positive(),
   array: z.string().min(1),
   mismatchCnt: z.number().int().nonnegative(),
+  /**
+   * The band's md level (sixth pass). ADDITIVE and optional — a result from an
+   * older daemon omits it, and a consumer that cannot tell which level a band
+   * is must not offer Rewrite parity for it.
+   *
+   * It is here because `mismatch_cnt` means two different things. On RAID5/6 a
+   * mismatching stripe is parity that disagrees with the data, and the
+   * data-intact case has a verb (selfheal.10). On RAID1 md counts legs that
+   * disagree with each other and `repair` copies the FIRST in-sync leg over the
+   * rest — a coin flip that overwrites the good copy half the time. A mirror
+   * mismatch is arbitrated per block by Repair from parity, never by md repair.
+   */
+  level: ArrayLevel.optional(),
 })
 export type AhrScrubParityMismatch = z.infer<typeof AhrScrubParityMismatch>
 

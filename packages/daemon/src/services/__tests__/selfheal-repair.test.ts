@@ -7,7 +7,7 @@ import type {
 } from '../../executor/types.js'
 import type { SelfhealRepairOptions } from '../selfheal-repair.js'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -26,10 +26,11 @@ import {
   reconstructFromQ,
   reconstructionPlan,
   repairBlock,
+  restoreSyncKnobs,
   SELFHEAL_SNAPSHOT_PREFIX,
   SelfhealRunError,
 } from '../selfheal-repair.js'
-import { forgetIssuedChecks } from '../selfheal-syncop.js'
+import { forgetIssuedChecks, hasIssuedCheck, markCheckIssued } from '../selfheal-syncop.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixtures = join(__dirname, '../../fixtures/selfheal')
@@ -1130,6 +1131,94 @@ describe('selfheal repair — md takes an operation of its own mid-repair', () =
     // The check the engine issued is over and the window is md's own again.
     assert.equal(node.knob('sync_action'), 'idle')
     assertKnobsRestored()
+  })
+})
+
+describe('selfheal repair — restoreSyncKnobs, and the token it decides with (N3/N11)', () => {
+  useNode(() => new FakeNode())
+
+  it('a widen md BOUNCES keeps the token and writes no sync_min/sync_max (N11)', async () => {
+    // This run owns a bounded check whose window is still narrow, and md
+    // refuses the widen: EBUSY means the op has NOT reached the boundary, so
+    // it is still running and still ours. The old code swallowed that, retired
+    // the token anyway, and then wrote the window wide open UNDER the running
+    // check — resuming it over the whole band.
+    const geo = raid5Geometry()
+    markCheckIssued('md127')
+    node.setKnob('sync_action', 'check')
+    node.setKnob('sync_min', '6272')
+    node.setKnob('sync_max', '6400')
+    chmodSync(join(node.sys, 'sync_max'), 0o444)
+    let note: string | null
+    try {
+      note = await restoreSyncKnobs(geo)
+    }
+    finally {
+      chmodSync(join(node.sys, 'sync_max'), 0o644)
+    }
+
+    assert.ok(note?.includes('could not be widened and ended'), String(note))
+    assert.ok(note?.includes('the check is still this run\'s'), String(note))
+    assert.equal(hasIssuedCheck('md127'), true, 'the check is still running, so it is still ours')
+    assert.equal(node.knob('sync_min'), '6272', 'nothing was written under the running check')
+    assert.equal(node.knob('sync_max'), '6400')
+    assert.equal(node.knob('sync_action'), 'check')
+  })
+
+  it('records a sysfs write it could not make, instead of throwing out of cleanup (N11)', async () => {
+    // `sync_min` is itself EBUSY on an array md is working on, and the pair was
+    // written unconditionally — a raw throw out of a `finally`-driven cleanup.
+    const geo = raid5Geometry()
+    node.setKnob('sync_action', 'idle')
+    node.setKnob('sync_min', '6272')
+    chmodSync(join(node.sys, 'sync_min'), 0o444)
+    let note: string | null
+    try {
+      note = await restoreSyncKnobs(geo)
+    }
+    finally {
+      chmodSync(join(node.sys, 'sync_min'), 0o644)
+    }
+    assert.ok(note?.includes('sync_min not restored to 0'), String(note))
+    assert.equal(node.knob('sync_max'), 'max', 'the half that CAN be written still goes in')
+  })
+
+  it('gives the token back on an idle array and on a foreign one (N3)', async () => {
+    const geo = raid5Geometry()
+    // Idle: whatever we issued has ended.
+    markCheckIssued('md127')
+    node.setKnob('sync_action', 'idle')
+    assert.equal(await restoreSyncKnobs(geo), null)
+    assert.equal(hasIssuedCheck('md127'), false)
+
+    // Foreign: md took an operation of its own, so our check is gone with it —
+    // and a token left behind would make md's NEXT check read as ours.
+    markCheckIssued('md127')
+    node.setKnob('sync_action', 'recover')
+    const note = await restoreSyncKnobs(geo)
+    assert.ok(note?.includes('md is running recover'), String(note))
+    assert.equal(hasIssuedCheck('md127'), false)
+  })
+
+  it('a bounded check that never settles ends its own op and drops the token (N3)', async () => {
+    // The op is still running when the timeout expires, and this call is
+    // walking away from it: `restoreSyncKnobs` ends OUR op first (while the
+    // token still proves it is ours), then the token goes — nothing after this
+    // may treat a `check` on this array as this run's.
+    const geo = raid5Geometry()
+    node.setKnob('sync_action', 'idle')
+    node.setKnob('sync_completed', '0 / 407552')
+    await assert.rejects(
+      () => boundedWindowCheck(node, geo, 49, { ...OPTIONS, checkTimeoutSeconds: 0.5 }),
+      (error: unknown) => {
+        assert.match((error as Error).message, /did not settle within 0\.5s/)
+        return true
+      },
+    )
+    assert.equal(hasIssuedCheck('md127'), false, 'the token never outlives the call that took it')
+    assert.equal(node.knob('sync_action'), 'idle', 'our own check was ended, not abandoned armed')
+    assert.equal(node.knob('sync_max'), 'max')
+    assert.equal(node.knob('sync_min'), '0')
   })
 })
 

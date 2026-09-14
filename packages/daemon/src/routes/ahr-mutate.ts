@@ -4,6 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
+import type { ParityRewriteRefusal } from '../services/ahr-parity-rewrite.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { relative, resolve as resolvePath } from 'node:path'
@@ -110,6 +111,22 @@ const EXCLUSIVE_OPERATION_NAMES: Record<string, string> = {
   'ahr.parity-rewrite': 'a parity rewrite',
 }
 
+/**
+ * The node-wide md-check refusal, in one sentence for all three verbs
+ * (sixth pass, N10).
+ *
+ * The job-queue exclusion above is IN-PROCESS: a check md is still running
+ * from a previous daemon, or one mdcheck's timer started, is invisible to it.
+ * /proc/mdstat is not, and the check is on a BAND — often a band whose disks
+ * another pool shares. A scrub would issue a second check beside it (§4), a
+ * repair's bounded check would fight it for the same sync thread, and a parity
+ * rewrite would hand md a whole-band `repair` on an array md is already busy
+ * re-reading. Only the scrub route used to ask; all three do now.
+ */
+function runningAhrCheckMessage(label: string): string {
+  return `an md check is running on ${label} (started outside this job or by a previous daemon) — ANAS runs one parity check at a time across the node's AHR bands, and this operation reads or writes the very stripes that check is re-reading; wait for it to finish, or end it from the command line`
+}
+
 // ---- Repair path confinement (design review 2026-09-14, D12) ---------------
 //
 // The lexical check (resolvePath + relative) keeps a path STRING under the
@@ -133,16 +150,32 @@ export async function repairRealPath(executor: CommandExecutor, path: string): P
   }
 }
 
-/** `findmnt -T <path>` — the SOURCE device of the filesystem holding the path. */
+/**
+ * `findmnt -T <path>` — the SOURCE device of the filesystem holding the path.
+ *
+ * `--nofsroot` is load-bearing on an AHR pool (sixth pass, N2). Without it
+ * findmnt appends the filesystem root in brackets for a btrfs subvolume mount —
+ * `/dev/mapper/ahr0-ahr0--vol[/@data]` — and every §12 pool mounts `subvol=@data`,
+ * so `realpath` of that string fails and the repair route 400s on EVERY file of
+ * EVERY subvol-layout pool.
+ */
 export function repairFindmntArgs(path: string): string[] {
-  return ['-n', '-o', 'SOURCE', '--real', '-T', path]
+  return ['-n', '-o', 'SOURCE', '--nofsroot', '--real', '-T', path]
 }
+
+/** `/dev/x[/@data]` → `/dev/x` — the fs-root suffix, belt to `--nofsroot`'s braces. */
+const FINDMNT_FSROOT_RE = /\[[^\]]*\]$/
 
 export async function repairMountSource(executor: CommandExecutor, path: string): Promise<string | null> {
   try {
     const r = await executor.exec(FINDMNT, repairFindmntArgs(path))
     const out = r.exitCode === 0 ? r.stdout.trim() : ''
-    return out === '' ? null : out.split('\n')[0]
+    if (out === '')
+      return null
+    // The flag above is the fix; this is the second line of defence, because a
+    // findmnt that ignored the flag would silently take every repair down.
+    const source = out.split('\n')[0].trim().replace(FINDMNT_FSROOT_RE, '')
+    return source === '' ? null : source
   }
   catch {
     return null
@@ -624,12 +657,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const foreignCheck = await runningAhrCheck(executor, pools)
     if (foreignCheck) {
       reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          message: `an md check is running on ${foreignCheck.label} (started outside this job or by a previous daemon) — a scrub runs one parity check at a time across the node's AHR bands; wait for it to finish, or end it from the command line`,
-        },
-      }
+      return { error: { code: 'CONFLICT', message: runningAhrCheckMessage(foreignCheck.label) } }
     }
 
     const job = jobQueue.submit(
@@ -662,7 +690,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pool = (await readAhrPools(executor)).find(p => p.name === name)
+    const pools = await readAhrPools(executor)
+    const pool = pools.find(p => p.name === name)
     if (!pool) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
@@ -683,6 +712,13 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (blocker) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `${blocker.operation === 'ahr.repair' ? 'another repair' : EXCLUSIVE_OPERATION_NAMES[blocker.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${blocker.id}) — a repair needs the array to itself; wait for it to finish` } }
+    }
+    // The node-wide half of the same exclusion (N10): a check from a previous
+    // daemon, or one mdcheck's timer started, survives the job queue's memory.
+    const repairForeignCheck = await runningAhrCheck(executor, pools)
+    if (repairForeignCheck) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: runningAhrCheckMessage(repairForeignCheck.label) } }
     }
     // A backup (or any snapshot verb) holding the pool's on-demand top-level
     // mount is the same refusal the engine makes at its gates — said here, at
@@ -815,7 +851,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pool = (await readAhrPools(executor)).find(p => p.name === name)
+    const pools = await readAhrPools(executor)
+    const pool = pools.find(p => p.name === name)
     if (!pool) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
@@ -860,19 +897,31 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       reply.code(409)
       return { error: { code: 'CONFLICT', reason: 'job-active', message: conflict } }
     }
+    // The node-wide half of the same exclusion (N10): this verb hands md a
+    // whole-band `repair`, which is the last thing to issue onto a node where
+    // md is already running a check of its own.
+    const rewriteForeignCheck = await runningAhrCheck(executor, pools)
+    if (rewriteForeignCheck) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'array-busy', message: runningAhrCheckMessage(rewriteForeignCheck.label) } }
+    }
     // The band's own state, read from md rather than from the pool rollup: a
     // pool can read `healthy` while THIS array is mid-check, and the rewrite
-    // happens on the array.
-    let bandRefusal: string | null
+    // happens on the array. A RAID1 band is refused here for good and not for
+    // now (N1): `not-a-parity-band` never becomes true.
+    let bandRefusal: ParityRewriteRefusal | null
     try {
       bandRefusal = await parityRewriteArrayRefusal(await readMdGeometry(executor, array.device))
     }
     catch (error) {
-      bandRefusal = `band r${band} of AHR pool '${name}' (${array.device}) could not be read: ${error instanceof Error ? error.message : String(error)}`
+      bandRefusal = {
+        reason: `band r${band} of AHR pool '${name}' (${array.device}) could not be read: ${error instanceof Error ? error.message : String(error)}`,
+        code: 'array-busy',
+      }
     }
     if (bandRefusal) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'array-busy', message: bandRefusal } }
+      return { error: { code: 'CONFLICT', reason: bandRefusal.code, message: bandRefusal.reason } }
     }
 
     // Confirm gate: what md is about to do, in the operator's terms. The
@@ -881,7 +930,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       operation: 'ahr.parity-rewrite',
       params: { name, band },
       message: `Rewriting parity on band r${band} of AHR pool '${name}' recomputes that band's parity from the data it holds now (md counted ${proof.mismatchCnt} mismatch(es) there, and the pool's last checksum scrub was clean)`,
-      warnings: parityRewriteWarnings(name, array),
+      // The estimate includes phase 1's full-pool checksum scrub (N8) — on a
+      // pool with real data in it that pass is usually the dominant term, and
+      // a gate that quoted only the two md passes understated the wait.
+      warnings: parityRewriteWarnings(name, array, pool.capacity.usedBytes),
     })) {
       return reply
     }

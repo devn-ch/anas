@@ -11,6 +11,8 @@ ANAS_ENV_FILE="${ANAS_ENV_FILE:-/etc/default/anas}"
 
 log()  { printf '==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
+# Something the operator has to act on, but not a failed uninstall.
+warn() { printf '    !! %s\n' "$*" >&2; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
 
 # Where systemd keeps a Persistent timer's last-fire stamp. The scrub timer's
@@ -62,12 +64,21 @@ remove_schedule_units() {
     # The node goes back to stock (ruling 2026-09-14): ANAS disabled mdadm's
     # timers when the periodic scrub was enabled, and the distro default is
     # that they are ON. Best-effort — a node without the mdcheck units (they
-    # ship with mdadm, but a minimal install may not have them) costs the
-    # re-enable and nothing else, and the line still tells the operator where
-    # the node stands.
-    systemctl enable --now mdcheck_start.timer mdcheck_continue.timer >/dev/null 2>&1 || true
-    info "ANAS periodic scrub removed. mdadm's own parity check (mdcheck_start.timer, mdcheck_continue.timer) — the distro default, which ANAS disabled when the scrub was enabled — has been RESTORED;"
-    info "run \`systemctl disable --now mdcheck_start.timer mdcheck_continue.timer\` if you do not want a periodic md parity check on this node."
+    # ship with mdadm, but a minimal install may not have them), or one where
+    # they have been masked, costs the re-enable and nothing else.
+    #
+    # REPORT WHAT ACTUALLY HAPPENED (sixth pass, N7). The line used to print
+    # "has been RESTORED" unconditionally, after a call ending in `|| true` —
+    # so a masked or missing unit left the node with NO periodic md parity
+    # check at all while the uninstaller said the opposite. That is the one
+    # sentence an operator would act on, and it has to be true.
+    if systemctl enable --now mdcheck_start.timer mdcheck_continue.timer >/dev/null 2>&1; then
+      info "ANAS periodic scrub removed. mdadm's own parity check (mdcheck_start.timer, mdcheck_continue.timer) — the distro default, which ANAS disabled when the scrub was enabled — has been RESTORED;"
+      info "run \`systemctl disable --now mdcheck_start.timer mdcheck_continue.timer\` if you do not want a periodic md parity check on this node."
+    else
+      warn "ANAS periodic scrub removed, but mdadm's own parity check (mdcheck_start.timer, mdcheck_continue.timer) could not be re-enabled (masked or not installed) — the node is left with no periodic md parity check."
+      warn "Run \`systemctl enable --now mdcheck_start.timer mdcheck_continue.timer\` by hand, or arrange a parity check another way."
+    fi
   fi
 }
 

@@ -85,6 +85,22 @@ function lunRestoreSentence(held: IscsiHeldByLun): string {
 }
 
 /**
+ * A csum-unreadable block that is ALSO a LUN image (sixth pass, N5).
+ *
+ * The two facts are not the same kind of fact. "This is a LUN" says which
+ * restore verb would apply; "the checksum could not be read" says a restore is
+ * the WRONG ACTION — nothing has confirmed the block is corrupt, and restoring
+ * would overwrite data on no evidence. The code used to test LUN-ness first, so
+ * a LUN file whose unrepairable blocks were all `csum-unreadable` was told to
+ * restore the LUN anyway. Csum-unreadable wins; the LUN identity rides along
+ * because the operator still needs to know what the file is, and it is stated
+ * without a restore verb.
+ */
+function csumUnreadableLunSentence(held: IscsiHeldByLun): string {
+  return `this block backs iSCSI LUN ${held.targetIqn}/${held.index}, and ${CSUM_UNREADABLE_SENTENCE}`
+}
+
+/**
  * Mapping-abort wording (selfheal.7 live proof, F2; its own count since
  * review R9 — no longer folded into `unrepairable`).
  *
@@ -240,6 +256,12 @@ export async function repairAhrFiles(
     // the re-scrub advice, a mixed one gets the ordinary restore advice
     // (which is still true of it: nothing else can prove those blocks).
     //
+    // CSUM-UNREADABLE IS TESTED FIRST (sixth pass, N5). It is the one verdict
+    // that says a restore is the wrong action — the checksum that would have
+    // proven the block corrupt is itself damaged — so it outranks the question
+    // of WHICH restore verb a LUN would need. The LUN identity is composed into
+    // that sentence instead of replacing it.
+    //
     // The classification reads `reasonCode`, not the reason TEXT: the sentence
     // is the operator's and may be reworded, the code is the contract.
     const unrepairableBlocks = blocks.filter(b => b.outcome === 'unrepairable')
@@ -249,10 +271,10 @@ export async function repairAhrFiles(
         .every(b => b.reasonCode === SELFHEAL_CSUM_UNREADABLE)
       unrepairableFiles.push({
         path: file.path,
-        advice: held
-          ? lunRestoreSentence(held)
-          : allCsumUnreadable
-            ? CSUM_UNREADABLE_SENTENCE
+        advice: allCsumUnreadable
+          ? (held ? csumUnreadableLunSentence(held) : CSUM_UNREADABLE_SENTENCE)
+          : held
+            ? lunRestoreSentence(held)
             : RESTORE_FILE_SENTENCE,
       })
     }

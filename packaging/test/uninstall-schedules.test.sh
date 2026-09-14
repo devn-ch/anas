@@ -111,6 +111,38 @@ check "the way to turn it back OFF is printed" \
 check "per-family count lines printed" \
   bash -c "grep -q 'anas-snap-\*' '${WORK}/out.log' && grep -q 'anas-backup-\*' '${WORK}/out.log' && grep -q 'anas-repl-\*' '${WORK}/out.log'"
 
+echo "== 3b. a MASKED mdcheck is reported as NOT restored (N7) =="
+# `systemctl enable --now` ends in `|| true`, so a masked or missing mdcheck
+# unit used to print "has been RESTORED" anyway — the node left with no
+# periodic md parity check at all, and the uninstaller saying the opposite.
+MASKING_SYSTEMCTL="${WORK}/systemctl-masked"
+cat > "${MASKING_SYSTEMCTL}" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${WORK}/systemctl.log"
+# Everything succeeds EXCEPT enabling the mdcheck timers (masked unit).
+case "\$*" in
+  *enable*mdcheck*) printf 'Failed to enable unit: Unit file mdcheck_start.timer is masked.\n' >&2; exit 1 ;;
+esac
+exit 0
+EOF
+chmod +x "${MASKING_SYSTEMCTL}"
+mkdir -p "${WORK}/maskedbin"
+cp "${MASKING_SYSTEMCTL}" "${WORK}/maskedbin/systemctl"
+
+make_units
+PATH="${WORK}/maskedbin:$PATH" SYSTEMD_DIR="${SYSTEMD_DIR}" TIMERS_STAMP_DIR="${STAMPS}" \
+  ANAS_UNINSTALL_LIB_ONLY=1 bash -c "source '${UNINSTALL}'; remove_schedule_units" > "${WORK}/masked.log" 2>&1
+check "it was TRIED" \
+  grep -q 'enable --now mdcheck_start.timer mdcheck_continue.timer' "${WORK}/systemctl.log"
+check "no false RESTORED claim" \
+  bash -c "! grep -q 'has been RESTORED' '${WORK}/masked.log'"
+check "it says what it could not do, and what that leaves" \
+  bash -c "grep -q 'could not be re-enabled (masked or not installed)' '${WORK}/masked.log' && grep -q 'no periodic md parity check' '${WORK}/masked.log'"
+check "and how to put it right by hand" \
+  grep -q 'systemctl enable --now mdcheck_start.timer mdcheck_continue.timer' "${WORK}/masked.log"
+check "the scrub units are removed either way" \
+  bash -c "! test -e '${SYSTEMD_DIR}/anas-scrub.timer' && ! test -e '${SYSTEMD_DIR}/anas-scrub.service'"
+
 echo "== 4. a node with no scrub units prints no mdcheck line =="
 make_units
 rm -f "${SYSTEMD_DIR}/anas-scrub.timer" "${SYSTEMD_DIR}/anas-scrub.service" "${STAMPS}/stamp-anas-scrub.timer"

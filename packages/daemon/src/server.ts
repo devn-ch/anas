@@ -412,6 +412,17 @@ export function createServer(opts?: ServerOptions) {
     // fixtures/ahr/NOTES.md for provenance (incl. which files are
     // reconstructed/synthetic).
     mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    // Both bands' parity counters, readable and zero — the healthy pool this
+    // mock replays. A counter that cannot be READ is not coverage (sixth pass,
+    // N12): the band lands in `bandsSkipped`, not `bandsChecked`, so the dev
+    // mock has to answer with a number or its scrub reports nothing checked.
+    for (const kernel of ['md127', 'md126']) {
+      mock.addFixture({
+        command: '/usr/bin/cat',
+        args: [`/sys/block/${kernel}/md/mismatch_cnt`],
+        result: { stdout: '0\n', stderr: '', exitCode: 0 },
+      })
+    }
     mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
     mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
     mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })

@@ -420,8 +420,24 @@ export async function boundedWindowCheck(
     }
     await sleep(500)
   }
-  if (!ended)
-    throw new Error(`bounded md check over stripe ${stripe} did not settle within ${cap}s`)
+  if (!ended) {
+    // The check this call issued is STILL RUNNING and this call is walking
+    // away from it. Two things have to happen in this order (sixth pass, N3):
+    // `restoreSyncKnobs` first, while the token is still held, so the op that
+    // is ended and the window that is widened are provably ours; then the
+    // token goes, because nothing after this point may treat a `check` on this
+    // array as this run's. Leaving it behind is how a later FOREIGN check —
+    // mdcheck's — got written `idle`.
+    let left: string | null = null
+    try {
+      left = await restoreSyncKnobs(geo)
+    }
+    catch (error) {
+      left = `sync knobs not restored: ${errorText(error)}`
+    }
+    retireCheckIssued(geo.kernel)
+    throw new Error(`bounded md check over stripe ${stripe} did not settle within ${cap}s${left ? ` (${left})` : ''}`)
+  }
 
   await sleep(options?.settleMs ?? MISMATCH_SETTLE_MS)
   const mismatch = Number(await readMdAttr(geo.sys, 'mismatch_cnt'))
@@ -444,25 +460,67 @@ export async function boundedWindowCheck(
  * restored; a FOREIGN operation is left completely untouched and the returned
  * sentence says which one it is. The daemon-start reconciliation
  * (`selfheal-reconcile.ts`) is what puts the window back once md is finished.
+ *
+ * ## The trailing pair, and the token (sixth pass, N11)
+ *
+ * The widen-then-`idle` above can BOUNCE (EBUSY: the op has not reached the
+ * boundary yet), and the old code swallowed that, retired the token anyway and
+ * then wrote `sync_min`/`sync_max` unconditionally. Both halves were wrong:
+ * widening `sync_max` under a check that is still running resumes it over the
+ * whole band, and `sync_min` is itself EBUSY during a recovery — a raw throw
+ * out of a `finally`-driven cleanup. So the bounce KEEPS the token (the check
+ * is still ours) and skips the pair, and the pair itself re-reads ownership
+ * one more time and records what it could not write instead of throwing.
+ *
+ * The return value is the caller's cleanup note — `null` when there is
+ * nothing to say, otherwise one or more sentences joined with `; `, which
+ * `repairBlock` pushes into `cleanupErrors`.
  */
 export async function restoreSyncKnobs(geo: MdGeometry): Promise<string | null> {
+  const notes: string[] = []
   const own = await ownsSyncOp(geo.kernel, () => readSyncAction(geo))
-  if (own.foreign)
+  if (own.foreign) {
+    // md is running something of its own: our check is gone whatever it was,
+    // so the token goes too — keeping it is what let a later foreign check
+    // read as ours (N3).
+    retireCheckIssued(geo.kernel)
     return `${geo.device}: sync_min/sync_max left as they are — ${foreignOpNote(geo.device, own.action)}`
+  }
   if (own.owned) {
     try {
       await writeMdAttr(geo.sys, 'sync_max', MD_DEFAULT_SYNC_MAX)
       await writeMdAttr(geo.sys, 'sync_action', 'idle')
     }
-    catch {
-      // EBUSY on a window the op has not reached yet — the unconditional
-      // restore below is what actually clears GT-13's trap.
+    catch (error) {
+      // EBUSY: the op has NOT reached the boundary, so it is still running and
+      // still ours. Keep the token and write nothing more — the window stays
+      // narrow until the daemon-start reconcile or the scrub's own pre-issue
+      // restore puts it back, which is the safe direction to fail.
+      return `${geo.device}: the bounded check could not be widened and ended (${errorText(error)}) — sync_min/sync_max left as they are, and the check is still this run's`
     }
     retireCheckIssued(geo.kernel)
   }
-  await writeMdAttr(geo.sys, 'sync_min', MD_DEFAULT_SYNC_MIN)
-  await writeMdAttr(geo.sys, 'sync_max', MD_DEFAULT_SYNC_MAX)
-  return null
+  else {
+    // Idle: whatever we issued has ended. The token has no business outliving it.
+    retireCheckIssued(geo.kernel)
+  }
+  // The pair that actually clears GT-13's trap — under the SAME ownership rule
+  // as everything above, because the array can have changed hands in the
+  // milliseconds since the read at the top of this function.
+  const after = await ownsSyncOp(geo.kernel, () => readSyncAction(geo))
+  if (!isIdleSyncAction(after.action)) {
+    notes.push(`${geo.device}: sync_min/sync_max left as they are — ${foreignOpNote(geo.device, after.action)}`)
+    return notes.join('; ')
+  }
+  for (const [attr, value] of [['sync_min', MD_DEFAULT_SYNC_MIN], ['sync_max', MD_DEFAULT_SYNC_MAX]] as const) {
+    try {
+      await writeMdAttr(geo.sys, attr, value)
+    }
+    catch (error) {
+      notes.push(`${geo.device}: ${attr} not restored to ${value}: ${errorText(error)}`)
+    }
+  }
+  return notes.length > 0 ? notes.join('; ') : null
 }
 
 // ---------------------------------------------------------------------------

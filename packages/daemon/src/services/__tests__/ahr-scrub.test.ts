@@ -25,6 +25,7 @@ import {
   scrubAhrPool,
 } from '../ahr-scrub.js'
 import { mismatchCntArgs } from '../scrub-schedules.js'
+import { forgetIssuedChecks, hasIssuedCheck, ownsSyncOp } from '../selfheal-syncop.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -109,6 +110,24 @@ function baseExecutor(): MockExecutor {
   // Tests that script mdstat transitions or rot register exact-arg fixtures,
   // which beat the catch-all.
   executor.addFixture({ command: '/usr/bin/cat', result: { stdout: mdstat([]), stderr: '', exitCode: 0 } })
+  return executor
+}
+
+/**
+ * A READABLE `mismatch_cnt` of 0 for the named bands — the ordinary "checked,
+ * and it came back clean" case.
+ *
+ * The catch-all `cat` above answers mdstat text for every unscripted sysfs
+ * read, which `mismatchCount` reads as "no counter". Since the sixth pass a
+ * band whose counter cannot be READ is not coverage (N12): the check ran but
+ * nothing came back from it, so the band has no verdict and lands in
+ * `bandsSkipped`. A test that means "this band was checked and is clean" has
+ * to say so with a number. First-match-wins, so this is registered only where
+ * the test has not scripted that band's counter itself.
+ */
+function cleanCounters(executor: MockExecutor, ...kernels: string[]): MockExecutor {
+  for (const kernel of kernels)
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs(kernel), result: { stdout: '0\n', stderr: '', exitCode: 0 } })
   return executor
 }
 
@@ -210,7 +229,7 @@ function probeArgs(path: string, block: number): string[] {
 
 describe('scrubAhrPool (Epic 11 + AHR)', () => {
   it('runs btrfs scrub to completion, THEN per-array checks sequentially; clean → silent', async () => {
-    const executor = baseExecutor()
+    const executor = cleanCounters(baseExecutor(), 'md127', 'md126')
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], results: [
       { stdout: scrubStatus('running', { percent: '42.50' }), stderr: '', exitCode: 0 },
@@ -261,7 +280,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   // and phase 2 (running right then) is what names the files. One warning per
   // mismatching band; phase 2 proceeds either way.
   it('phase 1 rot: a mismatch_cnt > 0 warns before phase 2 starts — and phase 2 still runs', async () => {
-    const executor = baseExecutor()
+    const executor = cleanCounters(baseExecutor(), 'md126')
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], results: [
@@ -276,7 +295,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     assert.equal(result.btrfsErrors, null, 'checksums can be clean while parity rots — both stories are told')
     // D1: the mismatch rides the result, and the band counts as checked.
-    assert.deepEqual(result.parityMismatches, [{ band: 't2-r1', bandIndex: 1, array: '/dev/md/t2-r1', mismatchCnt: 8 }])
+    assert.deepEqual(result.parityMismatches, [{ band: 't2-r1', bandIndex: 1, array: '/dev/md/t2-r1', mismatchCnt: 8, level: 'raid1' }])
     assert.deepEqual(result.bandsChecked, ['t2-r1', 't2-r2'])
 
     const calls = executor.calls
@@ -294,7 +313,10 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     )
     assert.equal(warns[1].args[3], 'AHR scrub: parity mismatch on t2-r1')
     assert.ok(warns[1].args[4].startsWith('Parity mismatch on t2-r1 (8), but the checksum scrub found no corrupt files'), warns[1].args[4])
-    assert.ok(warns[1].args[4].includes('Nothing in ANAS repairs parity'), warns[1].args[4])
+    // N6: the claim "nothing in ANAS repairs parity" stopped being true when
+    // Rewrite parity shipped — the clean arm names the verb instead.
+    assert.ok(!warns[1].args[4].includes('Nothing in ANAS repairs parity'), warns[1].args[4])
+    assert.ok(warns[1].args[4].includes('Scrubs → parity mismatch → Rewrite parity'), warns[1].args[4])
     // The warning lands BETWEEN the md check and the btrfs scrub: phase 2 is
     // literally running when the operator reads it.
     const warnAt = calls.indexOf(warns[0])
@@ -350,7 +372,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   // CURRENT kernel name from the stable pin symlink (realpath array.device) at
   // point-of-use and ignore the route-time value.
   it('ignores a STALE route-time array.kernelName — resolves fresh via the pin symlink', async () => {
-    const executor = baseExecutor()
+    const executor = cleanCounters(baseExecutor(), 'md127', 'md126')
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     // r1's check runs one poll then finishes; then r2's. The realpath fixtures
@@ -411,7 +433,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   // the pending one later fires, two full-device reads run concurrently,
   // breaking the strictly-sequential guarantee (§4).
   it('treats a resync=PENDING md check as in-flight — waits it out before the next band', async () => {
-    const executor = baseExecutor()
+    const executor = cleanCounters(baseExecutor(), 'md127', 'md126')
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
 
@@ -622,7 +644,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    * therefore a verdict: counted, and clean.
    */
   it('a genuine fast check whose counter was ZEROED is counted — and reported clean', async () => {
-    const executor = baseExecutor()
+    const executor = cleanCounters(baseExecutor(), 'md126')
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
@@ -658,7 +680,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    */
   for (const takeover of ['frozen', 'recover'] as const) {
     it(`stops waiting on a band whose check became '${takeover}', and checks the next band`, async () => {
-      const executor = baseExecutor()
+      const executor = cleanCounters(baseExecutor(), 'md126')
       executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
@@ -769,7 +791,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   })
 
   it('the absolute ceiling is the last resort — a band that never goes idle stops being waited on', async () => {
-    const executor = baseExecutor()
+    const executor = cleanCounters(baseExecutor(), 'md126')
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127', checkPercent: 1 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
@@ -1378,7 +1400,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
   })
 
   it('a clean scrub reads no journal and probes nothing', async () => {
-    const clean = baseExecutor()
+    const clean = cleanCounters(baseExecutor(), 'md127', 'md126')
     clean.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     clean.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     clean.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
@@ -2001,7 +2023,7 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
 
   /** Phase 1 on t2-r1 counts 8 mismatches; t2-r2 is clean. */
   function rotExecutor(btrfsSummary?: string): MockExecutor {
-    const executor = baseExecutor()
+    const executor = cleanCounters(baseExecutor(), 'md126')
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', btrfsSummary ? { summary: btrfsSummary } : undefined), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
@@ -2029,8 +2051,10 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
 
     const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
 
-    // The record carries the parity mismatch even though a file was named.
-    assert.deepEqual(result.parityMismatches, [{ band: 't2-r1', bandIndex: 1, array: '/dev/md/t2-r1', mismatchCnt: 8 }])
+    // The record carries the parity mismatch even though a file was named —
+    // with the band's LEVEL, which is what says whether Rewrite parity applies
+    // to it at all (sixth pass, N1).
+    assert.deepEqual(result.parityMismatches, [{ band: 't2-r1', bandIndex: 1, array: '/dev/md/t2-r1', mismatchCnt: 8, level: 'raid1' }])
     assert.deepEqual(result.bandsChecked, ['t2-r1', 't2-r2'])
     assert.ok(result.findings && result.findings.length > 0, 'the file is named')
 
@@ -2059,6 +2083,14 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     assert.equal(warns[1].args[3], 'AHR scrub found errors')
     assert.equal(warns[2].args[3], 'AHR scrub: parity mismatch on t2-r1')
     assert.ok(warns[2].args[4].includes('cannot tell whether the rot is in parity or in data'), warns[2].args[4])
+    // N6: the parity ASSERTION belongs only to the clean arm — this one does
+    // not know where the rot is, so it must not claim the parity member…
+    assert.ok(!warns[2].args[4].includes('The rot is in the PARITY'), warns[2].args[4])
+    // …and it says what to do FIRST rather than offering the verb.
+    assert.ok(warns[2].args[4].includes('Do the data first'), warns[2].args[4])
+    assert.ok(warns[2].args[4].includes('scrub pool \'t2\' again'), warns[2].args[4])
+    assert.ok(warns[2].args[4].includes('Rewrite parity is refused while a finding stands'), warns[2].args[4])
+    assert.ok(!warns[2].args[4].includes('Nothing in ANAS repairs parity'), warns[2].args[4])
   })
 
   it('a band md never started is recorded, not coverage — checkedArrays stays honest', async () => {
@@ -2077,6 +2109,66 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     assert.equal(warns.length, 1, 'a clean-but-incomplete scrub is not silent (D8)')
     assert.equal(warns[0].args[3], 'AHR scrub did not check every band')
     assert.ok(warns[0].args[4].includes('t2-r1 was not checked: md never started the check'), warns[0].args[4])
+  })
+
+  it('a band whose mismatch_cnt cannot be READ is a skip, not coverage (N12)', async () => {
+    // The check RAN — md took it and went idle — but nothing came back from
+    // it, so the band has no verdict: no clean bill, and no finding either.
+    // Counting it in `checkedArrays` is the same false assurance D8 closed for
+    // the bands that were never checked at all.
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '', stderr: 'No such file', exitCode: 1 } })
+    cleanCounters(executor, 'md126')
+
+    const progress: string[] = []
+    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1 })
+
+    assert.equal(result.checkedArrays, 1, 'only the band with a verdict counts')
+    assert.deepEqual(result.bandsChecked, ['t2-r2'])
+    assert.deepEqual(result.bandsSkipped, [{ band: 't2-r1', reason: 'checked, but its mismatch_cnt could not be read' }])
+    assert.ok(progress.some(m => m.includes('t2-r1 was checked, but its mismatch_cnt could not be read')), progress.join(' | '))
+    // And the operator is told — a clean-but-incomplete scrub is not silent (D8).
+    const warns = executor.calls.filter(c => c.command === '/usr/bin/perl')
+    assert.equal(warns.length, 1)
+    assert.equal(warns[0].args[3], 'AHR scrub did not check every band')
+  })
+
+  it('retires every band\'s issued-check token, so a later FOREIGN check is never ours (N3)', async () => {
+    // `markCheckIssued` is what licenses `echo idle > sync_action` (D2), and it
+    // used to be taken back ONLY on the abandonment path. A scrub that finished
+    // normally left both bands' tokens in the set for the life of the daemon —
+    // and then mdcheck's own check on one of those arrays read as ours, and the
+    // next thing to ask would have written `idle` over it.
+    forgetIssuedChecks()
+    const executor = cleanCounters(baseExecutor(), 'md127', 'md126')
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    assert.equal(result.checkedArrays, 2, 'a clean two-band scrub — the ordinary success path')
+    assert.equal(hasIssuedCheck('md127'), false, 'the token does not outlive the band that took it')
+    assert.equal(hasIssuedCheck('md126'), false)
+
+    // The leaked-entry consequence, at the one function that decides it: with
+    // no token, a `check` on that array is FOREIGN and nothing may end it.
+    const own = await ownsSyncOp('md127', async () => 'check')
+    assert.equal(own.owned, false, 'mdcheck\'s check is not this daemon\'s to end')
+    assert.equal(own.foreign, true)
+  })
+
+  it('retires the token on the SKIP paths too — md never started the check (N3)', async () => {
+    forgetIssuedChecks()
+    const executor = rotExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/last_sync_action'], result: { stdout: 'resync\n', stderr: '', exitCode: 0 } })
+
+    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    assert.equal(hasIssuedCheck('md127'), false)
+    assert.equal(hasIssuedCheck('md126'), false)
   })
 
   it('the new record fields round-trip the shared schema — and stay optional', () => {

@@ -362,6 +362,11 @@ export type AhrParityRewriteOutcome = z.infer<typeof AhrParityRewriteOutcome>
  * left it. `no-such-band` and `pool-not-mounted` are the two the route answers
  * before any of that (400 and 409 respectively), and the engine answers again
  * because it is also driven directly by the selfheal.2 suite.
+ *
+ * `not-a-parity-band` is the sixth pass's refusal and it is not a state that
+ * passes: a RAID1 band has no parity to rewrite, and md's `repair` on a mirror
+ * copies the first in-sync leg over the others — a 50/50 chance of writing the
+ * rotten copy over the good one. It never becomes true for that band.
  */
 export const AhrParityRewriteReasonCode = z.enum([
   'no-parity-mismatch',
@@ -372,6 +377,7 @@ export const AhrParityRewriteReasonCode = z.enum([
   'foreign-sync-op',
   'no-such-band',
   'pool-not-mounted',
+  'not-a-parity-band',
 ])
 export type AhrParityRewriteReasonCode = z.infer<typeof AhrParityRewriteReasonCode>
 

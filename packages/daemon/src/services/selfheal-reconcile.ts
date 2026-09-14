@@ -72,6 +72,22 @@ export interface SelfhealReconcileOptions {
   pools?: AhrPool[]
   /** Passed to the snapshot service (tests point its runtime dir at a temp path). */
   ahrSnapshotOptions?: AhrSnapshotOptions
+  /**
+   * Is a self-heal job IN FLIGHT on this pool right now (sixth pass, N9)?
+   *
+   * The reconciliation runs from `index.ts` AFTER the socket is listening, and
+   * the boot scan it chains off can take minutes on a real node. An operator
+   * who hits Repair or Rewrite parity in that window gets a job whose transient
+   * snapshot this sweep would destroy and whose `sync_min`/`sync_max` this
+   * walk would widen out from under it — the engine's OWN knobs, read as a
+   * killed run's leftovers because they look exactly alike.
+   *
+   * The daemon wires the job queue's `findActive` for `ahr.repair`,
+   * `ahr.parity-rewrite` and `ahr.scrub`. Absent (the direct/test call), every
+   * pool is reconciled — the queue is in memory, so on a genuine cold start
+   * there is nothing in flight to protect and the answer would be "no" anyway.
+   */
+  activeJob?: (pool: string) => { operation: string, id: string } | null | undefined
 }
 
 /** True when the report has nothing worth a journald line. */
@@ -103,6 +119,16 @@ export async function reconcileSelfhealState(
   }
 
   for (const pool of pools) {
+    // A pool with a self-heal job in flight is left ENTIRELY alone — knobs and
+    // snapshots both (N9). The ordering is unchanged: reconcile still runs
+    // after the boot scan, it just refuses to reconcile over a live run.
+    const active = options?.activeJob?.(pool.name)
+    if (active) {
+      report.skipped.push(
+        `${pool.name}: not reconciled — ${active.operation} job ${active.id} is in flight on this pool, and its md knobs and transient snapshot are in USE, not leftovers`,
+      )
+      continue
+    }
     for (const array of pool.arrays) {
       const label = `${pool.name}-r${array.band}`
       try {
