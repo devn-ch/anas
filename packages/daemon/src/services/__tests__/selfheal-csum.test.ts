@@ -9,10 +9,13 @@ import {
   crc32c,
   csumFromLeafBytes,
   csumHex,
+  CsumUnreadableError,
   findCsumEntry,
   LEAF_HEADER_BYTES,
+  NODE_BYTES,
   parseCsumItems,
   readStoredCsum,
+  verifyNode,
 } from '../selfheal-csum.js'
 import { parseChunkItems, parseDmTable, selfhealBand } from '../selfheal-map.js'
 
@@ -29,6 +32,22 @@ const ITEMS = parseCsumItems(CSUM_TREE)
 /** f1.bin block 300 as it actually sits on its member disk (PROVENANCE.md). */
 const MEMBER_BLOCK = Buffer.from(fixture('member-block-f1-300.b64').trim(), 'base64')
 const STORED_CSUM = Number(fixture('member-block-f1-300.csum').trim())
+
+/**
+ * Make a synthetic 16 KiB node vouch for itself the way btrfs does — its own
+ * bytenr at header offset 48, and the crc32c of bytes 32…nodesize in the low
+ * four bytes of the csum field, little-endian.
+ *
+ * Before D3 the reader believed any four bytes it found; these fixtures were
+ * built as bare `Buffer.alloc` with a csum written into one slot and passed.
+ * They now have to be real nodes, which is the point: the check is what stops
+ * rot in the csum tree being reported as rot in the file.
+ */
+function sealNode(node: Buffer, bytenr: number): Buffer {
+  node.writeBigUInt64LE(BigInt(bytenr), 48)
+  node.writeUInt32LE(crc32c(node.subarray(32, NODE_BYTES)), 0)
+  return node
+}
 
 /**
  * The csum half of the engine (selfheal.5): btrfs's own stored checksum, and
@@ -109,6 +128,42 @@ describe('selfheal csum — the csum tree', () => {
   })
 })
 
+/**
+ * The node self-check (D3), proved against a leaf the FILESYSTEM wrote
+ * (`split-csum-leaf.b64`, PROVENANCE.md) rather than against one this test
+ * built: nodesize 16384, crc32c over bytes 32…16384, stored little-endian in
+ * the first four, and the node's own bytenr at header offset 48.
+ */
+describe('selfheal csum — a tree node vouching for itself', () => {
+  const CAPTURED = Buffer.from(fixture('split-csum-leaf.b64').trim(), 'base64')
+  const CAPTURED_BYTENR = 30801920
+
+  it('accepts the captured leaf at its own bytenr', () => {
+    const check = verifyNode(CAPTURED.subarray(0, NODE_BYTES), CAPTURED_BYTENR)
+    assert.ok(check.ok, check.detail)
+  })
+
+  it('refuses it at a bytenr it does not claim — a valid node in the wrong place', () => {
+    const check = verifyNode(CAPTURED.subarray(0, NODE_BYTES), CAPTURED_BYTENR + NODE_BYTES)
+    assert.equal(check.ok, false)
+    assert.match(check.detail, /says it is bytenr 30801920/)
+  })
+
+  it('refuses one flipped byte anywhere past the header csum', () => {
+    const rotten = Buffer.from(CAPTURED.subarray(0, NODE_BYTES))
+    rotten[8000] ^= 0x01
+    const check = verifyNode(rotten, CAPTURED_BYTENR)
+    assert.equal(check.ok, false)
+    assert.match(check.detail, /is not the crc32c of its own bytes/)
+  })
+
+  it('refuses a short read rather than checksumming whatever arrived', () => {
+    const check = verifyNode(CAPTURED.subarray(0, 4096), CAPTURED_BYTENR)
+    assert.equal(check.ok, false)
+    assert.match(check.detail, /only 4096 of 16384 bytes/)
+  })
+})
+
 describe('selfheal csum — reading it off the LV', () => {
   const context = {
     mountpoint: '/mnt/gtsh/@data',
@@ -143,6 +198,7 @@ describe('selfheal csum — reading it off the LV', () => {
     const entry = findCsumEntry(ITEMS, 14860288)
     assert.ok(entry)
     leaf.writeUInt32LE(STORED_CSUM, entry.leafOffset)
+    sealNode(leaf.subarray(0, NODE_BYTES), 30834688)
 
     const executor = new MockExecutor()
     executor.addPipelineFixture({
@@ -221,6 +277,80 @@ describe('selfheal csum — reading it off the LV', () => {
     const wrong = await readStoredCsum(executor, ctx, expected.logical_byte_without_extent_data_offset)
     assert.equal(csumHex(wrong as number), expected.stored_csum_at_wrong_logical)
     assert.notEqual(wrong, crc32c(block), 'the pre-R2 byte belongs to another block')
+  })
+
+  /**
+   * D3, the whole point of the self-check: the leaf is the ONE read in the
+   * engine btrfs-progs does not verify for us, and a rotten one used to come
+   * back as a plausible four-byte number — no reconstruction could match it,
+   * and a HEALTHY data block was reported "restore from backup".
+   */
+  it('REFUSES a csum leaf that fails its own node checksum, on both DUP copies', async () => {
+    const entry = findCsumEntry(ITEMS, 14860288)
+    assert.ok(entry)
+    const leaf = Buffer.alloc(16384 + 4096)
+    leaf.writeUInt32LE(STORED_CSUM, entry.leafOffset)
+    sealNode(leaf.subarray(0, NODE_BYTES), 30834688)
+    // One flipped byte, after the seal — exactly what rot looks like.
+    leaf[9000] ^= 0x01
+
+    const executor = new MockExecutor()
+    executor.addPipelineFixture({
+      cmd1: '/usr/bin/dd',
+      cmd2: '/usr/bin/base64',
+      result: { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: leaf.toString('base64') },
+    })
+
+    await assert.rejects(
+      () => readStoredCsum(executor, { ...context }, 14860288),
+      (error: unknown) => {
+        assert.ok(error instanceof CsumUnreadableError)
+        assert.equal(error.reasonCode, 'csum-unreadable')
+        assert.match(error.message, /failed its own checksum on both copies/)
+        assert.doesNotMatch(error.message, /Restore .* from backup/)
+        return true
+      },
+    )
+    // BOTH copies of the DUP metadata chunk were tried before giving up.
+    assert.equal(executor.pipelineCalls.length, 2)
+  })
+
+  /**
+   * The other half: stripe 0 has rotted and stripe 1 of the same DUP chunk is
+   * fine. btrfs keeps metadata twice precisely so this is survivable, and the
+   * engine now uses the second copy instead of condemning the file.
+   */
+  it('falls back to the DUP chunk\'s SECOND copy when the first has rotted', async () => {
+    const entry = findCsumEntry(ITEMS, 14860288)
+    assert.ok(entry)
+    const good = Buffer.alloc(16384 + 4096)
+    good.writeUInt32LE(STORED_CSUM, entry.leafOffset)
+    sealNode(good.subarray(0, NODE_BYTES), 30834688)
+    const rotten = Buffer.from(good)
+    rotten[9000] ^= 0x01
+
+    // stripe 0 is at device offset 38797312, stripe 1 at 90767360 — the two
+    // reads land at different skips, which is what tells them apart here.
+    const stripe0Skip = (30834688 - 30408704 + 38797312) / 4096
+    const stripe1Skip = (30834688 - 30408704 + 90767360) / 4096
+    const executor = new MockExecutor()
+    executor.addPipelineFixture({
+      cmd1: '/usr/bin/dd',
+      args1: [`if=/dev/mapper/gtsh-data`, 'iflag=direct', 'bs=4096', `skip=${stripe0Skip}`, 'count=5', 'status=none'],
+      cmd2: '/usr/bin/base64',
+      args2: ['-w', '0'],
+      result: { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: rotten.toString('base64') },
+    })
+    executor.addPipelineFixture({
+      cmd1: '/usr/bin/dd',
+      args1: [`if=/dev/mapper/gtsh-data`, 'iflag=direct', 'bs=4096', `skip=${stripe1Skip}`, 'count=5', 'status=none'],
+      cmd2: '/usr/bin/base64',
+      args2: ['-w', '0'],
+      result: { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: good.toString('base64') },
+    })
+
+    assert.equal(await readStoredCsum(executor, { ...context }, 14860288), STORED_CSUM)
+    assert.equal(executor.pipelineCalls.length, 2, 'the first copy was tried, then the mirror')
   })
 
   it('walks once, then reports NO stored csum rather than "not fetched yet"', async () => {

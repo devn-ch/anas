@@ -6,6 +6,7 @@ import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
+import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
 // no-env manual launch must NOT land the trust-boundary socket in world-writable
@@ -66,6 +67,19 @@ async function main() {
           server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
       }).catch((err) => {
         server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
+      }).then(() => reconcileSelfhealState(decorated.executor)).then((report) => {
+        if (reconcileWasQuiet(report))
+          return
+        for (const line of report.restored)
+          server.log.warn(`selfheal reconcile: ${line}`)
+        for (const line of report.snapshots)
+          server.log.warn(`selfheal reconcile: swept transient snapshot ${line}`)
+        for (const line of report.skipped)
+          server.log.info(`selfheal reconcile: ${line}`)
+        for (const line of report.errors)
+          server.log.warn(`selfheal reconcile: ${line}`)
+      }).catch((err) => {
+        server.log.warn(`selfheal reconcile failed: ${err instanceof Error ? err.message : String(err)}`)
       })
 
       // iSCSI stub quarantine (story `iscsi.8`, live-proof F2): `targetctl

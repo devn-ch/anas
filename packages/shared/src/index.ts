@@ -433,6 +433,7 @@ export {
   SelfhealMapping,
   SelfhealOutcome,
   SelfhealOutcomeKind,
+  SelfhealReasonCode,
   SelfhealReconstruction,
   SelfhealStep,
   SelfhealStepName,

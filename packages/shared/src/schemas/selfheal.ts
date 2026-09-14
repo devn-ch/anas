@@ -41,6 +41,23 @@ export const SelfhealOutcomeKind = z.enum([
 export type SelfhealOutcomeKind = z.infer<typeof SelfhealOutcomeKind>
 
 /**
+ * A machine-readable qualifier on an `unrepairable` verdict, for the one case
+ * where the operator's next step is NOT "restore from backup".
+ *
+ * `csum-unreadable` — the csum tree leaf that would arbitrate this block failed
+ * its own checksum on every copy the DUP metadata chunk holds. Nothing is known
+ * about the data block: it may be perfectly good. Restoring the file from
+ * backup on the strength of this verdict overwrites data that was never proven
+ * bad, so the notification and the UI must say "the checksum could not be
+ * read", never "restore from backup" (design review 2026-09-14, D3).
+ *
+ * Absent on every other outcome — `reason` is the operator's sentence and
+ * stays the only thing most verdicts carry.
+ */
+export const SelfhealReasonCode = z.enum(['csum-unreadable'])
+export type SelfhealReasonCode = z.infer<typeof SelfhealReasonCode>
+
+/**
  * The steps of the converged sequence, in order.
  *
  * They are named (and NOT renumbered) because the selfheal.2 suite injects a
@@ -186,6 +203,8 @@ export const SelfhealOutcome = z.object({
   outcome: SelfhealOutcomeKind,
   /** Why, in one sentence, for the operator — not for a parser. */
   reason: z.string(),
+  /** The one verdict a parser must tell apart; absent on all the others. */
+  reasonCode: SelfhealReasonCode.optional(),
   /** Absolute path of the file on the node. */
   file: z.string(),
   /** 4 KiB file block index (byte offset / 4096). */
@@ -240,6 +259,12 @@ export const AhrRepairBlockOutcome = z.object({
   outcome: SelfhealOutcomeKind,
   /** The engine's own sentence — including a `refused:` gate and an error text. */
   reason: z.string(),
+  /**
+   * Carried through from the engine's outcome so the job result, the
+   * notification and the Scrubs window can all tell a block whose CHECKSUM
+   * could not be read from one that genuinely needs a restore.
+   */
+  reasonCode: SelfhealReasonCode.optional(),
 })
 export type AhrRepairBlockOutcome = z.infer<typeof AhrRepairBlockOutcome>
 

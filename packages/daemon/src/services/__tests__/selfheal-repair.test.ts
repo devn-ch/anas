@@ -14,18 +14,22 @@ import process from 'node:process'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { SelfhealOutcome } from '@anas/shared'
-import { crc32c } from '../selfheal-csum.js'
+import { withTopLevelMount } from '../ahr-snapshots.js'
+import { crc32c, NODE_BYTES } from '../selfheal-csum.js'
 import { chunkForLogical, geometryFromAttributes, locateLogicalIn, memberOffsetOn, parseChunkItems, parseDmTable, parseMdDetailExport, selfhealBand } from '../selfheal-map.js'
 import {
   boundedWindowCheck,
+  ForeignSyncOpError,
   gfInv,
   gfMul,
   gfPow2,
   reconstructFromQ,
+  reconstructionPlan,
   repairBlock,
   SELFHEAL_SNAPSHOT_PREFIX,
   SelfhealRunError,
 } from '../selfheal-repair.js'
+import { forgetIssuedChecks } from '../selfheal-syncop.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixtures = join(__dirname, '../../fixtures/selfheal')
@@ -41,6 +45,8 @@ const STORED = Number(fixture('member-block-f1-300.csum').trim())
 /** Where the chain puts that block on the captured rig (see selfheal-map.test.ts). */
 const MEMBER_OFFSET = 4308992
 const MD_BYTE = 16171008
+/** The csum tree leaf of the captured rig — what a sealed fake leaf claims to be. */
+const CSUM_LEAF = 30834688
 const TARGET_ROLE = 0
 const STRIPE = 49
 const MEMBERS = ['/dev/loop0', '/dev/loop1', '/dev/loop2', '/dev/loop3', '/dev/loop4', '/dev/loop5']
@@ -69,6 +75,22 @@ const TREE_ROOTS = [
   `file tree key (256 ROOT_ITEM 0) ${leafBytenr('dump-tree-subvol.txt')} level 0`,
   '',
 ].join('\n')
+
+/**
+ * Make a synthetic 16 KiB btrfs node vouch for itself, the way the filesystem
+ * does: its own bytenr at header offset 48, and the crc32c of bytes
+ * 32…nodesize in the low four bytes of the csum field, little-endian.
+ *
+ * D3: the engine now verifies the csum leaf it reads raw off the LV, so a fake
+ * that hands back a bare `Buffer.alloc` with a checksum written into it is
+ * correctly refused. Sealing it is what a real leaf already is — proved
+ * against the captured `split-csum-leaf.b64` in selfheal-csum.test.ts.
+ */
+function sealNode(node: Buffer, bytenr: number): Buffer {
+  node.writeBigUInt64LE(BigInt(bytenr), 48)
+  node.writeUInt32LE(crc32c(node.subarray(32, NODE_BYTES)), 0)
+  return node
+}
 
 /** Deterministic filler for the sibling members — content is irrelevant, XOR is not. */
 function filler(seed: number): Buffer {
@@ -283,9 +305,11 @@ class FakeNode implements CommandExecutor {
     if (device === '/dev/mapper/gtsh-data') {
       // The csum leaf: every 4-byte slot carries the stored csum, so the read
       // proves the HOP, not the entry arithmetic (that is selfheal-csum.test).
+      // Sealed as a real node so it passes the engine's own check (D3).
       bytes = Buffer.alloc(count * BS)
       for (let i = 0; i + 4 <= bytes.length; i += 4)
         bytes.writeUInt32LE(STORED, i)
+      sealNode(bytes.subarray(0, NODE_BYTES), CSUM_LEAF)
     }
     else if (device === '/dev/md127') {
       assert.equal(offset, MD_BYTE, 'the engine read md somewhere the mapping did not point')
@@ -441,6 +465,7 @@ class FakeMirror implements CommandExecutor {
       bytes = Buffer.alloc(count * BS)
       for (let i = 0; i + 4 <= bytes.length; i += 4)
         bytes.writeUInt32LE(STORED, i)
+      sealNode(bytes.subarray(0, NODE_BYTES), CSUM_LEAF)
     }
     else if (device === '/dev/md126') {
       assert.equal(offset, MD_BYTE, 'the engine read md somewhere the mapping did not point')
@@ -464,6 +489,9 @@ let node: FakeNode
 
 function useNode(build: () => FakeNode): void {
   beforeEach(() => {
+    // The sync-op ownership log lives for the life of the process (D2). Each
+    // case starts with nothing issued, exactly as a fresh daemon would.
+    forgetIssuedChecks()
     node = build()
     process.env.ANAS_SELFHEAL_KERNEL_ROOT = node.root
     process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(node.root, 'run')
@@ -473,6 +501,17 @@ function useNode(build: () => FakeNode): void {
     delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
     node.cleanup()
   })
+}
+
+/** The captured rig's own geometry, pointed at the current fake node's sysfs. */
+function raid5Geometry() {
+  const attributes: Record<string, string | null> = {}
+  for (const line of fixture('md-sysfs-raid5.txt').split('\n')) {
+    const eq = line.indexOf('=')
+    if (eq > 0)
+      attributes[line.slice(0, eq)] = line.slice(eq + 1) === '<absent>' ? null : line.slice(eq + 1)
+  }
+  return geometryFromAttributes('/dev/md127', 'md127', node.sys, attributes, parseMdDetailExport(fixture('mdadm-detail-export-raid5.txt'), 6))
 }
 
 /** Every knob the engine may touch, back the way md shipped it. */
@@ -875,6 +914,7 @@ describe('selfheal repair — a compressed blob straddling two bands', () => {
         assert.equal(skip * BS, leafLv, 'the csum leaf was read somewhere the chunk hop did not point')
         for (let k = 0; k < BLOB_SECTORS; k++)
           bytes.writeUInt32LE(crc32c(this.sectors[k]), LEAF_HEADER + CSUM_ITEM_OFFSET + k * 4)
+        sealNode(bytes.subarray(0, NODE_BYTES), CSUM_LEAF_LOGICAL)
       }
       else {
         bytes = this.disk.get(`${device}@${skip * BS}`) ?? Buffer.alloc(BS)
@@ -890,6 +930,7 @@ describe('selfheal repair — a compressed blob straddling two bands', () => {
   let blob: FakeBlobNode
 
   beforeEach(() => {
+    forgetIssuedChecks()
     blob = new FakeBlobNode()
     process.env.ANAS_SELFHEAL_KERNEL_ROOT = blob.root
     process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(blob.root, 'run')
@@ -1015,6 +1056,155 @@ describe('selfheal repair — the verdicts that write nothing', () => {
 })
 
 /**
+ * D2 (design review 2026-09-14) — NEVER interrupt an md operation we did not
+ * start.
+ *
+ * `echo idle > sync_action` does not mean "cancel my check". It means "stop
+ * whatever you are doing", and what md is very often doing is REBUILDING ONTO
+ * A SPARE after a member failed. Three paths wrote it on sight — the bounded
+ * check's poll loop, the knob restore, and the scrub's band cancel — so a disk
+ * failing mid-repair had its rebuild aborted by the repair that was trying to
+ * help. The periodic scrub did it on every pass.
+ *
+ * A repair that is already mid-sequence when this happens must also write
+ * NOTHING: the gates proved the array healthy at step 1, and everything since
+ * has taken real time.
+ */
+describe('selfheal repair — md takes an operation of its own mid-repair', () => {
+  useNode(() => new FakeNode())
+
+  it('writes NOTHING when a recovery starts between the precheck and the write', async () => {
+    const outcome = await repairBlock(
+      node,
+      { mountpoint: node.mountpoint, file: node.file, block: 300 },
+      { ...OPTIONS, beforeStep: (name) => {
+        if (name !== 'write')
+          return
+        // A member failed after the precheck: md is rebuilding onto a spare,
+        // and it has bounded its own sync window to do it.
+        node.setKnob('degraded', '1')
+        node.setKnob('sync_action', 'recover')
+        node.setKnob('sync_min', '6272')
+        node.setKnob('sync_max', '6400')
+      } },
+    )
+
+    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    assert.match(outcome.reason, /^array state changed mid-repair: /)
+    assert.match(outcome.reason, /is now degraded \(1 member missing\)/)
+    assert.match(outcome.reason, /nothing written$/)
+    assert.equal(node.wroteThroughMd, null, 'the reconstructed block was NOT written through md')
+    // The knobs md set for its own rebuild are exactly as md left them.
+    assert.equal(node.knob('sync_action'), 'recover', 'no idle was written over md\'s recovery')
+    assert.equal(node.knob('sync_min'), '6272', 'the recovery\'s own window was not widened')
+    assert.equal(node.knob('sync_max'), '6400')
+    // And the run says what it left behind rather than swallowing it.
+    assert.ok(
+      outcome.diagnostics?.cleanupErrors.some(e => e.includes('md is running recover')),
+      JSON.stringify(outcome.diagnostics?.cleanupErrors),
+    )
+    // rmw_level is still put back — it changes how md writes, never what it
+    // is doing, so restoring it interrupts nothing.
+    assert.equal(node.knob('rmw_level'), '1')
+  })
+
+  it('stops the bounded check itself rather than narrowing a recovery\'s window', async () => {
+    node.setKnob('sync_action', 'recover')
+    const geo = raid5Geometry()
+    await assert.rejects(
+      () => boundedWindowCheck(node, geo, 49, OPTIONS),
+      (error: unknown) => {
+        assert.ok(error instanceof ForeignSyncOpError)
+        assert.match(error.message, /md is running recover on \/dev\/md127; not touched/)
+        return true
+      },
+    )
+    assert.equal(node.knob('sync_action'), 'recover')
+    assert.equal(node.knob('sync_min'), '0', 'the window was not narrowed onto a running recovery')
+    assert.equal(node.knob('sync_max'), 'max')
+  })
+
+  it('ends its OWN check with idle, exactly as before', async () => {
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    // The check the engine issued is over and the window is md's own again.
+    assert.equal(node.knob('sync_action'), 'idle')
+    assertKnobsRestored()
+  })
+})
+
+/**
+ * D7 — `reconstruct` reads the siblings BY DEVICE PATH, out of the
+ * `mdadm --detail --export` snapshot the gates took. A member md has kicked
+ * since then still has a path in that list, and reading it returns the disk's
+ * own stale bytes rather than an error — so the XOR comes out wrong. On RAID5
+ * that is a candidate that cannot be told from a good one except by
+ * arbitration; the honest answer is that the array can no longer reconstruct.
+ */
+describe('selfheal repair — a member md kicked after the gates', () => {
+  useNode(() => new FakeNode())
+
+  it('REFUSES a RAID5 reconstruction once a sibling is gone', async () => {
+    const outcome = await repairBlock(
+      node,
+      { mountpoint: node.mountpoint, file: node.file, block: 300 },
+      { ...OPTIONS, beforeStep: (name) => {
+        if (name !== 'reconstruct')
+          return
+        // md kicked loop3 and removed its rd3 the instant it did (GT: the
+        // kernel drops the directory immediately).
+        node.setKnob('degraded', '1')
+        rmSync(join(node.sys, 'rd3'), { recursive: true, force: true })
+      } },
+    )
+    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    assert.match(outcome.reason, /md has kicked \/dev\/loop3 out of \/dev\/md127 since this repair started/)
+    assert.match(outcome.reason, /a RAID5 reconstruction needs every other member/)
+    assert.equal(node.wroteThroughMd, null)
+    assertKnobsRestored()
+  })
+
+  /**
+   * The plan itself, level by level. RAID6 survives exactly one kicked
+   * sibling, and only through the syndrome that does not need it — which is
+   * the whole reason the Q path exists (GT-15).
+   */
+  it('keeps the syndrome that does not need the kicked member, and only that one', () => {
+    const raid6 = { raid1: false, raid6: true, device: '/dev/md127', members: ['/dev/a', '/dev/b', '/dev/c', '/dev/d', '/dev/e'] } as never
+    const target = { memberIndex: 0, parityIndex: 3, qIndex: 4 } as never
+
+    assert.deepEqual(
+      reconstructionPlan(raid6, target, [], []),
+      { refusal: null, pXor: true, qSyndrome: true, mirrors: [] },
+      'a complete array builds both candidates',
+    )
+    assert.deepEqual(
+      reconstructionPlan(raid6, target, [4], []),
+      { refusal: null, pXor: true, qSyndrome: false, mirrors: [] },
+      'Q gone: P-XOR only',
+    )
+    assert.deepEqual(
+      reconstructionPlan(raid6, target, [3], []),
+      { refusal: null, pXor: false, qSyndrome: true, mirrors: [] },
+      'P gone: the Q solve, which never consults P',
+    )
+    // A kicked DATA member is a second unknown in the same stripe.
+    assert.match(reconstructionPlan(raid6, target, [1], []).refusal as string, /second unknown data member/)
+    assert.match(reconstructionPlan(raid6, target, [1, 3], []).refusal as string, /three unknowns and two syndromes/)
+    // The block under repair is on member 0 — its own absence is not a second
+    // failure, it is the thing being reconstructed.
+    assert.equal(reconstructionPlan(raid6, target, [0], []).refusal, null)
+  })
+
+  it('drops a kicked mirror leg from the RAID1 candidates, and refuses when none is left', () => {
+    const raid1 = { raid1: true, raid6: false, device: '/dev/md126', members: ['/dev/a', '/dev/b', '/dev/c'] } as never
+    const target = { memberIndex: 0, parityIndex: null, qIndex: null } as never
+    assert.deepEqual(reconstructionPlan(raid1, target, [2], [1, 2]).mirrors, [1], 'only the leg md still serves')
+    assert.match(reconstructionPlan(raid1, target, [1], [1]).refusal as string, /no mirror leg left to copy/)
+  })
+})
+
+/**
  * R3 — the eviction sweep's bound. `rd<n>/size` is in KIBIBYTES and is already
  * net of the data offset; reading it as sectors and subtracting the offset a
  * second time put the array's last stripe at roughly half its real one, so no
@@ -1024,16 +1214,7 @@ describe('selfheal repair — the verdicts that write nothing', () => {
 describe('selfheal repair — evicting the stripe cache near the end of the array', () => {
   useNode(() => new FakeNode())
 
-  /** The rig's own geometry, pointed at the fake node's sysfs. */
-  function geometry() {
-    const attributes: Record<string, string | null> = {}
-    for (const line of fixture('md-sysfs-raid5.txt').split('\n')) {
-      const eq = line.indexOf('=')
-      if (eq > 0)
-        attributes[line.slice(0, eq)] = line.slice(eq + 1) === '<absent>' ? null : line.slice(eq + 1)
-    }
-    return geometryFromAttributes('/dev/md127', 'md127', node.sys, attributes, parseMdDetailExport(fixture('mdadm-detail-export-raid5.txt'), 6))
-  }
+  const geometry = raid5Geometry
 
   it('sweeps the stripes around a target near the END of the array', async () => {
     const geo = geometry()
@@ -1335,5 +1516,49 @@ describe('selfheal repair — pinning a §12 pool', () => {
     assert.equal(node.created.length, 1)
     assert.ok(node.created[0].startsWith(join(node.mountpoint, SELFHEAL_SNAPSHOT_PREFIX)), node.created[0])
     assert.equal(node.mountLog.length, 0, 'a flat pool takes no top-level mount')
+  })
+
+  /**
+   * S2 — the gate at step 1 refuses a pool whose top-level mount is already
+   * held, but a backup can take it at any point AFTER that, and by the cold
+   * read the block has already been WRITTEN. `withTopLevelMount` serialises on
+   * that one path, so joining its queue means sitting on a live array with
+   * `rmw_level=0` for as long as the backup runs — hours.
+   *
+   * The cold read is a confirmation, not a gate. Bounded wait, then an honest
+   * `repaired` that says the confirmation did not run.
+   */
+  it('does not block behind a backup for the final cold read — it says the read was skipped', async () => {
+    const held = pool()
+    const snapshotOptions = { runtimeDir: join(node.root, 'run-ahr') }
+    // A holder that arrives AFTER the gates and keeps the mount — a backup run.
+    // It lets go on a timer: the engine's own `finally` destroys its pin
+    // through the same mount, and THAT must still happen (a snapshot left
+    // behind pins an extent for ever), so the destroy waits for the backup by
+    // design. Only the cold READ — a confirmation, after the write — gives up.
+    let holding: Promise<unknown> | null = null
+    const backup = new Promise<void>(resolve => setTimeout(resolve, 1500))
+
+    const outcome = await repairBlock(
+      node,
+      { mountpoint: node.mountpoint, file: node.file, block: 300, pool: held },
+      {
+        ...OPTIONS,
+        ahrSnapshotOptions: snapshotOptions,
+        coldReadWaitMs: 30,
+        beforeStep: (name) => {
+          if (name === 'write')
+            holding = withTopLevelMount(node, held, () => backup, snapshotOptions)
+        },
+      },
+    )
+
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.match(outcome.reason, /post-check passed; cold read skipped: top-level mount busy/)
+    assert.ok(node.wroteThroughMd?.equals(HEALTHY), 'the block WAS written — the read is the part that was skipped')
+    const coldread = outcome.steps.find(s => s.name === 'coldread')
+    assert.match(coldread?.detail ?? '', /^skipped: top-level mount busy/)
+    assert.equal(coldread?.ok, true, 'a skipped confirmation is not a failed step')
+    await holding
   })
 })

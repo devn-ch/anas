@@ -2,7 +2,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { SelfhealContext } from './selfheal-map.js'
 import { csumItemKey, findLeaf } from './selfheal-btree.js'
 import { BLOCK_BYTES, readDirect } from './selfheal-io.js'
-import { coveringChunk, SelfhealMapError } from './selfheal-map.js'
+import { chunkStripeOffsets, coveringChunk, SelfhealMapError } from './selfheal-map.js'
 
 /**
  * The stored btrfs checksum for one on-disk sector, and the crc32c that
@@ -33,7 +33,29 @@ import { coveringChunk, SelfhealMapError } from './selfheal-map.js'
  *  - Item payloads are addressed from the END of the 101-byte leaf header:
  *    `leaf + 101 + itemoff + index × 4`.
  *  - The leaf's own logical bytenr needs the chunk-tree hop like any other
- *    logical byte, and metadata chunks are `DUP` — stripe 0 is the copy read.
+ *    logical byte, and metadata chunks are `DUP` — so there are TWO copies of
+ *    it and either may answer.
+ *
+ * ## The leaf is checked against itself before it is believed (D3)
+ *
+ * This is the one read in the whole engine that btrfs-progs does not make for
+ * us. Every `dump-tree -b` the walk issues goes through btrfs-progs's own
+ * `read_tree_block`, which verifies the block's checksum and fails the command
+ * when it does not match — a non-zero exit `selfheal-btree.ts` already turns
+ * into an error, so the walk cannot consume a rotten node. The RAW leaf read
+ * below had no such protection: rot in the csum tree itself came back as a
+ * plausible four-byte number, no reconstruction could ever match it, and a
+ * perfectly healthy data block was reported "unrepairable — restore from
+ * backup". The operator then overwrites good data with a backup.
+ *
+ * So the node proves itself first, exactly the way btrfs does it (verified
+ * against a captured leaf, `split-csum-leaf.b64`): the crc32c of bytes
+ * 32…nodesize equals the little-endian word in bytes 0…3, and the node's own
+ * `bytenr` field at offset 48 equals the leaf the walk asked for. If the first
+ * copy fails, the DUP chunk's second copy is read and checked the same way.
+ * Only when BOTH fail is the answer "unreadable" — a distinct, honest verdict
+ * ({@link CsumUnreadableError}, reason code `csum-unreadable`) that must never
+ * be rendered as restore-from-backup.
  */
 
 /** Bytes of a btrfs leaf header, past which item payloads are addressed (GT-4). */
@@ -44,6 +66,63 @@ export const NODE_BYTES = 16384
 
 /** Bytes per stored csum entry (crc32c). */
 export const CSUM_BYTES = 4
+
+/**
+ * `struct btrfs_header`, the first 101 bytes of every tree node:
+ * `csum[32] fsid[16] bytenr(le64) flags(le64) chunk_tree_uuid[16]
+ * generation(le64) owner(le64) nritems(le32) level(u8)`. The two fields this
+ * module checks are the csum (its low 4 bytes are the crc32c, little-endian)
+ * and `bytenr` at offset 48.
+ */
+const NODE_CSUM_FIELD_BYTES = 32
+const NODE_BYTENR_OFFSET = 48
+
+/** What a node's self-check found. */
+export interface NodeCheck {
+  ok: boolean
+  /** The reason it failed, or what it proved — an operator's sentence either way. */
+  detail: string
+}
+
+/**
+ * Does this node vouch for itself, and is it the node that was asked for?
+ *
+ * Two independent facts: the stored crc32c has to match the bytes AFTER the
+ * csum field (btrfs computes it over `32 … nodesize`), and the node's own
+ * `bytenr` has to be the leaf the walk descended to. The second catches the
+ * case the first cannot — a whole VALID node from somewhere else landing at
+ * this offset, which is what a stale or mis-hopped chunk delta produces.
+ */
+export function verifyNode(node: Buffer, bytenr: number): NodeCheck {
+  if (node.length < NODE_BYTES)
+    return { ok: false, detail: `only ${node.length} of ${NODE_BYTES} bytes were read` }
+  const stored = node.readUInt32LE(0)
+  const computed = crc32c(node.subarray(NODE_CSUM_FIELD_BYTES, NODE_BYTES))
+  if (stored !== computed)
+    return { ok: false, detail: `its stored node checksum ${csumHex(stored)} is not the crc32c of its own bytes (${csumHex(computed)})` }
+  const own = Number(node.readBigUInt64LE(NODE_BYTENR_OFFSET))
+  if (own !== bytenr)
+    return { ok: false, detail: `the node at this offset says it is bytenr ${own}, not ${bytenr}` }
+  return { ok: true, detail: `node ${bytenr} passes its own crc32c` }
+}
+
+/**
+ * The csum tree leaf holding this block's checksum could not be read reliably.
+ *
+ * NOT the same thing as "this file is beyond repair": nothing is known about
+ * the data block at all, because the thing that would arbitrate it is itself
+ * damaged. The engine reports `unrepairable` with this reason and the
+ * `csum-unreadable` code, and the notification and the UI must NOT tell the
+ * operator to restore from backup for it — restoring would overwrite data that
+ * may be perfectly good.
+ */
+export class CsumUnreadableError extends Error {
+  readonly reasonCode = 'csum-unreadable' as const
+  constructor(message: string) {
+    super(message)
+    this.name = 'CsumUnreadableError'
+  }
+}
 
 /**
  * CRC-32C (Castagnoli) — reflected polynomial 0x82F63B78, init and final xor
@@ -212,7 +291,13 @@ export async function findStoredCsumEntry(
  * four bytes of it), so the leaf is read off the LV directly — with O_DIRECT,
  * so a stale page of the block device cannot answer with a csum from before
  * the last commit. The leaf's own logical bytenr needs the chunk hop like any
- * other logical byte, and metadata chunks are DUP: stripe 0 is the copy read.
+ * other logical byte.
+ *
+ * Every copy the chunk holds is tried in turn and each one must pass
+ * {@link verifyNode} before its four bytes are believed — metadata chunks are
+ * `DUP`, so a leaf whose first copy has rotted is answered by the second.
+ * Throws {@link CsumUnreadableError} when no copy vouches for itself: that is
+ * a verdict about the CHECKSUM, not about the file (D3).
  */
 export async function readStoredCsum(
   executor: CommandExecutor,
@@ -223,9 +308,30 @@ export async function readStoredCsum(
   if (!location)
     return null
   const chunk = await coveringChunk(executor, ctx, location.item.leaf)
-  const leafLv = location.item.leaf - chunk.logical + chunk.deviceOffset
-  const aligned = leafLv - (leafLv % BLOCK_BYTES)
-  const skew = leafLv - aligned
-  const bytes = await readDirect(executor, ctx.srcDevice, aligned, NODE_BYTES + BLOCK_BYTES)
-  return csumFromLeafBytes(bytes.subarray(skew), location)
+  const copies = chunkStripeOffsets(chunk)
+  const failures: string[] = []
+
+  for (const [copy, deviceOffset] of copies.entries()) {
+    const leafLv = location.item.leaf - chunk.logical + deviceOffset
+    const aligned = leafLv - (leafLv % BLOCK_BYTES)
+    const skew = leafLv - aligned
+    let bytes: Buffer
+    try {
+      bytes = await readDirect(executor, ctx.srcDevice, aligned, NODE_BYTES + BLOCK_BYTES)
+    }
+    catch (error) {
+      failures.push(`copy ${copy}: ${error instanceof Error ? error.message : String(error)}`)
+      continue
+    }
+    const check = verifyNode(bytes.subarray(skew, skew + NODE_BYTES), location.item.leaf)
+    if (check.ok)
+      return csumFromLeafBytes(bytes.subarray(skew), location)
+    failures.push(`copy ${copy}: ${check.detail}`)
+  }
+
+  throw new CsumUnreadableError(
+    `this file's checksum could not be read reliably (csum tree leaf ${location.item.leaf} failed its own checksum on `
+    + `${copies.length > 1 ? 'both copies' : 'its only copy'} — ${failures.join('; ')}). `
+    + `Nothing is known about the data block itself: do NOT restore from backup on the strength of this.`,
+  )
 }

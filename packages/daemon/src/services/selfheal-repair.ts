@@ -4,6 +4,7 @@ import type {
   SelfhealMapping,
   SelfhealOutcome,
   SelfhealOutcomeKind,
+  SelfhealReasonCode,
   SelfhealReconstruction,
   SelfhealStep,
   SelfhealStepName,
@@ -20,12 +21,14 @@ import {
   SUBVOL_DATA,
   SUBVOL_SNAPSHOTS,
   topLevelMountPath,
-  withTopLevelMount,
+  withTopLevelMountWithin,
 } from './ahr-snapshots.js'
-import { crc32c, csumHex, readStoredCsum } from './selfheal-csum.js'
+import { crc32c, csumHex, CsumUnreadableError, readStoredCsum } from './selfheal-csum.js'
 import {
   BLOCK_BYTES,
   dropCaches,
+  MD_DEFAULT_SYNC_MAX,
+  MD_DEFAULT_SYNC_MIN,
   probeFileBlock,
   readDirect,
   readDiscard,
@@ -44,6 +47,13 @@ import {
   stripeDataOrder,
   subvolumeIdOf,
 } from './selfheal-map.js'
+import {
+  foreignOpNote,
+  isIdleSyncAction,
+  markCheckIssued,
+  ownsSyncOp,
+  retireCheckIssued,
+} from './selfheal-syncop.js'
 
 /**
  * The AHR self-heal REPAIR ENGINE (story selfheal.5) — btrfs's checksum
@@ -155,6 +165,11 @@ export interface SelfhealRepairOptions {
   /** Passed straight to the AHR snapshot service (tests point its runtime dir at a temp path). */
   ahrSnapshotOptions?: AhrSnapshotOptions
   /**
+   * Milliseconds the final cold read may wait for the pool's top-level mount
+   * before it is skipped (S2). Default {@link SELFHEAL_COLD_READ_WAIT_MS}.
+   */
+  coldReadWaitMs?: number
+  /**
    * Milliseconds waited after a bounded check ends before `mismatch_cnt` is
    * read. The default is what the kernel needs (the counter finalizes slightly
    * after `sync_action` flips to idle — read it sooner and you get the PREVIOUS
@@ -178,7 +193,12 @@ export class SelfhealRunError extends Error {
 
 /** Internal: stop the sequence with one of the four verdicts. */
 class Verdict extends Error {
-  constructor(readonly kind: SelfhealOutcomeKind, message: string) {
+  constructor(
+    readonly kind: SelfhealOutcomeKind,
+    message: string,
+    /** Set only where a parser has to tell this verdict from its neighbours (D3). */
+    readonly code?: SelfhealReasonCode,
+  ) {
     super(message)
     this.name = 'Verdict'
   }
@@ -209,6 +229,16 @@ export const SELFHEAL_CHECK_TIMEOUT_SECONDS = 180
 
 /** Default stripes swept either side of the target during a stripe-cache evict. */
 export const SELFHEAL_EVICT_SPAN = 200
+
+/**
+ * How long the final cold read waits for the pool's top-level mount (S2).
+ *
+ * Long enough that an ordinary snapshot list or delete passing through clears
+ * out of the way; far short of a backup run, which holds that mount for the
+ * whole of one `pbc` invocation. Past it the repair says the confirmation was
+ * skipped rather than sitting on a live array with `rmw_level` turned down.
+ */
+export const SELFHEAL_COLD_READ_WAIT_MS = 60000
 
 /**
  * The floor md accepts for `stripe_cache_size` — below it the write is
@@ -302,6 +332,28 @@ async function memberDataSectors(geo: MdGeometry): Promise<number | null> {
 }
 
 /**
+ * md is running an operation this run did not start, on an array this run was
+ * about to touch (design review 2026-09-14, D2).
+ *
+ * Raised instead of writing anything. `repairBlock` turns it into
+ * `unrepairable` — "array state changed mid-repair" — because that is exactly
+ * what happened: a member failed, md started recovering onto a spare, and the
+ * only correct thing a repair can do is get out of the way. Narrowing
+ * `sync_max` under that rebuild, or ending it with `idle`, would abort it.
+ */
+export class ForeignSyncOpError extends Error {
+  constructor(readonly device: string, readonly action: string | null) {
+    super(foreignOpNote(device, action))
+    this.name = 'ForeignSyncOpError'
+  }
+}
+
+/** `sync_action` right now — null when the attribute cannot be read at all. */
+function readSyncAction(geo: MdGeometry): Promise<string | null> {
+  return readMdAttrOrNull(geo.sys, 'sync_action')
+}
+
+/**
  * Run an md `check` bounded to one stripe and return its `mismatch_cnt`.
  *
  * GT-5/GT-13: a check that reaches `sync_max` before the device end SUSPENDS
@@ -310,6 +362,12 @@ async function memberDataSectors(geo: MdGeometry): Promise<number | null> {
  * ends the op scoped to the window. And `mismatch_cnt` finalizes slightly
  * AFTER the op ends, so reading it immediately returns the previous check's
  * count — hence the settle.
+ *
+ * Every write here is gated on ownership (D2). `sync_min`/`sync_max` are
+ * narrowed only onto an IDLE array — re-read at this instant, not at the gates
+ * — and the poll loop's `idle` goes in only while `sync_action` still reads
+ * the `check` this call issued. The moment md is doing something of its own the
+ * call throws {@link ForeignSyncOpError} with nothing written.
  */
 export async function boundedWindowCheck(
   executor: CommandExecutor,
@@ -317,6 +375,12 @@ export async function boundedWindowCheck(
   stripe: number,
   options?: SelfhealRepairOptions,
 ): Promise<number> {
+  // The gates ran at step 1 and a member can fail at any point after it. Read
+  // it again HERE, immediately before the first knob moves.
+  const before = await ownsSyncOp(geo.kernel, () => readSyncAction(geo))
+  if (before.foreign)
+    throw new ForeignSyncOpError(geo.device, before.action)
+
   await evictStripeCache(executor, geo, stripe, options?.evictSpan ?? SELFHEAL_EVICT_SPAN)
   const per = windowSectors(geo)
   const low = stripe * per
@@ -324,18 +388,29 @@ export async function boundedWindowCheck(
   await writeMdAttr(geo.sys, 'sync_min', String(low))
   await writeMdAttr(geo.sys, 'sync_max', String(high))
   await writeMdAttr(geo.sys, 'sync_action', 'check')
+  // From here on `idle` may be written to this array — and only from here on.
+  markCheckIssued(geo.kernel)
 
   const cap = options?.checkTimeoutSeconds ?? SELFHEAL_CHECK_TIMEOUT_SECONDS
   let ended = false
   for (let i = 0; i < cap * 2 && !ended; i++) {
-    if ((await readMdAttr(geo.sys, 'sync_action')) === 'idle') {
+    const own = await ownsSyncOp(geo.kernel, () => readSyncAction(geo))
+    if (isIdleSyncAction(own.action)) {
+      retireCheckIssued(geo.kernel)
       ended = true
       break
+    }
+    if (own.foreign) {
+      // md dropped our check and took something of its own on — a member
+      // failed, and this array is now rebuilding. Leave every knob alone.
+      retireCheckIssued(geo.kernel)
+      throw new ForeignSyncOpError(geo.device, own.action)
     }
     const completed = (await readMdAttr(geo.sys, 'sync_completed')).split(WHITESPACE_RE)[0]
     if (INTEGER_RE.test(completed) && Number(completed) >= high) {
       try {
         await writeMdAttr(geo.sys, 'sync_action', 'idle')
+        retireCheckIssued(geo.kernel)
         ended = true
         break
       }
@@ -355,26 +430,39 @@ export async function boundedWindowCheck(
 }
 
 /**
- * Put `sync_min` / `sync_max` back the way md ships them.
+ * Put `sync_min` / `sync_max` back the way md ships them — unless md has taken
+ * an operation of its own on the array in the meantime.
  *
  * A suspended bounded op has to be widened and ended first: the knob PERSISTS,
  * and a later full check would stop at the old boundary again and silently
- * cover a sliver of the array (GT-13, the trap).
+ * cover a sliver of the array (GT-13, the trap). But that widen-then-`idle`
+ * pair is precisely what must NOT reach a recovery: the old code wrote both
+ * whenever `sync_action` was anything but idle, which on a member failure
+ * aborted the rebuild (D2).
+ *
+ * So: our own check is widened and ended as before; an idle array is simply
+ * restored; a FOREIGN operation is left completely untouched and the returned
+ * sentence says which one it is. The daemon-start reconciliation
+ * (`selfheal-reconcile.ts`) is what puts the window back once md is finished.
  */
-export async function restoreSyncKnobs(geo: MdGeometry): Promise<void> {
-  try {
-    const action = await readMdAttr(geo.sys, 'sync_action')
-    const completed = (await readMdAttr(geo.sys, 'sync_completed')).split(WHITESPACE_RE)[0]
-    if (action !== 'idle' && action !== 'none' && INTEGER_RE.test(completed)) {
-      await writeMdAttr(geo.sys, 'sync_max', 'max')
+export async function restoreSyncKnobs(geo: MdGeometry): Promise<string | null> {
+  const own = await ownsSyncOp(geo.kernel, () => readSyncAction(geo))
+  if (own.foreign)
+    return `${geo.device}: sync_min/sync_max left as they are — ${foreignOpNote(geo.device, own.action)}`
+  if (own.owned) {
+    try {
+      await writeMdAttr(geo.sys, 'sync_max', MD_DEFAULT_SYNC_MAX)
       await writeMdAttr(geo.sys, 'sync_action', 'idle')
     }
+    catch {
+      // EBUSY on a window the op has not reached yet — the unconditional
+      // restore below is what actually clears GT-13's trap.
+    }
+    retireCheckIssued(geo.kernel)
   }
-  catch {
-    // Fall through to the unconditional restore below — it is what matters.
-  }
-  await writeMdAttr(geo.sys, 'sync_min', '0')
-  await writeMdAttr(geo.sys, 'sync_max', 'max')
+  await writeMdAttr(geo.sys, 'sync_min', MD_DEFAULT_SYNC_MIN)
+  await writeMdAttr(geo.sys, 'sync_max', MD_DEFAULT_SYNC_MAX)
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -546,12 +634,12 @@ export async function repairBlock(
       current.detail = detail
   }
 
-  function fail(kind: SelfhealOutcomeKind, reason: string): never {
+  function fail(kind: SelfhealOutcomeKind, reason: string, code?: SelfhealReasonCode): never {
     if (current) {
       current.ok = false
       current.detail = reason
     }
-    throw new Verdict(kind, reason)
+    throw new Verdict(kind, reason, code)
   }
 
   try {
@@ -595,7 +683,7 @@ export async function repairBlock(
     const verdict = await reverify(executor, pinned, resolved)
     diagnostics.badSectors = verdict.badSectors
     if (verdict.abort)
-      fail(verdict.abort.kind, verdict.abort.reason)
+      fail(verdict.abort.kind, verdict.abort.reason, verdict.abort.code)
     const target = resolved.sectors[verdict.badSectors[0]]
     const geo = target.geometry
     // The band that is actually worked on — which is not necessarily the first
@@ -632,8 +720,18 @@ export async function repairBlock(
       await writeMdAttr(geo.sys, 'rmw_level', '0')
 
     // ---- reconstruct ----------------------------------------------------
+    // D7: the geometry's member list is the `mdadm --detail` snapshot taken at
+    // the gates, and a member md has KICKED since then still has a device path
+    // in it. Reading that path returns the disk's own stale bytes (or EIO) and
+    // the XOR comes out wrong — a false candidate that can still fail
+    // arbitration, but on RAID6 could be arbitrated against the WRONG syndrome.
+    // Re-read `degraded` and ask sysfs which roles are actually still in.
     await step('reconstruct')
-    const candidates = await reconstruct(executor, geo, target, verdict.goodMirrors)
+    const absent = await absentRoles(geo)
+    const plan = reconstructionPlan(geo, target, absent, verdict.goodMirrors)
+    if (plan.refusal)
+      fail('unrepairable', plan.refusal)
+    const candidates = await reconstruct(executor, geo, target, plan)
     if (candidates.length === 0)
       fail('unrepairable', `no candidate could be reconstructed for ${file} block ${request.block}`)
     note(candidates.map(c => c.how).join(', '))
@@ -665,7 +763,15 @@ export async function repairBlock(
       fail('unrepairable', guard.detail)
 
     // ---- write ----------------------------------------------------------
+    // The gates are a re-check, not a one-time test (D2). Everything between
+    // step 1 and here takes real time — a bounded check over a 20 TB band is
+    // minutes — and a member that failed inside that window puts md into
+    // `recover`. Writing through md then lands the block in a stripe that is
+    // being rebuilt underneath it.
     await step('write')
+    const changed = await preWriteRefusal(geo)
+    if (changed)
+      fail('unrepairable', `array state changed mid-repair: ${changed}, nothing written`)
     await writeDirect(executor, geo.device, target.mdByte, winner.bytes)
 
     // ---- postcheck ------------------------------------------------------
@@ -678,20 +784,40 @@ export async function repairBlock(
     }
 
     // ---- coldread -------------------------------------------------------
+    // The write has already happened, so this step can no longer refuse
+    // anything — it can only confirm. On a §12 pool it needs the pool's
+    // top-level mount, which `withTopLevelMount` serialises: a backup run that
+    // started since the gates holds it for HOURS, and blocking there would
+    // leave `rmw_level=0` set on a live array for the duration of the backup.
+    // Bounded wait, then say plainly that the confirmation did not run (S2).
     await step('coldread')
-    const bad = await coldRead(executor, pin, resolved)
-    if (bad.length > 0) {
-      fail('unrepairable', `the repaired region still reads back with an error through a fresh snapshot (blocks ${bad.join(', ')})`)
+    const repaired = `${file} block ${request.block} reconstructed from ${winner.detail} and verified against the stored csum ${csumHex(storedCsum)}`
+    const cold = await coldRead(executor, pin, resolved)
+    if (!cold.ran) {
+      note(`skipped: ${cold.reason}`)
+      return outcome('repaired', `${repaired} (post-check passed; cold read skipped: ${cold.reason})`)
+    }
+    if (cold.bad.length > 0) {
+      fail('unrepairable', `the repaired region still reads back with an error through a fresh snapshot (blocks ${cold.bad.join(', ')})`)
     }
     note('read back clean through the pin snapshot')
 
-    return outcome('repaired', `${file} block ${request.block} reconstructed from ${winner.detail} and verified against the stored csum ${csumHex(storedCsum)}`)
+    return outcome('repaired', repaired)
   }
   catch (error) {
     if (error instanceof Verdict)
-      return outcome(error.kind, error.message)
+      return outcome(error.kind, error.message, error.code)
     if (error instanceof SelfhealRunError)
       throw error
+    if (error instanceof ForeignSyncOpError) {
+      // Raised from inside a step by the bounded check, with nothing written.
+      const stopped = steps.at(-1)
+      if (stopped) {
+        stopped.ok = false
+        stopped.detail = error.message
+      }
+      return outcome('unrepairable', `array state changed mid-repair: ${error.message}, nothing written`)
+    }
     if (error instanceof SelfhealMapError)
       return outcome('mapping-abort', error.message)
     throw new SelfhealRunError(errorText(error), steps, diagnostics, { cause: error })
@@ -702,11 +828,12 @@ export async function repairBlock(
 
   // -- helpers that close over the run's state -----------------------------
 
-  function outcome(kind: SelfhealOutcomeKind, reason: string): SelfhealOutcome {
+  function outcome(kind: SelfhealOutcomeKind, reason: string, code?: SelfhealReasonCode): SelfhealOutcome {
     const map = diagnostics.mapping
     return {
       outcome: kind,
       reason,
+      ...(code ? { reasonCode: code } : {}),
       file,
       block: request.block,
       pool: request.pool?.name ?? null,
@@ -731,7 +858,12 @@ export async function repairBlock(
       }
       if (band.syncKnobs) {
         try {
-          await restoreSyncKnobs(band.geo)
+          // A foreign op is not an error — it is a reason the window is still
+          // narrow, and the operator is told which op it was rather than
+          // having md interrupted on their behalf (D2).
+          const left = await restoreSyncKnobs(band.geo)
+          if (left)
+            diagnostics.cleanupErrors.push(left)
         }
         catch (error) {
           diagnostics.cleanupErrors.push(`${band.geo.device}: sync knobs not restored: ${errorText(error)}`)
@@ -823,6 +955,102 @@ async function gateRefusal(
   return null
 }
 
+/**
+ * The gates, re-run on ONE array immediately before the write (D2).
+ *
+ * The gates at step 1 proved this array complete and still. This asks whether
+ * it STILL is, at the last instant before bytes go in — so "changed" and "not
+ * clean now" are the same question and the answer names the condition.
+ */
+async function preWriteRefusal(geo: MdGeometry): Promise<string | null> {
+  const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
+  if (degraded !== null && degraded !== '0')
+    return `${geo.device} is now degraded (${degraded} member${degraded === '1' ? '' : 's'} missing)`
+  const action = await readSyncAction(geo)
+  if (!isIdleSyncAction(action))
+    return `${geo.device} is now running ${action ?? 'an operation whose sync_action could not be read'}`
+  const reshape = await readMdAttrOrNull(geo.sys, 'reshape_position')
+  if (reshape !== null && reshape !== 'none')
+    return `${geo.device} is now mid-reshape (reshape_position=${reshape})`
+  return null
+}
+
+/**
+ * The roles md is no longer serving, read from sysfs rather than from the
+ * `mdadm --detail --export` snapshot the geometry was built from (D7).
+ *
+ * The kernel removes a faulty member's `rd<n>` directory the moment it kicks
+ * it, so an absent attribute IS the answer; a member marked `faulty` that has
+ * not been removed yet counts too. Skipped entirely while `degraded` reads 0,
+ * which is the overwhelmingly common case and costs one attribute read.
+ */
+async function absentRoles(geo: MdGeometry): Promise<number[]> {
+  const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
+  if (degraded === null || degraded === '0')
+    return []
+  const out: number[] = []
+  for (let role = 0; role < geo.raidDisks; role++) {
+    if (geo.members[role] === null) {
+      out.push(role)
+      continue
+    }
+    const state = await readMdAttrOrNull(geo.sys, `rd${role}/state`)
+    if (state === null || state.includes('faulty'))
+      out.push(role)
+  }
+  return out
+}
+
+/** Which reconstructions are still possible given what md is still serving. */
+export interface ReconstructionPlan {
+  /** Set when none of them are — the operator's sentence. */
+  refusal: string | null
+  /** RAID6/RAID5: the P-based XOR candidate can be built. */
+  pXor: boolean
+  /** RAID6: the Q-syndrome candidate can be built (P never consulted). */
+  qSyndrome: boolean
+  /** RAID1: the legs that are still in the array AND passed their csum. */
+  mirrors: number[]
+}
+
+/**
+ * What can still be reconstructed once md's kicked members are taken out (D7).
+ *
+ * RAID5 needs every other member of the stripe, so one kicked sibling ends it.
+ * RAID6 has two syndromes and survives exactly one: a kicked Q leaves the
+ * P-XOR, a kicked P leaves the Q solve — which is the whole reason the Q path
+ * exists. A kicked DATA member is a second unknown alongside the block under
+ * repair and neither syndrome can solve for two.
+ */
+export function reconstructionPlan(
+  geo: MdGeometry,
+  target: MemberLocation,
+  absent: number[],
+  goodMirrors: number[],
+): ReconstructionPlan {
+  const kicked = absent.filter(role => role !== target.memberIndex)
+  const names = kicked.map(role => geo.members[role] ?? `role ${role}`).join(', ')
+  const since = `md has kicked ${names} out of ${geo.device} since this repair started`
+
+  if (geo.raid1) {
+    const mirrors = goodMirrors.filter(leg => !kicked.includes(leg))
+    return mirrors.length > 0
+      ? { refusal: null, pXor: false, qSyndrome: false, mirrors }
+      : { refusal: `${since} — there is no mirror leg left to copy the block from. Nothing was written.`, pXor: false, qSyndrome: false, mirrors: [] }
+  }
+  if (kicked.length === 0)
+    return { refusal: null, pXor: true, qSyndrome: geo.raid6, mirrors: [] }
+  if (!geo.raid6)
+    return { refusal: `${since} — a RAID5 reconstruction needs every other member of the stripe. Nothing was written.`, pXor: false, qSyndrome: false, mirrors: [] }
+  if (kicked.length > 1)
+    return { refusal: `${since} — a RAID6 stripe with the block under repair and two members gone has three unknowns and two syndromes. Nothing was written.`, pXor: false, qSyndrome: false, mirrors: [] }
+  if (kicked[0] === target.qIndex)
+    return { refusal: null, pXor: true, qSyndrome: false, mirrors: [] }
+  if (kicked[0] === target.parityIndex)
+    return { refusal: null, pXor: false, qSyndrome: true, mirrors: [] }
+  return { refusal: `${since} — that is a second unknown data member in the same stripe as the block under repair, and neither syndrome solves for two. Nothing was written.`, pXor: false, qSyndrome: false, mirrors: [] }
+}
+
 /** Why ONE band's array cannot be repaired on right now, or null when it can. */
 async function arrayRefusal(geo: MdGeometry): Promise<string | null> {
   const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
@@ -875,9 +1103,24 @@ async function arrayRefusal(geo: MdGeometry): Promise<string | null> {
 interface Pin {
   /** What to call it in an outcome or an error. */
   describe: string
-  /** Read those file blocks cold through the snapshot; returns the ones that failed. */
-  coldRead: (blocks: number[]) => Promise<number[]>
+  /**
+   * Read those file blocks cold through the snapshot.
+   *
+   * `ran: false` is a real answer, not a failure: on a §12 pool the read needs
+   * the pool's top-level mount, and a backup job holding it for hours is not
+   * something a repair that has ALREADY WRITTEN should block behind (S2).
+   */
+  coldRead: (blocks: number[]) => Promise<ColdReadResult>
   destroy: () => Promise<void>
+}
+
+/** What the cold read found, or why it could not look. */
+interface ColdReadResult {
+  ran: boolean
+  /** The blocks that still read back with an error. Empty when `ran` is false. */
+  bad: number[]
+  /** Why it could not run — an operator's clause, appended to the outcome. */
+  reason: string
 }
 
 function noProgress(): void {}
@@ -921,16 +1164,7 @@ async function takePin(
   const ahrOptions = options?.ahrSnapshotOptions
 
   if (pool?.subvolLayout && pool.mounted) {
-    for (const stale of await listAhrSnapshots(executor, pool, ahrOptions)) {
-      if (!stale.name.startsWith(SELFHEAL_SNAPSHOT_PREFIX))
-        continue
-      try {
-        await deleteAhrSnapshot(executor, pool, stale.name, noProgress, ahrOptions)
-      }
-      catch (error) {
-        diagnostics.cleanupErrors.push(`stale transient snapshot ${pool.name}:${SUBVOL_SNAPSHOTS}/${stale.name} could not be swept: ${errorText(error)}`)
-      }
-    }
+    diagnostics.cleanupErrors.push(...(await sweepSelfhealPins(executor, pool, mountpoint, ahrOptions)).errors)
     const nested = await nestedSubvolumeOf(executor, pool, file)
     await createAhrSnapshot(executor, pool, name, noProgress, {
       ...ahrOptions,
@@ -943,7 +1177,7 @@ async function takePin(
     return {
       describe: `${pool.name}:${SUBVOL_SNAPSHOTS}/${name}`,
       coldRead: async (blocks) => {
-        return withTopLevelMount(executor, pool, async (top) => {
+        const held = await withTopLevelMountWithin(executor, pool, async (top) => {
           const path = join(top, SUBVOL_SNAPSHOTS, name, within)
           const bad: number[] = []
           for (const block of blocks) {
@@ -951,7 +1185,10 @@ async function takePin(
               bad.push(block)
           }
           return bad
-        }, ahrOptions)
+        }, ahrOptions, options?.coldReadWaitMs)
+        return held.ran
+          ? { ran: true, bad: held.value, reason: '' }
+          : { ran: false, bad: [], reason: `top-level mount busy (another job has held ${topLevelMountPath(pool, ahrOptions)} for the ${Math.round(held.waitedMs / 1000)}s this read waited)` }
       },
       destroy: async () => {
         await deleteAhrSnapshot(executor, pool, name, noProgress, ahrOptions)
@@ -961,7 +1198,7 @@ async function takePin(
 
   // Flat pool (or no pool): no @snapshots to put it in, so the snapshot goes
   // inside the mountpoint and is swept from there.
-  await sweepStaleSnapshots(executor, mountpoint, diagnostics)
+  diagnostics.cleanupErrors.push(...(await sweepSelfhealPins(executor, null, mountpoint, ahrOptions)).errors)
   const path = join(mountpoint, name)
   const r = await executor.exec(BTRFS, ['subvolume', 'snapshot', '-r', mountpoint, path])
   if (r.exitCode !== 0)
@@ -975,7 +1212,7 @@ async function takePin(
         if (!(await probeFileBlock(executor, join(path, within), block)))
           bad.push(block)
       }
-      return bad
+      return { ran: true, bad, reason: '' }
     },
     destroy: async () => {
       const d = await executor.exec(BTRFS, ['subvolume', 'delete', path])
@@ -985,26 +1222,66 @@ async function takePin(
   }
 }
 
-/** Destroy leftovers of a crashed earlier run — this engine's own prefix only. */
-async function sweepStaleSnapshots(
+/** What one sweep of this engine's transient snapshots destroyed, and what it could not. */
+export interface SelfhealPinSweep {
+  /** Names destroyed. */
+  swept: string[]
+  /** Leftovers that could not be destroyed, each with its reason. */
+  errors: string[]
+}
+
+/**
+ * Destroy leftovers of a crashed earlier run — this engine's OWN prefix only,
+ * never anything an operator or a backup made.
+ *
+ * Called from two places and living in one (D4): `takePin`, before it takes a
+ * new one, and the daemon-start reconciliation, which is the only thing that
+ * can clean up after a run that was SIGKILLed and so never reached its
+ * `finally`. Both shapes of pin are swept here — the §12 `@snapshots/<name>`
+ * through the same AHR snapshot verbs the pin is taken with, and the flat
+ * pool's in-place subvolume inside the mountpoint.
+ */
+export async function sweepSelfhealPins(
   executor: CommandExecutor,
+  pool: AhrPool | null,
   mountpoint: string,
-  diagnostics: SelfhealDiagnostics,
-): Promise<void> {
+  ahrOptions?: AhrSnapshotOptions,
+): Promise<SelfhealPinSweep> {
+  const swept: string[] = []
+  const errors: string[] = []
+
+  if (pool?.subvolLayout && pool.mounted) {
+    for (const stale of await listAhrSnapshots(executor, pool, ahrOptions)) {
+      if (!stale.name.startsWith(SELFHEAL_SNAPSHOT_PREFIX))
+        continue
+      try {
+        await deleteAhrSnapshot(executor, pool, stale.name, noProgress, ahrOptions)
+        swept.push(`${pool.name}:${SUBVOL_SNAPSHOTS}/${stale.name}`)
+      }
+      catch (error) {
+        errors.push(`stale transient snapshot ${pool.name}:${SUBVOL_SNAPSHOTS}/${stale.name} could not be swept: ${errorText(error)}`)
+      }
+    }
+    return { swept, errors }
+  }
+
   let entries: string[]
   try {
     entries = await readdir(mountpoint)
   }
   catch {
-    return
+    return { swept, errors }
   }
   for (const entry of entries) {
     if (!entry.startsWith(SELFHEAL_SNAPSHOT_PREFIX))
       continue
     const r = await executor.exec(BTRFS, ['subvolume', 'delete', join(mountpoint, entry)])
-    if (r.exitCode !== 0)
-      diagnostics.cleanupErrors.push(`stale transient snapshot ${entry} could not be swept: ${r.stderr.trim()}`)
+    if (r.exitCode === 0)
+      swept.push(join(mountpoint, entry))
+    else
+      errors.push(`stale transient snapshot ${entry} could not be swept: ${r.stderr.trim()}`)
   }
+  return { swept, errors }
 }
 
 interface Reverified {
@@ -1019,7 +1296,7 @@ interface Reverified {
   /** RAID1: legs that still pass their csum — the candidate source. */
   goodMirrors: number[]
   /** Set when the sequence must stop here. */
-  abort: { kind: SelfhealOutcomeKind, reason: string } | null
+  abort: { kind: SelfhealOutcomeKind, reason: string, code?: SelfhealReasonCode } | null
 }
 
 /**
@@ -1049,7 +1326,25 @@ async function reverify(
   for (let k = 0; k < resolved.sectors.length; k++) {
     const location = resolved.sectors[k]
     const geo = location.geometry
-    const stored = await readStoredCsum(executor, ctx, location.logical)
+    let stored: number | null
+    try {
+      stored = await readStoredCsum(executor, ctx, location.logical)
+    }
+    catch (error) {
+      // D3: the csum tree leaf failed its OWN checksum on every copy. Nothing
+      // is known about the data block — say that, with a code the UI can key
+      // on, and never the words "restore from backup".
+      if (!(error instanceof CsumUnreadableError))
+        throw error
+      return {
+        badSectors,
+        corruptBytes,
+        storedCsum,
+        badMirror,
+        goodMirrors,
+        abort: { kind: 'unrepairable', reason: error.message, code: error.reasonCode },
+      }
+    }
     if (stored === null) {
       return {
         badSectors,
@@ -1206,22 +1501,27 @@ async function readMemberWithRetry(
 }
 
 /**
- * Build every candidate for the corrupt block, best first.
+ * Build every candidate the {@link ReconstructionPlan} says is still possible,
+ * best first.
  *
  * RAID5 has exactly one: the XOR of the same stripe row on every other member.
  * RAID6 has two — the P-based XOR (all members but the bad one and Q), and, if
  * that fails arbitration because P is ALSO damaged, the Q syndrome solve which
  * never touches P. RAID1's candidates are the surviving legs themselves.
+ *
+ * The plan is what keeps a kicked member from being READ (D7): its device path
+ * is still in the geometry, and reading it returns that disk's stale bytes
+ * rather than an error.
  */
 async function reconstruct(
   executor: CommandExecutor,
   geo: MdGeometry,
   target: MemberLocation,
-  goodMirrors: number[],
+  plan: ReconstructionPlan,
 ): Promise<Candidate[]> {
   if (geo.raid1) {
     const out: Candidate[] = []
-    for (const leg of goodMirrors) {
+    for (const leg of plan.mirrors) {
       const device = geo.members[leg] as string
       out.push({
         bytes: await readDirect(executor, device, memberOffsetOn(geo, target, leg), BLOCK_BYTES),
@@ -1239,6 +1539,8 @@ async function reconstruct(
   }
 
   if (!geo.raid6) {
+    if (!plan.pXor)
+      return []
     const candidate = Buffer.alloc(BLOCK_BYTES)
     for (let i = 0; i < geo.raidDisks; i++) {
       if (i === target.memberIndex)
@@ -1253,32 +1555,37 @@ async function reconstruct(
   }
 
   const qIndex = target.qIndex as number
-  const pXor = Buffer.alloc(BLOCK_BYTES)
-  for (let i = 0; i < geo.raidDisks; i++) {
-    if (i === target.memberIndex || i === qIndex)
-      continue
-    xorInto(pXor, await row(i))
-  }
+  const out: Candidate[] = []
 
-  const order = stripeDataOrder(geo, stripe)
-  const dataBlocks: (Buffer | null)[] = []
-  for (let d = 0; d < order.length; d++)
-    dataBlocks.push(order[d] === target.memberIndex ? null : await row(order[d]))
-  const qBytes = await row(qIndex)
-  const missing = target.dataIndex ?? order.indexOf(target.memberIndex)
-
-  return [
-    {
+  if (plan.pXor) {
+    const pXor = Buffer.alloc(BLOCK_BYTES)
+    for (let i = 0; i < geo.raidDisks; i++) {
+      if (i === target.memberIndex || i === qIndex)
+        continue
+      xorInto(pXor, await row(i))
+    }
+    out.push({
       bytes: pXor,
       how: 'p-xor',
       detail: `the P parity of stripe ${stripe} and its other data members`,
-    },
-    {
+    })
+  }
+
+  if (plan.qSyndrome) {
+    const order = stripeDataOrder(geo, stripe)
+    const dataBlocks: (Buffer | null)[] = []
+    for (let d = 0; d < order.length; d++)
+      dataBlocks.push(order[d] === target.memberIndex ? null : await row(order[d]))
+    const qBytes = await row(qIndex)
+    const missing = target.dataIndex ?? order.indexOf(target.memberIndex)
+    out.push({
       bytes: reconstructFromQ(dataBlocks, qBytes, missing),
       how: 'q-syndrome',
       detail: `the Q syndrome of stripe ${stripe} (P not consulted)`,
-    },
-  ]
+    })
+  }
+
+  return out
 }
 
 /**
@@ -1295,7 +1602,7 @@ async function coldRead(
   executor: CommandExecutor,
   pin: Pin,
   resolved: ResolvedBlock,
-): Promise<number[]> {
+): Promise<ColdReadResult> {
   await dropCaches(executor)
   const span = resolved.extent.length ?? resolved.extent.ram ?? BLOCK_BYTES
   const blocks = resolved.compressed

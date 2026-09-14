@@ -213,7 +213,7 @@ describe('selfheal mapping — a multi-band pool', () => {
     selfhealBand(TWO_BAND[1], BAND2),
   ]
   /** Identity chunk: this is about the band hop, not the GT-2 chunk delta. */
-  const FLAT_CHUNK = { logical: 0, length: 2 ** 40, deviceOffset: 0, type: 'DATA|single' }
+  const FLAT_CHUNK = { logical: 0, length: 2 ** 40, deviceOffset: 0, stripes: [0], type: 'DATA|single' }
 
   it('reads the LV as two linear segments on two different arrays', () => {
     assert.equal(TWO_BAND.length, 2)
@@ -265,8 +265,8 @@ describe('selfheal mapping — chunk tree (GT-2)', () => {
   it('reads every chunk with its own device delta', () => {
     const data = chunks.filter(c => /\bDATA\b/.test(c.type))
     assert.equal(data.length, 2)
-    assert.deepEqual(data[0], { logical: 13631488, length: 8388608, deviceOffset: 13631488, type: 'DATA|single' })
-    assert.deepEqual(data[1], { logical: 82378752, length: 117440512, deviceOffset: 142737408, type: 'DATA|single' })
+    assert.deepEqual(data[0], { logical: 13631488, length: 8388608, deviceOffset: 13631488, stripes: [13631488], type: 'DATA|single' })
+    assert.deepEqual(data[1], { logical: 82378752, length: 117440512, deviceOffset: 142737408, stripes: [142737408], type: 'DATA|single' })
   })
 
   it('selects the chunk COVERING the byte — the second one has delta 60,358,656', () => {

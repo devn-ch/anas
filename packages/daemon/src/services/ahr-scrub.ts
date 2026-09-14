@@ -9,8 +9,22 @@ import { ahrLvPath } from './ahr-paths.js'
 import { SUBVOL_DATA, subvolFromMountOptions } from './ahr-snapshots.js'
 import { pveNotify } from './pve-notify.js'
 import { mismatchCntArgs } from './scrub-schedules.js'
-import { probeFileBlock } from './selfheal-io.js'
+import {
+  MD_DEFAULT_SYNC_MAX,
+  MD_DEFAULT_SYNC_MIN,
+  mdSysPath,
+  probeFileBlock,
+  readMdAttrOrNull,
+  writeMdAttr,
+} from './selfheal-io.js'
 import { BTRFS_STRIPE_BYTES, extentsForStripe, resolveContext } from './selfheal-map.js'
+import {
+  foreignOpNote,
+  isIdleSyncAction,
+  markCheckIssued,
+  ownsSyncOp,
+  retireCheckIssued,
+} from './selfheal-syncop.js'
 
 /**
  * AHR pool scrub (Epic 11 + AHR, docs/AHR-DESIGN.md §4) — behind
@@ -179,9 +193,16 @@ export function lastSyncActionArgs(kernelName: string): string[] {
 /** Everything md prints in `sync_action`. Anything else is not an answer. */
 const MD_SYNC_ACTIONS = new Set(['idle', 'none', 'frozen', 'resync', 'recover', 'check', 'repair', 'reshape'])
 
-/** md is doing nothing this wait can watch. */
+/**
+ * md is doing nothing this wait can watch.
+ *
+ * Wider than {@link isIdleSyncAction} on purpose: an UNREADABLE `sync_action`
+ * ends a wait (there is no signal left to wait on), but it must never license a
+ * write — which is why the ownership helper treats null as not-idle and this
+ * one does not (D2).
+ */
 function isIdleAction(action: string | null): boolean {
-  return action === null || action === 'idle' || action === 'none'
+  return action === null || isIdleSyncAction(action)
 }
 
 /** The finish-wait ceiling, in the largest unit that states it plainly. */
@@ -238,28 +259,89 @@ export async function lastSyncAction(
 }
 
 /**
+ * One of the repair engine's sync-window knobs, or null when it cannot be read.
+ *
+ * Read through the SAME md layer that writes them (`selfheal-io.ts`) rather
+ * than through `cat`, so the pre-issue guard below and the engine's own
+ * save/restore are looking at one thing. Null is the answer on a band whose
+ * sysfs is not there, and a null never triggers a restore.
+ */
+async function readSyncValue(kernelName: string, key: 'sync_min' | 'sync_max'): Promise<string | null> {
+  return readMdAttrOrNull(mdSysPath(kernelName), key)
+}
+
+/**
+ * Put a band's sync window back to md's own `0 … max` (GT-1), for a band the
+ * caller has ALREADY proven idle. False when the write did not take — the
+ * caller then skips the band rather than issuing a check into a one-stripe
+ * window.
+ */
+async function restoreSyncWindow(kernelName: string): Promise<boolean> {
+  try {
+    await writeMdAttr(mdSysPath(kernelName), 'sync_min', MD_DEFAULT_SYNC_MIN)
+    await writeMdAttr(mdSysPath(kernelName), 'sync_max', MD_DEFAULT_SYNC_MAX)
+    return true
+  }
+  catch {
+    return false
+  }
+}
+
+/**
  * Take back the check this scrub asked for on a band it is walking away from
- * (third pass, T4).
+ * (third pass, T4) — but ONLY when the check is still the thing md is running
+ * (design review 2026-09-14, D2).
  *
  * The finish-wait abandons a band md froze, took another sync op on, or simply
  * never finished before the ceiling. ANAS's `--action=check` is still ARMED on
- * it in every one of those cases, and the loop moves straight on to issue the
- * next band's check — so when the array thaws, or the resync ends, two parity
- * checks run at once across disks that are very often the same spindles. §4's
- * whole point is that a scrub's reads are strictly sequential.
+ * it in some of those cases, and the loop moves straight on to issue the next
+ * band's check — so when the array thaws, two parity checks run at once across
+ * disks that are very often the same spindles. §4's whole point is that a
+ * scrub's reads are strictly sequential.
  *
- * Written the way `boundedWindowCheck` ends its own bounded check (`idle` into
- * `sync_action`), through mdadm's own front door — the same door two lines up
- * issued the check — and BEST-EFFORT: md refuses `idle` on a frozen array
- * (EBUSY), and a failure here is worth a sentence in the progress line, never
- * a failed scrub. Returns what to say about it.
+ * The dangerous case is the one that used to be treated the same way. A member
+ * that failed mid-scrub puts md into `recover`, rebuilding onto a spare, and
+ * `mdadm --action=idle` does not mean "drop my check" — it means "stop what you
+ * are doing". It ABORTS the rebuild, and the periodic scrub does it on every
+ * pass. So `sync_action` is re-read immediately before the write and the write
+ * happens only for a `check` this run issued; every other state is left exactly
+ * as it is and named in the progress line.
+ *
+ * Best-effort otherwise: md refuses `idle` on a frozen array (EBUSY), and a
+ * failure there is worth a sentence, never a failed scrub. Returns what to say.
  */
 async function cancelBandCheck(
   executor: CommandExecutor,
   device: string,
+  kernelName: string | null,
   label: string,
   action: string | null,
 ): Promise<string> {
+  if (kernelName === null) {
+    // Nothing to read `sync_action` from, so nothing can be proven about what
+    // md is doing — and an unprovable `idle` is exactly the write that aborts
+    // a rebuild. Leave it, and say the check may still be armed.
+    return `could not drop this scrub's check on ${label} — ${device} does not resolve to a kernel device, so what md is running there cannot be read; nothing was written and the check may still run beside a later band's`
+  }
+
+  const own = await ownsSyncOp(kernelName, () => syncAction(executor, kernelName))
+  if (own.action === 'frozen') {
+    // md refuses `idle` on a frozen array (EBUSY), so the write was always a
+    // no-op here — and an array that is frozen is one md may be about to do
+    // something of its own on. Say plainly that the check may still be armed.
+    retireCheckIssued(kernelName)
+    return `could not drop this scrub's check on ${label} — md refuses idle on a frozen array, so the check may still run when it thaws`
+  }
+  if (own.foreign) {
+    retireCheckIssued(kernelName)
+    return `left ${label} alone — ${foreignOpNote(label, own.action)}; this scrub's check on ${label} was not dropped, because ending md's own operation would abort it`
+  }
+  if (!own.owned) {
+    // Already idle: md is running nothing, so there is nothing to take back.
+    retireCheckIssued(kernelName)
+    return `this scrub's check on ${label} is no longer running — nothing to drop`
+  }
+
   let failure: string | null = null
   try {
     const r = await executor.exec(MDADM, ['--action=idle', device])
@@ -269,6 +351,7 @@ async function cancelBandCheck(
   catch (err) {
     failure = err instanceof Error ? err.message : String(err)
   }
+  retireCheckIssued(kernelName)
   if (action === 'frozen') {
     // md refuses idle while the array is frozen, so this one is expected to
     // bounce — say plainly that the check may still be armed when it thaws.
@@ -279,6 +362,43 @@ async function cancelBandCheck(
   return failure === null
     ? `dropped this scrub's check on ${label} so it cannot run beside the next band's`
     : `could not drop this scrub's check on ${label} (${failure}) — it may still run beside a later band's`
+}
+
+/**
+ * An md `check` running on ANY AHR band of the node, or null (S6).
+ *
+ * The route's "already scrubbing" refusals are all in-process: the pool state
+ * the topology read reports, and the job queue's own record. Neither survives a
+ * daemon restart. A restart mid-scrub leaves md's check on band r1 running
+ * happily while the job that started it is gone — and the next scrub then
+ * issues checks on bands that share spindles with it, which is precisely what
+ * §4 exists to prevent. /proc/mdstat is the one place that still knows, so it
+ * is read ONCE and every AHR band on the node is matched against it.
+ *
+ * A DELAYED or PENDING check counts: md has it queued and it will fire.
+ */
+export async function runningAhrCheck(
+  executor: CommandExecutor,
+  pools: AhrPool[],
+): Promise<{ label: string, kernelName: string } | null> {
+  const labels = new Map<string, string>()
+  for (const pool of pools) {
+    for (const array of pool.arrays) {
+      if (array.kernelName)
+        labels.set(array.kernelName, `${pool.name}-r${array.band}`)
+    }
+  }
+  if (labels.size === 0)
+    return null
+  const mdstat = parseMdstat((await executor.exec(CAT, MDSTAT_CAT_ARGS)).stdout)
+  for (const md of mdstat) {
+    const label = labels.get(md.kernelName)
+    if (!label)
+      continue
+    if (md.sync?.action === 'check' || md.syncDelayed || md.syncPending)
+      return { label, kernelName: md.kernelName }
+  }
+  return null
 }
 
 // ---- Attribution: WHAT is corrupt (story selfheal.3) ------------------------
@@ -1076,14 +1196,59 @@ export async function scrubAhrPool(
     const priorAction = kernelName ? await lastSyncAction(executor, kernelName) : null
     const priorMismatch = kernelName ? await mismatchCount(executor, kernelName) : null
 
-    await run(executor, MDADM, ['--action=check', array.device])
+    if (kernelName) {
+      // S3: the route read the pool's state once, and bands are checked one at
+      // a time over hours. A member that failed since then has md recovering
+      // onto a spare RIGHT NOW, and issuing a check into that either bounces
+      // (mdadm exits non-zero and `run` throws, failing the whole scrub) or —
+      // worse, once the cancel path runs — aborts the rebuild. Re-read what md
+      // is doing immediately before issuing, per band.
+      const busy = await syncAction(executor, kernelName)
+      if (!isIdleAction(busy)) {
+        updateProgress(`${label} was not checked (md is running ${busy}) — a parity check would fight the operation md is already running on that band`)
+        continue
+      }
+      // D4(b): a repair that was killed mid-sequence leaves `sync_max` bounded
+      // to ONE STRIPE, and the knob PERSISTS (GT-13's trap) — a check issued
+      // under it covers that stripe, suspends, and the finish-wait then holds
+      // the pool's job exclusion for the full ceiling. The band is idle (just
+      // proven), so the window can simply be put back.
+      const syncMax = await readSyncValue(kernelName, 'sync_max')
+      const syncMin = await readSyncValue(kernelName, 'sync_min')
+      if ((syncMax !== null && syncMax !== MD_DEFAULT_SYNC_MAX) || (syncMin !== null && syncMin !== MD_DEFAULT_SYNC_MIN)) {
+        const widened = await restoreSyncWindow(kernelName)
+        if (widened) {
+          updateProgress(`${label}: sync window was bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} (an interrupted repair left it there) — restored to ${MD_DEFAULT_SYNC_MIN}..${MD_DEFAULT_SYNC_MAX} before issuing the check`)
+        }
+        else {
+          updateProgress(`${label} was not checked — its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and could not be restored, so a check would cover that sliver of the band and suspend there`)
+          continue
+        }
+      }
+    }
+
+    // Issued without `run`: a band that entered recovery in the few
+    // milliseconds since the read above makes mdadm exit non-zero, and one
+    // band's refusal must not fail the whole scrub (S3).
+    const issue = await executor.exec(MDADM, ['--action=check', array.device])
+    if (issue.exitCode !== 0) {
+      updateProgress(`${label} was not checked (mdadm --action=check exited ${issue.exitCode}${issue.stderr.trim() ? `: ${issue.stderr.trim()}` : ''})`)
+      continue
+    }
+    if (kernelName) {
+      // From here on THIS scrub owns the check on this band, and only now may
+      // it write `idle` there (D2).
+      markCheckIssued(kernelName)
+    }
 
     if (!kernelName) {
       // A FOURTH abandonment path (fourth pass): the check above WAS issued —
       // the comment before the resolution says so deliberately — so walking
-      // away without taking it back leaves it armed beside the next band's
-      // check, exactly like every other abandonment. Best-effort, same door.
-      updateProgress(await cancelBandCheck(executor, array.device, label, null))
+      // away without taking it back would leave it armed beside the next
+      // band's check. It cannot be taken back safely either: with no kernel
+      // name there is no `sync_action` to prove the check is still what md is
+      // running, and an unprovable `idle` is the write that aborts a rebuild.
+      updateProgress(await cancelBandCheck(executor, array.device, null, label, null))
       updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
       continue
     }
@@ -1226,7 +1391,7 @@ export async function scrubAhrPool(
     if (!checked) {
       // Never walk away leaving our check armed on the band (T4): the next
       // band's check is issued immediately after this `continue`.
-      updateProgress(await cancelBandCheck(executor, array.device, label, abandonedOn))
+      updateProgress(await cancelBandCheck(executor, array.device, kernelName, label, abandonedOn))
       continue
     }
 

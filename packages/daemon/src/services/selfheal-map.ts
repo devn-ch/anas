@@ -86,8 +86,14 @@ const CHUNK_KEY_RE = /item \d+ key \(FIRST_CHUNK_TREE CHUNK_ITEM (\d+)\)/
 const ANY_ITEM_KEY_RE = /item \d+ key \(/
 /** `length <n> owner <n> stripe_len <n> type <type>`. */
 const CHUNK_GEOMETRY_RE = /length (\d+) owner \d+ stripe_len \d+ type (\S+)/
-/** `stripe 0 devid <n> offset <n>` — the first copy of a DUP chunk. */
-const CHUNK_STRIPE0_RE = /stripe 0 devid \d+ offset (\d+)/
+/**
+ * `stripe <n> devid <n> offset <n>` — ONE copy of a chunk.
+ *
+ * Both are captured, not just stripe 0: a `METADATA|DUP` chunk holds the csum
+ * tree TWICE, and the second copy is what a leaf whose first copy has rotted is
+ * re-read from (design review 2026-09-14, D3).
+ */
+const CHUNK_STRIPE_RE = /stripe (\d+) devid \d+ offset (\d+)/
 /** A chunk `type` naming DATA. */
 const CHUNK_TYPE_DATA_RE = /\bDATA\b/
 /** `item N key (<inode> EXTENT_DATA <file offset>)`. */
@@ -170,8 +176,20 @@ export interface ChunkItem {
   length: number
   /** First stripe's device offset — the delta GT-2 corrected for. */
   deviceOffset: number
+  /**
+   * EVERY copy's device offset, by stripe index — one entry for a `single`
+   * chunk, two for a `DUP` one. `deviceOffset` is `stripes[0]`; the rest exist
+   * so a metadata node that fails its own checksum in the first copy can be
+   * re-read from the second (D3) instead of being reported as unreadable rot.
+   */
+  stripes: number[]
   /** `DATA|single`, `METADATA|DUP`, … verbatim. */
   type: string
+}
+
+/** Every copy of a chunk, in stripe order — one on `single`, two on `DUP`. */
+export function chunkStripeOffsets(chunk: ChunkItem): number[] {
+  return chunk.stripes.length > 0 ? chunk.stripes : [chunk.deviceOffset]
 }
 
 /**
@@ -379,20 +397,38 @@ export function bandForLvByte(bands: SelfhealBand[], lvByte: number): SelfhealBa
 /**
  * Parse the CHUNK_ITEMs of `btrfs inspect-internal dump-tree -t 3`.
  *
- * Only `stripe 0` is read: on `DUP` metadata both stripes hold the same bytes
- * and the first copy is the one the csum reader follows.
+ * EVERY stripe is read, not just the first. `stripe 0` remains the copy the
+ * chain follows for data, but a `METADATA|DUP` chunk carries the tree twice and
+ * the second copy is the fallback a csum leaf that fails its own crc32c is
+ * re-read from (D3). An item is emitted when the next item key closes it —
+ * emitting on `stripe 0` would throw the second copy away before it was seen.
  */
 export function parseChunkItems(dump: string): ChunkItem[] {
   const items: ChunkItem[] = []
-  let current: Partial<ChunkItem> | null = null
+  let current: (Partial<ChunkItem> & { stripes: number[] }) | null = null
+
+  function flush(): void {
+    if (current && current.logical !== undefined && current.length !== undefined && current.stripes[0] !== undefined) {
+      items.push({
+        logical: current.logical,
+        length: current.length,
+        deviceOffset: current.stripes[0],
+        stripes: current.stripes.filter(offset => offset !== undefined),
+        type: current.type ?? '',
+      })
+    }
+    current = null
+  }
+
   for (const line of dump.split('\n')) {
     const key = CHUNK_KEY_RE.exec(line)
     if (key) {
-      current = { logical: Number(key[1]) }
+      flush()
+      current = { logical: Number(key[1]), stripes: [] }
       continue
     }
     if (ANY_ITEM_KEY_RE.test(line)) {
-      current = null
+      flush()
       continue
     }
     if (!current)
@@ -403,13 +439,11 @@ export function parseChunkItems(dump: string): ChunkItem[] {
       current.type = geom[2]
       continue
     }
-    const stripe = CHUNK_STRIPE0_RE.exec(line)
-    if (stripe && current.length !== undefined) {
-      current.deviceOffset = Number(stripe[1])
-      items.push(current as ChunkItem)
-      current = null
-    }
+    const stripe = CHUNK_STRIPE_RE.exec(line)
+    if (stripe)
+      current.stripes[Number(stripe[1])] = Number(stripe[2])
   }
+  flush()
   return items
 }
 

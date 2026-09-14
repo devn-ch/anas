@@ -40,6 +40,23 @@ const SYNC = '/usr/bin/sync'
 /** btrfs sector / md page unit. Everything in the engine is a multiple of this. */
 export const BLOCK_BYTES = 4096
 
+/**
+ * The values md ships a RAID5/6 array with (GT-1, captured verbatim off a
+ * fresh rig: `rmw_level=1`, `sync_min=0`, `sync_max=max`,
+ * `stripe_cache_size=256`).
+ *
+ * They are here — in the md I/O layer, not in the engine that turns them — so
+ * the repair's `finally` and the daemon-start reconciliation that has to clean
+ * up after a repair that never GOT its `finally` restore the same numbers.
+ */
+export const MD_DEFAULT_RMW_LEVEL = '1'
+/** @see MD_DEFAULT_RMW_LEVEL */
+export const MD_DEFAULT_STRIPE_CACHE_SIZE = 256
+/** @see MD_DEFAULT_RMW_LEVEL */
+export const MD_DEFAULT_SYNC_MIN = '0'
+/** @see MD_DEFAULT_RMW_LEVEL */
+export const MD_DEFAULT_SYNC_MAX = 'max'
+
 /** Where the write path stages its 4 KiB payload (tmpfs, removed in a finally). */
 const DEFAULT_RUNTIME_DIR = '/run/anas'
 

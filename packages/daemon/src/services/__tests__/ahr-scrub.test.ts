@@ -8,6 +8,7 @@ import { after, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { AhrPool, AhrScrubResult } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import {
   AHR_SCRUB_FINDINGS_CAP,
   AHR_SCRUB_JOURNAL_LINE_CAP,
@@ -20,6 +21,7 @@ import {
   parseBtrfsScrubStatus,
   parseScrubWarning,
   parseUnattributedScrubError,
+  runningAhrCheck,
   scrubAhrPool,
 } from '../ahr-scrub.js'
 import { mismatchCntArgs } from '../scrub-schedules.js'
@@ -634,8 +636,10 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
-      // Our check starts, then md is doing something else entirely — for good.
+      // Idle at the PRE-ISSUE read (S3), our check starts, then md is doing
+      // something else entirely — for good.
       executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], results: [
+        { stdout: 'idle\n', stderr: '', exitCode: 0 },
         { stdout: 'check\n', stderr: '', exitCode: 0 },
         { stdout: `${takeover}\n`, stderr: '', exitCode: 0 },
       ] })
@@ -653,14 +657,22 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       )
       assert.ok(progress.includes(`t2-r1 was not checked (sync_action=${takeover}) — md is not running this scrub's check on that band`), progress.join(' | '))
       assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'no rot is claimed from a stale number')
-      // T4: this scrub's check is taken back off the abandoned band BEFORE the
-      // next band's is issued — the two must never run together (§4).
-      const idleAt = executor.calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle' && c.args[1] === '/dev/md/t2-r1')
-      const nextCheck = checkIssuedAt(executor, '/dev/md/t2-r2')
-      assert.ok(idleAt >= 0, 'the abandoned band\'s check is cancelled')
-      assert.ok(idleAt < nextCheck, 'and cancelled before the next band\'s check is issued')
-      assert.ok(progress.some(m => m.includes('this scrub\'s check on t2-r1')), progress.join(' | '))
+      // D2 (design review 2026-09-14): the check is NOT taken back by writing
+      // `idle`. `idle` does not mean "drop my check" — it means "stop whatever
+      // you are doing", and on a `recover` that is a rebuild onto a spare; on a
+      // frozen array md refuses the write anyway. md is left alone either way,
+      // and the progress line names what it is doing.
+      assert.deepEqual(
+        executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle' && c.args[1] === '/dev/md/t2-r1'),
+        [],
+        'nothing is written to an array md is running its own operation on',
+      )
+      assert.ok(
+        progress.some(m => m.includes('t2-r1') && (m.includes('not touched') || m.includes('may still run when it thaws'))),
+        progress.join(' | '),
+      )
       // The scrub goes ON: band 2 is checked and phase 2 runs.
+      const nextCheck = checkIssuedAt(executor, '/dev/md/t2-r2')
       assert.ok(nextCheck >= 0)
       assert.ok(executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'))
     })
@@ -678,10 +690,13 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], results: [
+      { stdout: 'idle\n', stderr: '', exitCode: 0 },
       { stdout: 'check\n', stderr: '', exitCode: 0 },
       { stdout: 'frozen\n', stderr: '', exitCode: 0 },
     ] })
-    // mdadm's own refusal, the way md reports it.
+    // mdadm's own refusal, the way md reports it — no longer reached (D2: the
+    // write is not attempted at all on a frozen array), and left registered so
+    // the assertion below is about ANAS's sentence, not about mdadm's.
     executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--action=idle', '/dev/md/t2-r1'], result: { stdout: '', stderr: 'mdadm: failed to set action for /dev/md/t2-r1: Device or resource busy', exitCode: 1 } })
 
     const progress: string[] = []
@@ -705,6 +720,8 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
     ] })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], results: [
+      // The pre-issue read (S3) — md is idle, so the check is issued.
+      { stdout: 'idle\n', stderr: '', exitCode: 0 },
       ...Array.from({ length: 12 }).fill({ stdout: 'check\n', stderr: '', exitCode: 0 }) as ExecResult[],
       { stdout: 'idle\n', stderr: '', exitCode: 0 },
     ] })
@@ -725,9 +742,13 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127', checkPercent: 1 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
-    // md says `check` for ever — the one state the sync_action policy cannot
-    // end, because a real check legitimately looks exactly like this.
-    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'check\n', stderr: '', exitCode: 0 } })
+    // Idle at the pre-issue read (S3), then md says `check` for ever — the one
+    // state the sync_action policy cannot end, because a real check
+    // legitimately looks exactly like this.
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], results: [
+      { stdout: 'idle\n', stderr: '', exitCode: 0 },
+      { stdout: 'check\n', stderr: '', exitCode: 0 },
+    ] })
     executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
 
     const progress: string[] = []
@@ -752,10 +773,17 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    * T4's FOURTH abandonment path (fourth pass): an unresolvable pin symlink
    * leaves no kernel name to watch the check on — but the check was still
    * ISSUED (the resolution comment says so deliberately: an unresolvable name
-   * costs the wait, never the check). Walking away without taking it back
-   * armed it beside the next band's check, and the btrfs scrub after that.
+   * costs the wait, never the check).
+   *
+   * The third pass took it back with `mdadm --action=idle`. D2 (design review
+   * 2026-09-14) says that write is safe only when `sync_action` has just been
+   * read as the `check` this run issued — and with no kernel name there is
+   * nothing to read it from. An unprovable `idle` is exactly the write that
+   * aborts a rebuild onto a spare, so the band is left alone and the progress
+   * line says the check may still be armed. A check running beside a later
+   * band's breaks §4's sequencing; an aborted rebuild loses data.
    */
-  it('a band whose kernel name will not resolve has its issued check cancelled before the next band', async () => {
+  it('a band whose kernel name will not resolve is LEFT ALONE — an unprovable idle is not written', async () => {
     const executor = new MockExecutor()
     // First-match-wins: the failing realpath for t2-r1 is registered FIRST, so
     // it beats baseExecutor's resolving one — build the executor by hand.
@@ -777,16 +805,119 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       progress.includes('Cannot resolve /dev/md/t2-r1 to a kernel device — not waiting on its check'),
       progress.join(' | '),
     )
-    // The check WAS issued either way — and taken back before the next band's
-    // is issued and phase 2 runs over both.
-    const idleAt = executor.calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle' && c.args[1] === '/dev/md/t2-r1')
+    // The check WAS issued either way — and nothing is written to take it back,
+    // because nothing here can prove what md is running on that array.
+    assert.deepEqual(
+      executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle' && c.args[1] === '/dev/md/t2-r1'),
+      [],
+      'no idle is written to an array whose sync_action cannot be read',
+    )
+    assert.ok(
+      progress.some(m => m.includes('could not drop this scrub\'s check on t2-r1') && m.includes('nothing was written')),
+      progress.join(' | '),
+    )
     const nextCheck = checkIssuedAt(executor, '/dev/md/t2-r2')
-    assert.ok(idleAt > checkIssuedAt(executor, '/dev/md/t2-r1'), 'the check was issued before the band was given up on')
-    assert.ok(idleAt >= 0, 'the unresolvable band\'s check is cancelled')
-    assert.ok(idleAt < nextCheck, 'and cancelled before the next band\'s check is issued')
-    assert.ok(progress.includes('dropped this scrub\'s check on t2-r1 so it cannot run beside the next band\'s'), progress.join(' | '))
     assert.ok(nextCheck >= 0, 'the scrub goes on: band 2 is still checked')
     assert.equal(result.btrfsErrors, null, 'the job completes — the cancellation is best-effort, never fatal')
+  })
+
+  /**
+   * S3 — the route reads the pool's state once, and bands are checked one at a
+   * time over hours. A member that failed since then has md recovering onto a
+   * spare RIGHT NOW. Issuing `--action=check` into that used to go through
+   * `run`, which THROWS on a non-zero exit and failed the whole scrub; worse,
+   * once the cancel path ran it wrote `idle` and aborted the rebuild (D2).
+   *
+   * Re-read per band, immediately before issuing. A busy band is recorded and
+   * skipped, nothing is issued, nothing is written, and the scrub carries on.
+   */
+  it('does not ISSUE a check on a band md is already recovering — it skips it', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    // A member failed between the route's read and this band's turn.
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'recover\n', stderr: '', exitCode: 0 } })
+
+    const progress: string[] = []
+    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+    assert.ok(
+      progress.includes('t2-r1 was not checked (md is running recover) — a parity check would fight the operation md is already running on that band'),
+      progress.join(' | '),
+    )
+    assert.equal(checkIssuedAt(executor, '/dev/md/t2-r1'), -1, 'no check was issued into the recovery')
+    assert.deepEqual(
+      executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=idle'),
+      [],
+      'and nothing was written to take back a check that was never issued',
+    )
+    // The scrub is not failed by one busy band: band 2 and phase 2 still run.
+    assert.ok(checkIssuedAt(executor, '/dev/md/t2-r2') >= 0)
+    assert.equal(result.btrfsErrors, null)
+  })
+
+  it('records a band whose check mdadm refuses, rather than failing the scrub', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--action=check', '/dev/md/t2-r1'], result: { stdout: '', stderr: 'mdadm: failed to set action for /dev/md/t2-r1: Device or resource busy', exitCode: 1 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r1'], result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r2'], result: { stdout: '/dev/md126\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', result: { stdout: mdstat([]), stderr: '', exitCode: 0 } })
+
+    const progress: string[] = []
+    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+    assert.ok(
+      progress.some(m => m.startsWith('t2-r1 was not checked (mdadm --action=check exited 1')),
+      progress.join(' | '),
+    )
+    assert.ok(checkIssuedAt(executor, '/dev/md/t2-r2') >= 0, 'band 2 is still checked')
+    assert.equal(result.btrfsErrors, null, 'one band\'s refusal is not the job\'s failure')
+  })
+
+  /**
+   * D4(b) — GT-13's trap, reached from the scrub side. A repair killed
+   * mid-sequence leaves `sync_max` bounded to ONE STRIPE, and the knob
+   * PERSISTS: a check issued under it covers that stripe, suspends there, and
+   * the finish-wait then holds the pool's job exclusion for the full ceiling
+   * while the band goes unchecked. The band is idle, so the window is simply
+   * put back before the check goes in.
+   */
+  it('restores a sync window an interrupted repair left bounded, before issuing the check', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'anas-scrub-knobs-'))
+    const sys = join(root, 'sys/block/md127/md')
+    mkdirSync(sys, { recursive: true })
+    writeFileSync(join(sys, 'sync_min'), '6272\n')
+    writeFileSync(join(sys, 'sync_max'), '6400\n')
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = root
+
+    try {
+      const executor = baseExecutor()
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+
+      const progress: string[] = []
+      await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+
+      const widened = progress.findIndex(m => m.includes('t2-r1: sync window was bounded to 6272..6400') && m.includes('restored to 0..max'))
+      assert.ok(widened >= 0, progress.join(' | '))
+      assert.equal(readFileSync(join(sys, 'sync_min'), 'utf-8').trim(), '0')
+      assert.equal(readFileSync(join(sys, 'sync_max'), 'utf-8').trim(), 'max')
+      // And it happened BEFORE the check went in — a check issued under the old
+      // window would have covered one stripe and suspended there.
+      assert.ok(checkIssuedAt(executor, '/dev/md/t2-r1') >= 0)
+    }
+    finally {
+      delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it('aborted btrfs scrub fails the job', async () => {
@@ -1683,5 +1814,80 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
       links: 1,
       path: 'f.bin',
     })
+  })
+})
+
+/**
+ * S6 — the node-wide check exclusion.
+ *
+ * Every other "already scrubbing" refusal is in-process: the pool state a
+ * topology read reports, and the job queue's own record. Neither survives a
+ * daemon restart. A restart mid-scrub leaves md's check on band r1 running
+ * happily while the job that issued it is gone, and the next scrub then issues
+ * checks on bands that share spindles with it — exactly what §4 exists to
+ * prevent. And a check on ANOTHER POOL's band is invisible to the requested
+ * pool's state no matter what: on a real node those bands are very often
+ * slices of the same disks.
+ */
+describe('runningAhrCheck — an md check anywhere on the node\'s AHR bands', () => {
+  function poolWith(name: string, bands: { band: number, kernelName?: string }[]): AhrPool {
+    return { name, arrays: bands.map(b => ({ band: b.band, kernelName: b.kernelName })) } as unknown as AhrPool
+  }
+
+  function executorWith(text: string): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: text, stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  const CHECKING = [
+    'Personalities : [raid1] [raid5]',
+    'md126 : active raid1 sdd2[1] sdc2[0]',
+    '      523200 blocks super 1.2 [2/2] [UU]',
+    '      [============>........]  check = 61.9% (323840/523200) finish=0.3min speed=53973K/sec',
+    '',
+    'md127 : active raid5 sdd1[3] sdc1[1] sdb1[0]',
+    '      2089984 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]',
+    '',
+    'unused devices: <none>',
+    '',
+  ].join('\n')
+
+  const DELAYED = [
+    'Personalities : [raid5]',
+    'md126 : active raid5 sdd1[3] sdc1[1] sdb1[0]',
+    '      2089984 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]',
+    '      \tresync=DELAYED',
+    '',
+    'unused devices: <none>',
+    '',
+  ].join('\n')
+
+  it('finds a check running on ANOTHER pool\'s band — the shared-spindle case', async () => {
+    const found = await runningAhrCheck(executorWith(CHECKING), [
+      poolWith('tank', [{ band: 1, kernelName: 'md127' }]),
+      poolWith('scratch', [{ band: 1, kernelName: 'md126' }]),
+    ])
+    assert.deepEqual(found, { label: 'scratch-r1', kernelName: 'md126' })
+  })
+
+  it('counts a DELAYED check — md has it queued and it will fire', async () => {
+    const found = await runningAhrCheck(executorWith(DELAYED), [poolWith('tank', [{ band: 2, kernelName: 'md126' }])])
+    assert.equal(found?.label, 'tank-r2')
+  })
+
+  it('ignores an md array that is not an AHR band', async () => {
+    const found = await runningAhrCheck(executorWith(CHECKING), [poolWith('tank', [{ band: 1, kernelName: 'md127' }])])
+    assert.equal(found, null, 'md126 belongs to nothing ANAS manages')
+  })
+
+  it('reads mdstat ONCE, and not at all when no band has a kernel name', async () => {
+    const executor = executorWith(CHECKING)
+    await runningAhrCheck(executor, [poolWith('tank', [{ band: 1, kernelName: 'md127' }])])
+    assert.equal(executor.calls.filter(c => c.args[0] === '/proc/mdstat').length, 1)
+
+    const cold = executorWith(CHECKING)
+    assert.equal(await runningAhrCheck(cold, [poolWith('tank', [{ band: 1 }])]), null)
+    assert.equal(cold.calls.length, 0, 'nothing to match against — no read at all')
   })
 })

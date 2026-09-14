@@ -1,10 +1,12 @@
 import type { Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
 import { mockFixtures } from '../../fixtures/loader.js'
@@ -20,6 +22,9 @@ import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { ahrMutationRoutes } from '../ahr-mutate.js'
 import { jobRoutes } from '../jobs.js'
+
+/** Where the shipped md/lvm captures live — `mdstat-check.txt` among them. */
+const AHR_FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), '../../fixtures/ahr')
 
 /**
  * AHR mutation routes (Epic 11 + AHR) — POST /v1/ahr, DELETE /v1/ahr/:name,
@@ -524,6 +529,57 @@ describe('POST /v1/ahr/:name/{scrub,repair} — the in-flight exclusion', () => 
     inFlight('ahr.repair', 'other')
     const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 202)
+  })
+
+  /**
+   * S6 — the exclusions above are BOTH in-process, and a daemon restart takes
+   * both with it: md's check on band r1 keeps running while the job that
+   * issued it is gone. /proc/mdstat is the one thing that still knows, so the
+   * route reads it at submit time and refuses.
+   *
+   * Staged with two mdstat reads: the topology read sees the clean node the
+   * route-time state came from, and the exclusion read — a separate read, a
+   * moment later — sees the check. That separation is the whole point: what md
+   * is doing at the instant of the gate is the authority, not what a snapshot
+   * taken earlier said.
+   */
+  it('refuses while an md check is running on a band, with no ANAS job behind it', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, results: [
+      mockFixtures.ahrMdstat(),
+      { stdout: readFileSync(join(AHR_FIXTURES, 'mdstat-check.txt'), 'utf-8'), stderr: '', exitCode: 0 },
+    ] })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+
+    const app = Fastify({ logger: false })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue: new JobQueue(),
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+    })
+    try {
+      const res = await app.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 409)
+      const { message } = res.json().error
+      assert.match(message, /^an md check is running on ahr0-r\d/)
+      assert.match(message, /started outside this job or by a previous daemon/)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no bypass for "unsafe now"')
+    }
+    finally {
+      await app.close()
+    }
   })
 })
 

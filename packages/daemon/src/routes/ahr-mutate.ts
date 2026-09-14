@@ -16,7 +16,7 @@ import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
 import { repairAhrFiles } from '../services/ahr-repair.js'
-import { pathExists, scrubAhrPool } from '../services/ahr-scrub.js'
+import { pathExists, runningAhrCheck, scrubAhrPool } from '../services/ahr-scrub.js'
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
 import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
@@ -459,7 +459,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pool = (await readAhrPools(executor)).find(p => p.name === name)
+    const pools = await readAhrPools(executor)
+    const pool = pools.find(p => p.name === name)
     if (!pool) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
@@ -499,6 +500,23 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
           message: scrubBlocker.operation === 'ahr.repair'
             ? `a repair job is in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — a check would re-read the stripes the repair is writing; wait for it to finish`
             : `a scrub is already in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — one scrub reads every byte of the pool and checks every band array; wait for it to finish`,
+        },
+      }
+    }
+    // Both refusals above are IN-PROCESS: the pool state a topology read
+    // reports, and the job queue's own record. Neither survives a daemon
+    // restart — md's check on band r1 keeps running while the job that issued
+    // it is gone (S6). A new scrub would then issue checks on bands sharing
+    // spindles with it, which is exactly what §4 forbids. /proc/mdstat still
+    // knows, so it is read once and matched against EVERY AHR band on the
+    // node: another pool's bands are very often the same disks.
+    const foreignCheck = await runningAhrCheck(executor, pools)
+    if (foreignCheck) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          message: `an md check is running on ${foreignCheck.label} (started outside this job or by a previous daemon) — a scrub runs one parity check at a time across the node's AHR bands; wait for it to finish, or end it from the command line`,
         },
       }
     }

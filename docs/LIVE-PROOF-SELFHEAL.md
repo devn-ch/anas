@@ -1156,3 +1156,97 @@ on the new one. No new captures were needed.
   skipped the whole routes tree, so any route could have named `writeScrubUnits`/`removeScrubUnits`
   unnoticed. Only `routes/scrub.ts` is exempt now. *(`scrub-schedules.test.ts`: same walk, door
   narrowed — still a string scan, still fast.)*
+
+### Design review (2026-09-14)
+
+A two-altitude read of the arc against `docs/DESIGN.md`, looking for systems-level gaps rather than
+line bugs. Everything below was fixed at the source with a failing-before test.
+
+- **D2 (LOSE-DATA) — never interrupt an md operation ANAS did not start.** `echo idle >
+  sync_action` and `mdadm --action=idle` do not mean "cancel my check" — they mean "stop whatever
+  you are doing", and what md is very often doing after a member fails is REBUILDING ONTO A SPARE.
+  Three paths wrote it on sight (`boundedWindowCheck`'s poll loop, `restoreSyncKnobs` whenever the
+  array was not idle, and `ahr-scrub`'s `cancelBandCheck` for every abandonment), so a disk failing
+  mid-run had its rebuild aborted by the repair or the scrub that was trying to help — and the
+  periodic scrub did it on every pass. One helper now decides, for everyone: `ownsSyncOp`
+  (`selfheal-syncop.ts`) re-reads `sync_action` immediately before ANY write of `idle` and permits
+  it only when it reads `check` AND this run issued a check on that array. `sync_min`/`sync_max` are
+  narrowed and widened under the same rule, and the gates became RE-CHECKS: `degraded`,
+  `sync_action` and `reshape_position` are re-read immediately before the write step, not only at
+  step 1, and a change aborts as `unrepairable` — "array state changed mid-repair: …, nothing
+  written". A band whose kernel name will not resolve is now left alone rather than written to
+  blind: an unprovable `idle` is the write that aborts a rebuild. *(`selfheal-repair.test.ts`: a
+  recovery started between the precheck and the write → no write, no `idle`, md's own
+  `sync_min`/`sync_max` untouched, the outcome names the condition and `cleanupErrors` says what was
+  left; the bounded check refuses to narrow a running recovery's window; our own check still ends
+  with `idle`. `ahr-scrub.test.ts`: a band that went `recover` or `frozen` records not-checked with
+  NO `--action=idle` call at all.)*
+- **D3 (LOSE-DATA) — the csum leaf now proves itself, and has a second copy.** `readStoredCsum` read
+  the leaf RAW off the LV with no self-check: no node-header crc32c, no bytenr check, and only
+  `stripe 0` of the DUP metadata chunk. Rot in the csum tree itself came back as a plausible
+  four-byte number, no reconstruction could match it, and a HEALTHY block was reported
+  "unrepairable — restore from backup", after which the operator overwrites good data. The node is
+  now verified exactly the way btrfs does it (crc32c of bytes 32…nodesize == the LE word in bytes
+  0…3, and the node's own `bytenr` at header offset 48 == the leaf the walk asked for — both proved
+  against the captured `split-csum-leaf.b64`), and a failure falls back to the DUP chunk's second
+  copy (`parseChunkItems` reads every stripe now, not just the first). Both copies failing is a
+  DISTINCT verdict — `unrepairable` with reason code `csum-unreadable` — whose text says the
+  checksum could not be read and explicitly does not say restore-from-backup. Confirmed and
+  documented: every `dump-tree -b` the walk consumes is verified by btrfs-progs itself and fails the
+  command on a bad block, which `selfheal-btree.ts` already turns into an error, so the raw leaf was
+  the only unprotected read in the engine. *(`selfheal-csum.test.ts`: the captured leaf passes; one
+  flipped byte, a wrong bytenr and a short read each refuse; a synthetic leaf rotten on stripe 0 and
+  good on stripe 1 is answered from the mirror.)*
+- **D4 (LOSE-DETECTION) — daemon-start reconciliation.** SIGKILL, the OOM killer, or an upgrade
+  restarting anasd mid-repair never runs the engine's `finally`, and the band keeps `sync_max`
+  bounded to ONE STRIPE, `rmw_level=0` and `stripe_cache_size=17` for the life of the assembly —
+  invisibly. The next monthly check then covers that one stripe, suspends there (GT-13's trap), and
+  the 7-day finish-wait holds the pool's job exclusion. `reconcileSelfhealState`
+  (`selfheal-reconcile.ts`, hooked once in `index.ts` after the AHR boot scan) reads every AHR
+  band's `sync_min`/`sync_max`/`rmw_level`/`stripe_cache_size`, restores anything that is not md's
+  own value (GT-1: `0`/`max`/`1`/`256`), logs one journald line per band, and sweeps the
+  `anas-selfheal-*` transients through `listAhrSnapshots`/`deleteAhrSnapshot` (§12) and the flat
+  pool's in-place prefix. A band md is mid-operation on keeps its sync window and is REPORTED
+  instead — D2's rule from the other side. Phase 1 of the scrub also refuses to issue a check into a
+  bounded window, restoring it first when the band is idle. Nothing is persisted and nothing is
+  remembered: every value is read off the kernel and compared with md's own default, which is
+  reading the system, not a shadow database (§11). *(`selfheal-reconcile.test.ts`: dirty knobs →
+  restored + logged; a running `recover` → window untouched, band reported; a healthy node → silent;
+  RAID1 (no such knobs, GT-16) → silent; both snapshot shapes swept, the operator's own snapshot
+  left alone. `ahr-scrub.test.ts`: a 6272..6400 window is widened before the check goes in.)*
+- **D7 — a member md kicked after the gates is treated as absent.** `reconstruct` read the siblings
+  by device path out of the `mdadm --detail --export` snapshot the gates took, and a kicked member
+  still has a path in it — reading it returns that disk's own stale bytes rather than an error.
+  `degraded` is re-read immediately before the reconstruction and, when it has moved, each role's
+  `rd<n>/state` says who is still in. RAID5 refuses (it needs every other member); RAID6 keeps only
+  the syndrome that does not need the missing one — a kicked Q leaves the P-XOR, a kicked P leaves
+  the Q solve; RAID1 drops the leg from the candidates. *(`selfheal-repair.test.ts`: a sibling
+  kicked between the precheck and the reconstruction → `unrepairable` naming the device, nothing
+  written; `reconstructionPlan` asserted level by level.)*
+- **S2 — the final cold read is bounded, and says so.** `withTopLevelMount` serialises every holder
+  of one pool's top-level mount, so the engine's cold read could join a queue behind a backup run
+  for hours — with the block ALREADY WRITTEN and `rmw_level=0` still set on a live array. The read
+  is a confirmation, not a gate: `withTopLevelMountWithin` waits at most 60 s (the queue depth is
+  checked and the mount taken in the same synchronous turn, so nothing slips in front), and past it
+  the outcome is an honest `repaired … (post-check passed; cold read skipped: top-level mount
+  busy)`. The pin's DESTROY still waits — a snapshot left behind pins an extent, and by then every
+  md knob is already restored. *(`selfheal-repair.test.ts`: a holder taken at the write step → the
+  block is written, the cold read is skipped, the step is marked ok with its reason.)*
+- **S3 — the per-band pre-issue re-check.** `mdadm --action=check` was issued unconditionally per
+  band through `run`, which THROWS on a non-zero exit: a band that entered recovery after the
+  route-time read failed the whole scrub, or (with the old cancel path) aborted the rebuild.
+  `sync_action` is re-read per band immediately before issuing; a busy band is recorded "not checked
+  (md is running <op>)" and skipped, and the issue itself no longer throws — a refusal is one band's
+  line, never the job's failure. *(`ahr-scrub.test.ts`: a band in `recover` gets no check issued and
+  no write; a band whose `--action=check` exits 1 is recorded and the scrub carries on.)*
+- **S6 — the check exclusion is node-wide, and survives a restart.** Every other "already scrubbing"
+  refusal is in-process — the pool state a topology read reports, and the job queue's own record —
+  and a daemon restart takes both with it: md's check on band r1 keeps running while the job that
+  issued it is gone, and the next scrub issues checks on bands that share spindles with it. The
+  scrub route now reads /proc/mdstat once and refuses on a `check` (including a queued or delayed
+  one) running on ANY AHR band of ANY pool on the node: "an md check is running on <band> (started
+  outside this job or by a previous daemon)". A check on another pool's band is invisible to the
+  requested pool's state no matter what, and on a real node those bands are very often slices of the
+  same disks. *(`ahr-scrub.test.ts`: `runningAhrCheck` over two pools, a DELAYED check, a non-AHR
+  array ignored, one mdstat read. `ahr-mutate.test.ts`: the route answers 409 with that message and
+  no confirm code.)*
