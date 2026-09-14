@@ -319,7 +319,7 @@ async function evictStripeCache(
  * array that is otherwise fine. Null when no role reports a size — the caller
  * then bounds the sweep by the span alone rather than inventing a number.
  */
-async function memberDataSectors(geo: MdGeometry): Promise<number | null> {
+export async function memberDataSectors(geo: MdGeometry): Promise<number | null> {
   for (let role = 0; role < geo.raidDisks; role++) {
     const kib = await readMdAttrOrNull(geo.sys, `rd${role}/size`)
     if (kib === null)
@@ -961,8 +961,12 @@ async function gateRefusal(
  * The gates at step 1 proved this array complete and still. This asks whether
  * it STILL is, at the last instant before bytes go in — so "changed" and "not
  * clean now" are the same question and the answer names the condition.
+ *
+ * Exported because the parity rewrite (selfheal.10) has the same last instant
+ * — its md write is `mdadm --action=repair` over a whole band — and asks the
+ * question with this function rather than a second copy of it.
  */
-async function preWriteRefusal(geo: MdGeometry): Promise<string | null> {
+export async function preWriteRefusal(geo: MdGeometry): Promise<string | null> {
   const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
   if (degraded !== null && degraded !== '0')
     return `${geo.device} is now degraded (${degraded} member${degraded === '1' ? '' : 's'} missing)`
@@ -1051,8 +1055,15 @@ export function reconstructionPlan(
   return { refusal: `${since} — that is a second unknown data member in the same stripe as the block under repair, and neither syndrome solves for two. Nothing was written.`, pXor: false, qSyndrome: false, mirrors: [] }
 }
 
-/** Why ONE band's array cannot be repaired on right now, or null when it can. */
-async function arrayRefusal(geo: MdGeometry): Promise<string | null> {
+/**
+ * Why ONE band's array cannot be repaired on right now, or null when it can.
+ *
+ * The submit-time half of the pair above, and shared with the parity rewrite
+ * (selfheal.10) for the same reason: degraded, busy, mid-reshape and an
+ * unwritable `array_state` bar a parity rewrite exactly as they bar a block
+ * repair, and the operator should read the same sentence either way.
+ */
+export async function arrayRefusal(geo: MdGeometry): Promise<string | null> {
   const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
   if (degraded !== null && degraded !== '0') {
     return `${geo.device} is degraded (${degraded} member${degraded === '1' ? '' : 's'} missing) — a reconstruction needs every other member of the stripe`

@@ -1250,3 +1250,15 @@ line bugs. Everything below was fixed at the source with a failing-before test.
   same disks. *(`ahr-scrub.test.ts`: `runningAhrCheck` over two pools, a DELAYED check, a non-AHR
   array ignored, one mdstat read. `ahr-mutate.test.ts`: the route answers 409 with that message and
   no confirm code.)*
+- **selfheal.10 — Rewrite parity rides these rules rather than reopening them.** The one verb that
+  runs `mdadm --action=repair` (`services/ahr-parity-rewrite.ts`) reuses D2's ownership helper, the
+  repair engine's own gates and pre-write re-check, and the scrub's phase-2 pass verbatim: both its
+  md operations are whole-band with `sync_max` at its default, so it never narrows a window and
+  never writes `idle`, and an operation md took of its own ends the run with every knob as md left
+  it. Its licence is the two-phase scrub's verdict — mismatches on the band, checksums clean across
+  the pool — re-taken immediately before the md write, with a FRESH btrfs scrub in between that
+  aborts on any finding, because `repair` would bless that rot (GT-18's negative control).
+  *(`ahr-parity-rewrite.test.ts`: each precondition refusal, the fresh-scrub abort with no
+  `--action=repair` issued at all, a foreign op replacing the repair and the check, and a check that
+  still counts mismatches reported as `still-mismatched`. Suite case 8 + its control on the stunt
+  node: `test/self-heal/suite/LAST-RUN-parity.md`.)*

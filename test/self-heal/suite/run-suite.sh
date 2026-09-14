@@ -9,8 +9,8 @@
 #   rsync -a test/self-heal/suite/ test/self-heal/gt/{lib.sh,00-rig.sh} node:/root/gtsh/
 #   ssh node 'python3 /root/gtsh/suite/suite.py'
 #
-# Env: NODE (default root@192.168.200.50), REPAIR_CMD (passed through to the
-# node run; see README for the contract).
+# Env: NODE (default root@192.168.200.50), REPAIR_CMD and PARITY_CMD (passed
+# through to the node run; see README for the contracts).
 set -euo pipefail
 NODE=${NODE:-root@192.168.200.50}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -23,16 +23,19 @@ rsync -a "$GTDIR/lib.sh" "$GTDIR/00-rig.sh" "$GTDIR/00-rig-twoband.sh" \
     "$NODE:/root/gtsh/"
 
 set +e
-# REPAIR_CMD has to cross the ssh boundary explicitly — ssh carries no
-# environment of its own, and the README has always said this script passes it
-# through (selfheal.5: it did not, so an alternative repair could only be run by
-# hand on the node). Quoted so a multi-word command (`node /opt/…/x.js`) stays
-# one value.
+# REPAIR_CMD / PARITY_CMD have to cross the ssh boundary explicitly — ssh
+# carries no environment of its own, and the README has always said this script
+# passes them through (selfheal.5: it did not, so an alternative repair could
+# only be run by hand on the node). Quoted so a multi-word command
+# (`node /opt/…/x.js --flag`) stays one value.
+ENVPREFIX=""
 if [ -n "${REPAIR_CMD:-}" ]; then
-    ssh "$NODE" "REPAIR_CMD=$(printf '%q' "$REPAIR_CMD") python3 /root/gtsh/suite/suite.py"
-else
-    ssh "$NODE" "python3 /root/gtsh/suite/suite.py"
+    ENVPREFIX="$ENVPREFIX REPAIR_CMD=$(printf '%q' "$REPAIR_CMD")"
 fi
+if [ -n "${PARITY_CMD:-}" ]; then
+    ENVPREFIX="$ENVPREFIX PARITY_CMD=$(printf '%q' "$PARITY_CMD")"
+fi
+ssh "$NODE" "$ENVPREFIX python3 /root/gtsh/suite/suite.py"
 RC=$?
 set -e
 

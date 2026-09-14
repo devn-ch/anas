@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { AhrScrubFinding } from './ahr.js'
 import { AbsolutePath } from './common.js'
 
 /**
@@ -311,3 +312,105 @@ export const AhrRepairResult = z.object({
   blocks: z.number().int().nonnegative(),
 })
 export type AhrRepairResult = z.infer<typeof AhrRepairResult>
+
+// ---------------------------------------------------------------------------
+//  Rewrite parity (story selfheal.10) — POST /v1/ahr/:name/parity-rewrite
+// ---------------------------------------------------------------------------
+
+/**
+ * Body of POST /v1/ahr/:name/parity-rewrite — the ONE band to rewrite.
+ *
+ * A band at a time, never the pool: `mdadm --action=repair` walks every member
+ * of the array it is given, and the operator confirms one array's worth of
+ * reading at a time, with that array's own estimate in front of them.
+ */
+export const AhrParityRewriteRequest = z.object({
+  band: z.number().int().positive(),
+})
+export type AhrParityRewriteRequest = z.infer<typeof AhrParityRewriteRequest>
+
+/**
+ * What the run did, in three honest words.
+ *
+ * - `rewritten` — the fresh btrfs scrub was clean, md rewrote the band's parity
+ *   from the data as it stands, and the check afterwards counted 0.
+ * - `refused` — a precondition did not hold (see `reasonCode`). Nothing was
+ *   written and no md knob was moved.
+ * - `still-mismatched` — the repair ran and the check afterwards still counted
+ *   mismatches. Parity is NOT proven good; the band needs looking at.
+ */
+export const AhrParityRewriteOutcome = z.enum(['rewritten', 'refused', 'still-mismatched'])
+export type AhrParityRewriteOutcome = z.infer<typeof AhrParityRewriteOutcome>
+
+/**
+ * Why a run refused, for a parser. The operator's sentence is `reason`.
+ *
+ * The first four are the route's hard 409s, re-checked by the engine at submit
+ * AND immediately before the md write (the array can lose a member in between);
+ * `data-corruption-found` is the fresh scrub's own abort, and `foreign-sync-op`
+ * is md having taken an operation of its own on the band while the run was in
+ * flight — the one case where the run walks away with every knob exactly as md
+ * left it. `no-such-band` and `pool-not-mounted` are the two the route answers
+ * before any of that (400 and 409 respectively), and the engine answers again
+ * because it is also driven directly by the selfheal.2 suite.
+ */
+export const AhrParityRewriteReasonCode = z.enum([
+  'no-parity-mismatch',
+  'data-findings-present',
+  'array-busy',
+  'job-active',
+  'data-corruption-found',
+  'foreign-sync-op',
+  'no-such-band',
+  'pool-not-mounted',
+])
+export type AhrParityRewriteReasonCode = z.infer<typeof AhrParityRewriteReasonCode>
+
+/** How long each phase took, in milliseconds — the run's own clock. */
+export const AhrParityRewriteDurations = z.object({
+  /** The fresh btrfs scrub (phase 1). */
+  scrubMs: z.number().int().nonnegative(),
+  /** `mdadm --action=repair` over the whole band (phase 2). */
+  repairMs: z.number().int().nonnegative(),
+  /** The verifying md check over the whole band (phase 3). */
+  checkMs: z.number().int().nonnegative(),
+  totalMs: z.number().int().nonnegative(),
+})
+export type AhrParityRewriteDurations = z.infer<typeof AhrParityRewriteDurations>
+
+/**
+ * The result of a parity-rewrite job (story selfheal.10).
+ *
+ * `mismatchBefore` is md's counter as it read immediately before the repair was
+ * issued — the last completed check's verdict, since md zeroes the counter when
+ * a sync op starts. `mismatchAfter` is the verifying check's own count. Both are
+ * nullable because an attribute that could not be read is reported as unknown,
+ * never as zero.
+ *
+ * `btrfsErrors` / `errorsReported` / `findings` carry the fresh scrub's verdict
+ * — populated on a `data-corruption-found` refusal, which is the whole point of
+ * running that scrub: md repair would BLESS that rot (GT-18's negative), so the
+ * files are named here and repaired through selfheal.6 first.
+ */
+export const AhrParityRewriteResult = z.object({
+  /** The AHR pool the band belongs to. */
+  pool: z.string(),
+  /** Band index (1-based), as the request named it. */
+  band: z.number().int().positive(),
+  /** The md array that band is (`/dev/md/tank-r1`), or null when unresolved. */
+  array: z.string().nullable(),
+  mismatchBefore: z.number().int().nonnegative().nullable(),
+  mismatchAfter: z.number().int().nonnegative().nullable(),
+  outcome: AhrParityRewriteOutcome,
+  /** One sentence for the operator — always set on anything but `rewritten`. */
+  reason: z.string().optional(),
+  reasonCode: AhrParityRewriteReasonCode.optional(),
+  /** The fresh scrub's `Error summary:` line, verbatim, when it found errors. */
+  btrfsErrors: z.string().nullable().optional(),
+  /** Total errors that summary counted. */
+  errorsReported: z.number().int().nonnegative().optional(),
+  /** The corrupt files the fresh scrub named, when attribution ran. */
+  findings: z.array(AhrScrubFinding).optional(),
+  durations: AhrParityRewriteDurations,
+})
+export type AhrParityRewriteResult = z.infer<typeof AhrParityRewriteResult>

@@ -11,12 +11,14 @@ mapping helpers are used only for verification and by the negative-control
 drivers (which, like the drill, are allowed to know the layout — the binding
 rule constrains the injector, not the controls).
 """
+import hashlib
 import json
 import os
 
 from common import (BS, LOGS, SUITE_OUT, array_end_sectors, bounded_end_check,
                     bounded_range_check, bounded_window_check, btrfs_chunk_ranges,
-                    btrfs_metadata_ranges, call_repair, chunk_sectors, components,
+                    btrfs_metadata_ranges, call_parity, call_repair, chunk_sectors,
+                    components,
                     drop_caches, fail_member, file_sector_digests, full_check,
                     locate_block, make_marker, make_snap, md_attr, md_attr_or_none,
                     md_geometry, readd_member, read_direct, regen, remove_snap,
@@ -28,6 +30,7 @@ from oracle import (ORACLE_SNAP, corrupt_block, disambiguate_data_slot,
 REPAIR_SNAP = ".anas-repair-snap"
 TX_PROBE_SNAP = ".anas-tx-probe"
 REPORT_PATH = f"{SUITE_OUT}/last-repair.json"
+PARITY_REPORT_PATH = f"{SUITE_OUT}/last-parity.json"
 
 STEPS = ["pin", "resolve", "reverify", "precheck", "rmw", "reconstruct",
          "arbitrate", "guard", "write", "postcheck", "coldread"]
@@ -153,6 +156,18 @@ def run_repair(ctx: CaseCtx, path: str, block: int, fail_at: str | None = None,
     rc, out = call_repair(ctx.mp, path, block, fail_at=fail_at,
                           report=REPORT_PATH, log=log)
     rep = json.load(open(REPORT_PATH)) if os.path.exists(REPORT_PATH) else {}
+    return rc, rep, out
+
+
+def run_parity(ctx: CaseCtx, band: int = 1, tag: str = "p") -> tuple[int, dict, str]:
+    """Invoke the parity-rewrite verb under test (PARITY_CMD, story
+    selfheal.10). The sidecar is removed first so a crashed run can never be
+    read as this one's report."""
+    if os.path.exists(PARITY_REPORT_PATH):
+        os.unlink(PARITY_REPORT_PATH)
+    log = f"{LOGS}/{ctx.tag}-{tag}.log"
+    rc, out = call_parity(ctx.mp, band, report=PARITY_REPORT_PATH, log=log)
+    rep = json.load(open(PARITY_REPORT_PATH)) if os.path.exists(PARITY_REPORT_PATH) else {}
     return rc, rep, out
 
 
@@ -859,3 +874,131 @@ def control7_two_band(ctx: CaseCtx, rec: Recorder) -> None:
                 f"eio={r['eio']} content_match={okc}")
     finally:
         remove_snap(ctx.mp, REPAIR_SNAP)
+
+
+# ---------------------------------------------------------------- case 8
+
+def _xor_rows(members: list[str], moff: int, parity: int) -> tuple[bool, list[str]]:
+    """Read the 4 KiB stripe ROW off every member behind md and test the RAID5
+    row identity: the parity member's row is the XOR of the data members' rows
+    (GT-18's 09-gt18-xor.py, the same check, on the suite's rig)."""
+    rows = [read_direct(dev, moff, BS) for dev in members]
+    acc = bytearray(BS)
+    for i, row in enumerate(rows):
+        if i == parity:
+            continue
+        for j in range(BS):
+            acc[j] ^= row[j]
+    digests = [f"m{i}[{'PARITY' if i == parity else 'data'}]="
+               f"{hashlib.sha256(r).hexdigest()[:12]}" for i, r in enumerate(rows)]
+    return bytes(acc) == rows[parity], digests
+
+
+def _cold_block(path: str, block: int) -> bytes | None:
+    """The block as it reads THROUGH btrfs with the caches dropped, or None on
+    EIO (the checksum refused it)."""
+    drop_caches()
+    try:
+        return read_direct(path, block * BS, BS)
+    except OSError:
+        return None
+
+
+def case8_parity_rewrite(ctx: CaseCtx, rec: Recorder) -> None:
+    """P-MEMBER ROT (GT-18's shape) — the one case `md repair` is the right
+    verb for: the parity member's stripe row is junk, every data member is
+    intact, btrfs sees nothing and md counts mismatches.
+
+    The verb under test (PARITY_CMD) must: run a fresh btrfs scrub, find it
+    clean, repair the whole band, check it, and come back with mismatch_cnt 0
+    — after which the file still reads MATCH and the parity row is once again
+    the XOR of the data rows.
+
+    Injector note: the rot goes on the PARITY member, which carries no
+    signature to scan for — it is the XOR of the others. The OFFSET is
+    scan-derived exactly as everywhere else in this suite (the oracle finds the
+    data block's member offset, and every member of a stripe row shares it);
+    only WHICH member is parity comes from the mapping helper, which is the
+    verification side. That is the same construction GT-18 used."""
+    path = ctx.files["p1"]
+    dev, off = ctx.scan_locate(path, 300)
+    boff = off - off % BS
+    loc = locate_block(ctx.mddev, ctx.mp, path, 300)
+    parity_dev = ctx.members[loc["parity_disk"]]
+    kept = _cold_block(path, 300)
+    if kept is None:
+        rec.add("case", "8-precondition", "the marker block reads before the rot", False,
+                "the cold read EIO'd before anything was injected")
+        return
+    corrupt_block(parity_dev, boff)
+    drop_caches()
+    rec.add("case", "8-inject", "parity member's stripe row corrupted behind md "
+            "(data members untouched)", True,
+            f"data m{loc['disk']}({os.path.basename(dev)}) scan-located at {boff}; "
+            f"rot injected on PARITY m{loc['parity_disk']}({os.path.basename(parity_dev)})@{boff}, "
+            f"stripe {loc['stripe']}")
+
+    # md sees it, btrfs does not — the whole reason this case exists (GT-18 a/b).
+    mm = bounded_window_check(ctx.mddev, loc["stripe"])
+    rec.add("case", "8-md-sees-it", "bounded md check over the stripe counts mismatches",
+            mm > 0, f"mismatch_cnt={mm} (expected > 0)")
+    before = _cold_block(path, 300)
+    rec.add("case", "8-data-intact", "the file still reads correctly through btrfs "
+            "(parity rot is invisible above md)", before == kept,
+            "cold read MATCH" if before == kept else "cold read differs or EIO'd")
+    if mm == 0 or before != kept:
+        return
+
+    rc, rep, out = run_parity(ctx, band=1, tag="p8")
+    ok = rc == 0 and rep.get("outcome") == "rewritten" and rep.get("mismatch_after") == 0
+    rec.add("case", "8-rewrite", "the verb rewrites the band's parity (exit 0, "
+            "mismatch_cnt 0 afterwards)", ok,
+            f"rc={rc} outcome={rep.get('outcome')} before={rep.get('mismatch_before')} "
+            f"after={rep.get('mismatch_after')} reason={rep.get('reason', out)[:140]}")
+    if not ok:
+        return
+
+    # The three facts GT-18(d) proved, re-proven independently of the verb.
+    mm2 = bounded_window_check(ctx.mddev, loc["stripe"])
+    rec.add("case", "8-clean", "an independent bounded check over the stripe reads 0",
+            mm2 == 0, f"mismatch_cnt={mm2}")
+    after = _cold_block(path, 300)
+    rec.add("case", "8-match", "the file still reads MATCH after the rewrite",
+            after == kept, "cold read MATCH" if after == kept else "cold read differs or EIO'd")
+    same, digests = _xor_rows(ctx.members, boff, loc["parity_disk"])
+    rec.add("case", "8-xor", "the parity row is the XOR of the data rows again",
+            same, f"parity row == XOR(data rows): {same} — " + " ".join(digests))
+    assert_knobs_default(ctx, "case 8")
+
+
+def control8_data_rot_refused(ctx: CaseCtx, rec: Recorder) -> None:
+    """NEGATIVE CONTROL — DATA-member rot: the verb must REFUSE.
+
+    This is the case `md repair` gets WRONG (GT-18's negative control: it
+    rewrites parity to match the junk, the array goes clean, and the rot is
+    blessed — invisible to every later check while btrfs still EIOs the file).
+    The fresh btrfs scrub is what tells the two apart, so the control asserts
+    both halves: the verb exits 3 with `data-corruption-found`, AND md never
+    ran a repair (`last_sync_action` is untouched)."""
+    path = ctx.files["p2"]
+    dev, off, boff = ctx.corrupt_below_md(path, 300)
+    drop_caches()
+    loc = locate_block(ctx.mddev, ctx.mp, path, 300)
+    mm = bounded_window_check(ctx.mddev, loc["stripe"])
+    rec.add("control", "8-neg-inject", "data-member rot injected below md", mm > 0,
+            f"m{loc['disk']}({os.path.basename(dev)})@{boff} stripe {loc['stripe']}: "
+            f"mismatch_cnt={mm}")
+    if mm == 0:
+        return
+
+    last_before = md_attr(ctx.mddev, "last_sync_action")
+    rc, rep, out = run_parity(ctx, band=1, tag="p8neg")
+    refused = rc == 3 and rep.get("reason_code") == "data-corruption-found"
+    rec.add("control", "8-neg", "the verb REFUSES data rot (exit 3, "
+            "data-corruption-found) instead of blessing it", refused,
+            f"rc={rc} outcome={rep.get('outcome')} code={rep.get('reason_code')} "
+            f"reason={rep.get('reason', out)[:160]}")
+    last_after = md_attr(ctx.mddev, "last_sync_action")
+    rec.add("control", "8-neg-no-repair", "md never ran a repair on the band",
+            last_after == last_before and last_after != "repair",
+            f"last_sync_action {last_before} -> {last_after}")

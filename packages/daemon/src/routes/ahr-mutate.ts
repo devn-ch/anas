@@ -7,7 +7,7 @@ import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { relative, resolve as resolvePath } from 'node:path'
-import { AhrCreateRequest, AhrMountpointRequest, AhrRepairRequest, isComposableDisk, PoolName } from '@anas/shared'
+import { AhrCreateRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
@@ -15,13 +15,15 @@ import { confirmGate } from '../safety/gate.js'
 import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
+import { parityRewriteArray, parityRewriteArrayRefusal, parityRewriteEvidence, parityRewriteWarnings, rewriteBandParity } from '../services/ahr-parity-rewrite.js'
 import { repairAhrFiles } from '../services/ahr-repair.js'
-import { pathExists, runningAhrCheck, scrubAhrPool } from '../services/ahr-scrub.js'
+import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../services/ahr-scrub.js'
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
 import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
 import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
+import { readMdGeometry } from '../services/selfheal-map.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -87,8 +89,23 @@ const REPAIR_REFUSED_STATES: Record<string, string> = {
   readonly: 'is read-only — a repair writes the reconstructed block back through md',
 }
 
-/** Job operations that must not overlap a repair on the same pool. */
-const REPAIR_EXCLUSIVE_OPERATIONS = ['ahr.scrub', 'ahr.repair'] as const
+/**
+ * Job operations that must not overlap on the same pool.
+ *
+ * The parity rewrite (selfheal.10) joined the pair: it runs a full btrfs scrub
+ * and then TWO whole-band md operations, so it fights a scrub for md's sync
+ * thread and a repair for the array it is writing parity across. The exclusion
+ * is mutual in every direction — this one list is what the scrub, the repair
+ * and the rewrite all ask.
+ */
+const REPAIR_EXCLUSIVE_OPERATIONS = ['ahr.scrub', 'ahr.repair', 'ahr.parity-rewrite'] as const
+
+/** What to call each of them in a refusal, in the operator's words. */
+const EXCLUSIVE_OPERATION_NAMES: Record<string, string> = {
+  'ahr.scrub': 'a scrub',
+  'ahr.repair': 'a repair',
+  'ahr.parity-rewrite': 'a parity rewrite',
+}
 
 export interface AhrMutationRouteOptions {
   executor: CommandExecutor
@@ -124,6 +141,7 @@ export interface AhrMutationRouteOptions {
  *   DELETE /v1/ahr/:name        — destroy pool (409 confirm)
  *   POST   /v1/ahr/:name/scrub  — btrfs scrub then md checks (202, no confirm)
  *   POST   /v1/ahr/:name/repair — repair named blocks from parity (409 confirm)
+ *   POST   /v1/ahr/:name/parity-rewrite — rewrite ONE band's parity (409 confirm)
  *
  * All mutations are jobs (202). The expansion verbs (expand/plan/resume/
  * abandon/replace) live separately in routes/ahr-expand.ts. Reads live in
@@ -155,9 +173,12 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    * "nothing in flight" — the engine's own gates (`sync_action` not idle) are
    * the backstop, and no shadow state is introduced to paper over it.
    */
-  function conflictingAhrJob(name: string): { operation: string, id: string } | null {
+  function conflictingAhrJob(name: string, exceptJobId?: string): { operation: string, id: string } | null {
     const job = jobQueue.findActive(REPAIR_EXCLUSIVE_OPERATIONS, name)
-    return job ? { operation: job.operation, id: job.id } : null
+    // `exceptJobId` is the caller's OWN job: the parity rewrite re-asks this
+    // question from inside its handler, and a run that counts itself as a
+    // conflicting job refuses every time.
+    return job && job.id !== exceptJobId ? { operation: job.operation, id: job.id } : null
   }
 
   /** Parse + validate a pool-name param, or 400 and return null. */
@@ -497,9 +518,9 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       return {
         error: {
           code: 'CONFLICT',
-          message: scrubBlocker.operation === 'ahr.repair'
-            ? `a repair job is in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — a check would re-read the stripes the repair is writing; wait for it to finish`
-            : `a scrub is already in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — one scrub reads every byte of the pool and checks every band array; wait for it to finish`,
+          message: scrubBlocker.operation === 'ahr.scrub'
+            ? `a scrub is already in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — one scrub reads every byte of the pool and checks every band array; wait for it to finish`
+            : `${EXCLUSIVE_OPERATION_NAMES[scrubBlocker.operation] ?? 'another job'} job is in flight on AHR pool '${name}' (job ${scrubBlocker.id}) — a check would re-read the stripes that job is writing; wait for it to finish`,
         },
       }
     }
@@ -571,7 +592,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const blocker = conflictingAhrJob(name)
     if (blocker) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', message: `${blocker.operation === 'ahr.scrub' ? 'a scrub' : 'another repair'} is in flight on AHR pool '${name}' (job ${blocker.id}) — a repair needs the array to itself; wait for it to finish` } }
+      return { error: { code: 'CONFLICT', message: `${blocker.operation === 'ahr.repair' ? 'another repair' : EXCLUSIVE_OPERATION_NAMES[blocker.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${blocker.id}) — a repair needs the array to itself; wait for it to finish` } }
     }
     // A backup (or any snapshot verb) holding the pool's on-demand top-level
     // mount is the same refusal the engine makes at its gates — said here, at
@@ -634,6 +655,117 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       { ...identity, params: { name, files: files.map(f => f.path), blocks } },
       async updateProgress => repairAhrFiles(executor, pool, files, updateProgress),
     )
+    reply.code(202)
+    return { job }
+  })
+
+  // --- POST /ahr/:name/parity-rewrite — rewrite one band's parity (confirm) --
+  //
+  // Story selfheal.10. The ONE case where ANAS runs `mdadm --action=repair`:
+  // md counted mismatches on this band and the checksum pass came back clean
+  // across the pool, so the data is right and the parity is what is wrong. The
+  // preconditions below are that proof, taken here and taken AGAIN inside the
+  // job immediately before the md write — a band that lost a member in between
+  // is a band this must not touch.
+  server.post<{ Params: { name: string } }>('/ahr/:name/parity-rewrite', async (request, reply) => {
+    const name = parsePoolName(request.params.name, reply)
+    if (!name)
+      return
+
+    const parsed = AhrParityRewriteRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid parity-rewrite request: ${parsed.error.issues[0]?.message} — the body names ONE band (\`{ "band": 1 }\`), because md repairs a whole array at a time` } }
+    }
+    const band = parsed.data.band
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const pool = (await readAhrPools(executor)).find(p => p.name === name)
+    if (!pool) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
+    }
+    const array = parityRewriteArray(pool, band)
+    if (!array) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `AHR pool '${name}' has no band r${band} — its bands are ${pool.arrays.map(a => `r${a.band}`).join(', ') || 'none'}` } }
+    }
+    if (!pool.mounted || pool.mountpoint.startsWith('/dev/')) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'pool-not-mounted', message: `AHR pool '${name}' is not mounted — the fresh btrfs scrub this verb runs before it touches md needs the filesystem online` } }
+    }
+
+    // Hard refusals, every one of them BEFORE a confirm code is minted
+    // (Principle 14: "unsafe now" has no bypass, and none of these is a risk
+    // the operator can accept — they are states in which the verb is wrong).
+    const evidence = () => parityRewriteEvidence(name, jobQueue.findLastCompleted('ahr.scrub', name), band)
+    const proof = evidence()
+    if (!proof.ok) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: proof.code, message: proof.reason } }
+    }
+    const stateRefusal = REPAIR_REFUSED_STATES[pool.state]
+    if (stateRefusal) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'array-busy', message: `AHR pool '${name}' ${stateRefusal}; rewrite parity when the pool is healthy and idle` } }
+    }
+    // Set the moment the job exists, and read only from inside the handler —
+    // every call there happens in a later microtask than the assignment below,
+    // because `rewriteBandParity` awaits before it asks. A run must not count
+    // ITSELF as the job that blocks it.
+    let selfJobId: string | undefined
+    const jobConflict = () => {
+      const active = conflictingAhrJob(name, selfJobId)
+      return active
+        ? `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}) — a parity rewrite reads every member of a band twice and needs the array to itself; wait for it to finish`
+        : null
+    }
+    const conflict = jobConflict()
+    if (conflict) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'job-active', message: conflict } }
+    }
+    // The band's own state, read from md rather than from the pool rollup: a
+    // pool can read `healthy` while THIS array is mid-check, and the rewrite
+    // happens on the array.
+    let bandRefusal: string | null
+    try {
+      bandRefusal = await parityRewriteArrayRefusal(await readMdGeometry(executor, array.device))
+    }
+    catch (error) {
+      bandRefusal = `band r${band} of AHR pool '${name}' (${array.device}) could not be read: ${error instanceof Error ? error.message : String(error)}`
+    }
+    if (bandRefusal) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'array-busy', message: bandRefusal } }
+    }
+
+    // Confirm gate: what md is about to do, in the operator's terms. The
+    // signature carries the band, so a code minted for r1 cannot rewrite r2.
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'ahr.parity-rewrite',
+      params: { name, band },
+      message: `Rewriting parity on band r${band} of AHR pool '${name}' recomputes that band's parity from the data it holds now (md counted ${proof.mismatchCnt} mismatch(es) there, and the pool's last checksum scrub was clean)`,
+      warnings: parityRewriteWarnings(name, array),
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'ahr.parity-rewrite',
+      { ...identity, params: { name, band } },
+      async updateProgress => rewriteBandParity(executor, pool, band, {
+        updateProgress,
+        evidence,
+        jobConflict,
+        attributeFindings: async since => (await attributeScrub(executor, pool, since, updateProgress)).findings ?? [],
+        pollIntervalMs: opts.scrubPollIntervalMs,
+      }),
+    )
+    selfJobId = job.id
     reply.code(202)
     return { job }
   })

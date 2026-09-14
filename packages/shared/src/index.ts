@@ -422,8 +422,14 @@ export {
   SnapshotTarget,
 } from './schemas/schedules.js'
 
-// Self-heal repair engine schemas (story selfheal.5) + the repair job (selfheal.6)
+// Self-heal repair engine schemas (story selfheal.5) + the repair job
+// (selfheal.6) + the parity rewrite (selfheal.10)
 export {
+  AhrParityRewriteDurations,
+  AhrParityRewriteOutcome,
+  AhrParityRewriteReasonCode,
+  AhrParityRewriteRequest,
+  AhrParityRewriteResult,
   AhrRepairBlockOutcome,
   AhrRepairFile,
   AhrRepairFileOutcome,

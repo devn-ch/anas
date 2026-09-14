@@ -19,6 +19,7 @@ never the ANAS install, never `/dev/sda*` or `/dev/zd*`.
 | 5 | above-md rot (junk written THROUGH md, parity agrees): pre-check diagnoses it, exit 3, `precheck_mismatch == 0` | 5-neg: below-md rot in the same file repairs normally, not exit 3 |
 | 6 | RAID1 (2 legs, GT-16: no `rmw_level`, no `stripe_cache_size`, `chunk_size` reads 0): corrupt the marker block on ONE leg behind md — the signature is on BOTH legs, the injector picks one hit and records which — repair must exit 0 and the block must read back correct on BOTH legs afterwards (md writes every leg); post-repair cold snapshot read matches | 6-neg: BEFORE the repair, a cold read through md may be served either leg — the control records which leg md served and whether the btrfs read EIOs accordingly; both outcomes are legitimate, so it asserts only coherence (EIO iff md served the corrupt bytes) and that the rot is real on the member |
 | 7 | **Two-band rig — the AHR pool shape (review finding R1).** Two md arrays (bands) as the PVs of one VG, one LV spanning both in band order with DIFFERENT chunks on purpose (band A RAID5 6×200 MiB @ 64K, band B RAID5 4×200 MiB @ 512K) — the LV is a linear concatenation, and the segment that owns each byte comes from the dm table, never from one array's geometry. The rig is filled past segment 1 until a marker block lands in segment 2 (band B); corrupt that block on its member (the oracle scans the members of BOTH arrays and records which one it hit) and repair: exit 0 using band B's OWN geometry, the member block reads back the original, an evicted bounded check over band B's stripe reads 0, cold snapshot read matches. The assertion R1 exists to be caught by runs REGARDLESS of the repair's exit: no DATA write on band A — the repair's own snapshot commits a btrfs transaction whose superblock/metadata writes can all sit in segment 1, so every changed band-A 4K block is mapped back to its LV byte through band A's geometry and must fall in md's superblock region, a measured superblock-mirror block, or a SYSTEM/METADATA chunk stripe. The mirrors are measured by the tx-probe (7-txprobe): the suite runs the SAME transaction the repair runs (RO snapshot create + delete) before the baseline and records the band-A blocks it writes — a measured block inside a DATA chunk FAILS the suite (the assertion would have a blind spot) | 7-neg: a marker in segment 1 (band A) repairs normally — both segments of the concatenated LV are reachable, so the segment-2 repair is not a rig fluke; 7-neg2: the post-repair cold snapshot read of the segment-1 block matches |
+| 8 | **Parity rewrite (selfheal.10), on a rig of its own.** P-MEMBER rot in GT-18's shape: the PARITY member's stripe row is junked behind md while every data member is left alone — btrfs sees nothing, a bounded md check counts 8, and the file still reads MATCH. The verb under test (`PARITY_CMD`) must run a fresh btrfs scrub, find it clean, repair the WHOLE band, check it, and report `mismatch_cnt` 0; the case then re-proves GT-18(d)'s three facts independently — an evicted bounded check over the stripe reads 0, the file still reads MATCH, and the parity row is once again the XOR of the data rows — and asserts the md knobs are back at their defaults. The rig is its own because the verb scrubs the WHOLE filesystem and any finding aborts it, so it cannot follow case 5, which leaves its above-md rot in place by design | 8-neg: DATA-member rot — the case `md repair` gets WRONG (it would rewrite parity to match the junk and bless it, GT-18's negative). The verb must exit 3 with `data-corruption-found`, and `last_sync_action` must be unchanged: md never ran a repair at all |
 
 Each case records its verdict and a detail line; the final line of the report
 is `SUITE: PASS|FAIL (n/m cases, k/l negative controls)` and the suite exits 0
@@ -35,6 +36,10 @@ NODE=root@someother test/self-heal/suite/run-suite.sh
 # the ANAS repair engine (selfheal.5), deployed by test/stunt-node/deploy-anas.sh
 REPAIR_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-repair.js" \
 REPORT_NAME=LAST-RUN-engine.md test/self-heal/suite/run-suite.sh
+
+# the ANAS parity rewrite (selfheal.10) — case 8's verb
+PARITY_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-parity.js --assume-mismatch" \
+REPORT_NAME=LAST-RUN-parity.md test/self-heal/suite/run-suite.sh
 ```
 
 `run-suite.sh` rsyncs this directory (+ `../gt/lib.sh`, `../gt/00-rig.sh` and
@@ -45,8 +50,8 @@ report to `LAST-RUN.md` (the committed record of the last full run) — or to
 `REPORT_NAME` when one is given, so a run with a different `REPAIR_CMD` does not
 overwrite the reference implementation's record. Exit code is the suite's.
 (This dev-box-entry shape is the story's chosen convention: run from the dev
-box, everything else happens on the node.) `REPAIR_CMD` is exported across the
-ssh boundary explicitly — ssh carries no environment of its own.
+box, everything else happens on the node.) `REPAIR_CMD` and `PARITY_CMD` are exported across
+the ssh boundary explicitly — ssh carries no environment of its own.
 
 Requires on the node: python3, mdadm, lvm2, btrfs-progs, ~5 GB free under
 `/root`, and 10 loop devices (the two-band rig uses 6+4; the rigs are torn
@@ -77,11 +82,36 @@ A custom `REPAIR_CMD` only needs to honor the three-argument invocation and
 the exit codes; the injected-failure and report envs are honored by the
 reference implementation and checked when present.
 
+## PARITY_CMD contract (case 8, story selfheal.10)
+
+The suite calls `${PARITY_CMD:-python3 <suite dir>/parity-ref.py}` as
+`<cmd> <mountpoint> <band>` — a BAND index, 1-based, in dm-table order (an AHR
+pool's LV is the linear concatenation of its band arrays, and a single-band rig
+has exactly one).
+
+Exit codes: `0` rewritten · `2` still-mismatched · `3` refused ·
+`1` internal error.
+
+`PARITY_REPORT=<path>` writes a JSON sidecar. The suite reads `outcome`,
+`reason`, `reason_code`, `mismatch_before`, `mismatch_after` and `array`.
+
+The command string may carry flags of its own, which are passed BEFORE the two
+positional arguments. The ANAS dev entry takes `--assume-mismatch`, and it is
+DEV-ONLY: the product's precondition is "the pool's last COMPLETED scrub job
+counted a parity mismatch on this band and its checksum pass was clean", and a
+loop rig has no daemon and no job queue to hold such a job. The flag supplies
+that ONE precondition; the fresh btrfs scrub, the array gates, the whole-band
+repair, the verifying check and the `mismatch_cnt == 0` proof all run exactly as
+they do in the job. `parity-ref.py` accepts and ignores unknown flags, so one
+`PARITY_CMD` string runs against either implementation.
+
 ## Implementations that have passed
 
 | REPAIR_CMD | report | result |
 |---|---|---|
 | `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 41/41 cases, 14/14 controls |
+| `python3 parity-ref.py` (the reference parity rewrite) | — | case 8 + its control on the parity rig (the committed `LAST-RUN.md` predates case 8) |
+| `node …/daemon/dist/bin/selfheal-parity.js --assume-mismatch` (the ANAS parity rewrite, selfheal.10) | `LAST-RUN-parity.md` | 48/48 cases, 17/17 controls (2026-09-14, the full suite with case 8) |
 | `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 41/41 cases, 14/14 controls (2026-09-13, with case 7 on the two-band rig) |
 
 The engine covers everything the reference does and adds the RAID6 Q-syndrome
@@ -286,6 +316,9 @@ correctness on a rig:
   checks, snapshots, marker files, repair invocation.
 - `repair-ref.py` — the reference repair implementing the converged
   sequence; the default `REPAIR_CMD`.
+- `parity-ref.py` — the reference parity rewrite (fresh btrfs scrub → whole-band
+  `mdadm --action=repair` → whole-band check → `mismatch_cnt` 0); the default
+  `PARITY_CMD`.
 - `oracle.py` — THE INJECTOR: raw signature scan of the member devices,
   flip-test disambiguation, junk writes. Shares NO code with the mapping
   helper (harness rule) — locating bytes via `common.locate_block` is

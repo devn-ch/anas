@@ -38,6 +38,11 @@ RIG5_FILES = [("c1", "random", 8 * 1024 * 1024, 1, [300]),
               ("c5", "random", 4 * 1024 * 1024, 5, [300, 700])]
 RIG6_FILES = [("r1", "random", 8 * 1024 * 1024, 1, [300, 1000, 1400])]
 RIG1_FILES = [("l1", "random", 4 * 1024 * 1024, 7, [300])]
+# Case 8 (selfheal.10) gets a rig of its own: the verb scrubs the WHOLE
+# filesystem and any finding aborts it, so it cannot follow cases that leave
+# unrepaired rot behind (case 5's above-md block, by design).
+RIG8_FILES = [("p1", "random", 4 * 1024 * 1024, 8, [300]),
+              ("p2", "random", 4 * 1024 * 1024, 9, [300])]
 # Two-band rig: plain filler (no signatures — an explicit empty block list) to
 # push the data past band A's segment, then the marker whose signature blocks
 # must land in BOTH segments (case 7 maps them from the dm table).
@@ -69,6 +74,10 @@ def case_fn(cid: str, ctx, rec: Recorder, level: int) -> None:
         return C.case7_two_band(ctx, rec)
     if cid == "7-neg":
         return C.control7_two_band(ctx, rec)
+    if cid == "8":
+        return C.case8_parity_rewrite(ctx, rec)
+    if cid == "8-neg":
+        return C.control8_data_rot_refused(ctx, rec)
     raise KeyError(cid)
 
 
@@ -216,6 +225,8 @@ def meta() -> dict:
         "btrfs_progs": btrfs_v.group(1) if btrfs_v else "?",
         "repair_cmd": os.environ.get("REPAIR_CMD") or
                       f"python3 {GT}/suite/repair-ref.py",
+        "parity_cmd": os.environ.get("PARITY_CMD") or
+                      f"python3 {GT}/suite/parity-ref.py",
     }
 
 
@@ -234,9 +245,11 @@ def write_report(rec: Recorder, notes: list[str]) -> tuple[str, str, bool]:
         f"- date: {m['date']}  node: {m['node']}  kernel: {m['kernel']}",
         f"- mdadm: {m['mdadm']}  btrfs-progs: {m['btrfs_progs']}",
         f"- REPAIR_CMD: `{m['repair_cmd']}`",
+        f"- PARITY_CMD: `{m['parity_cmd']}`",
         "- rigs: RAID5 (6 × 200 MiB loops), RAID6 (7 × 200 MiB loops),"
         " RAID5 at md's 512 KiB chunk (6 × 200 MiB loops, parity case only),"
-        " RAID1 (2 × 200 MiB loops), and the two-band AHR shape (RAID5"
+        " RAID1 (2 × 200 MiB loops), a second RAID5 rig for the parity-rewrite"
+        " case, and the two-band AHR shape (RAID5"
         " 6 × 200 MiB @ 64K + RAID5 4 × 200 MiB @ 512K in one VG/LV, case 7)"
         " — built fresh per run, torn down after"
         " (see test/self-heal/gt/00-rig.sh and 00-rig-twoband.sh)",
@@ -293,6 +306,11 @@ def main() -> int:
         # reads 0 — case 6 with its negative control
         ("RAID1", lambda: run_rig(1, rec, notes, files=RIG1_FILES,
                                   cases=("6",))),
+        # selfheal.10: P-member rot — the one shape `md repair` is right for —
+        # and its negative control, data-member rot, which the verb must refuse
+        # rather than bless (GT-18)
+        ("RAID5 parity", lambda: run_rig(5, rec, notes, tag="r5p",
+                                         files=RIG8_FILES, cases=("8", "8-neg"))),
         # the AHR pool shape (review finding R1): the LV is the linear
         # concatenation of TWO md arrays (bands) with different chunk sizes —
         # a segment-2 repair must not touch the other band

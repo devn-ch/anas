@@ -1071,7 +1071,7 @@ async function buildFindings(
  * having even when the journal is unreadable or a probe fails, so every failure
  * here degrades to "no attribution" instead of failing the job.
  */
-async function attributeScrub(
+export async function attributeScrub(
   executor: CommandExecutor,
   pool: AhrPool,
   startedAt: Date,
@@ -1141,6 +1141,53 @@ function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult
     ...(result.truncated ? [`the list is incomplete — the ${AHR_SCRUB_FINDINGS_CAP}-file cap or the kernel-journal read cap was reached`] : []),
   ].join(', ')
   return `${head}\n\nAffected files (${counts}):\n${lines.join('\n')}`
+}
+
+/** One btrfs scrub pass over a filesystem — the scrub's phase 2, on its own. */
+export interface BtrfsScrubPass {
+  /**
+   * Local wall clock stamped BEFORE `btrfs scrub start`. The kernel-journal
+   * read that attributes errors to files is bounded to this instant, so an
+   * older scrub's errors are never re-reported as this pass's findings
+   * (selfheal.3).
+   */
+  startedAt: Date
+  /** The `Error summary:` line, verbatim, or null when the pass was clean. */
+  btrfsErrors: string | null
+}
+
+/**
+ * Run ONE btrfs scrub to completion and report what it found.
+ *
+ * Extracted from `scrubAhrPool`'s phase 2 because the parity rewrite
+ * (selfheal.10) runs exactly this pass, for exactly this purpose, immediately
+ * before it lets md rewrite a band's parity: md repair recomputes parity from
+ * the data AS IT IS, so a file whose checksum fails has to be found FIRST or
+ * its rot is blessed (GT-18's negative control). Two callers, one scrub — the
+ * poll wording, the aborted-scrub error and the clean-summary rule are the
+ * same in both because they are the same code.
+ */
+export async function btrfsScrubPass(
+  executor: CommandExecutor,
+  mountpoint: string,
+  label: string,
+  updateProgress: (message: string) => void,
+  pollIntervalMs: number,
+): Promise<BtrfsScrubPass> {
+  const startedAt = new Date()
+  await run(executor, BTRFS, ['scrub', 'start', mountpoint])
+  for (;;) {
+    const st = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', mountpoint])).stdout)
+    if (st.status === 'running') {
+      updateProgress(`btrfs scrub running${st.percent !== null ? ` (${st.percent.toFixed(1)}%)` : ''}`)
+      await sleep(pollIntervalMs)
+      continue
+    }
+    if (st.status === 'aborted')
+      throw new Error(`btrfs scrub on '${label}' was aborted${isCleanSummary(st.errorSummary) ? '' : ` (${st.errorSummary})`}`)
+    // finished — or no Status line at all (nothing to report): done either way.
+    return { startedAt, btrfsErrors: isCleanSummary(st.errorSummary) ? null : st.errorSummary }
+  }
 }
 
 /**
@@ -1421,27 +1468,8 @@ export async function scrubAhrPool(
   }
 
   // --- Phase 2/2: btrfs checksum scrub ----------------------------------------
-  // Stamped BEFORE the scrub starts: the kernel journal read below is bounded to
-  // THIS scrub's window, so an older scrub's errors are never re-reported as
-  // this one's findings (selfheal.3).
-  const startedAt = new Date()
   updateProgress('phase 2/2: btrfs checksum scrub')
-  await run(executor, BTRFS, ['scrub', 'start', pool.mountpoint])
-  let btrfsErrors: string | null = null
-  for (;;) {
-    const st = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', pool.mountpoint])).stdout)
-    if (st.status === 'running') {
-      updateProgress(`btrfs scrub running${st.percent !== null ? ` (${st.percent.toFixed(1)}%)` : ''}`)
-      await sleep(interval)
-      continue
-    }
-    if (st.status === 'aborted')
-      throw new Error(`btrfs scrub on '${name}' was aborted${isCleanSummary(st.errorSummary) ? '' : ` (${st.errorSummary})`}`)
-    // finished — or no Status line at all (nothing to report): done either way.
-    if (!isCleanSummary(st.errorSummary))
-      btrfsErrors = st.errorSummary
-    break
-  }
+  const { startedAt, btrfsErrors } = await btrfsScrubPass(executor, pool.mountpoint, name, updateProgress, interval)
 
   // --- Attribution: which files, which blocks (selfheal.3) -------------------
   // Runs AFTER phase 1 by construction now — its probe reads are tiny, but §4's

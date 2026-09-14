@@ -887,3 +887,36 @@ def repair_report(path: str) -> dict:
     if os.path.exists(path):
         return json.load(open(path))
     return {}
+
+# ---------------------------------------------------------------- parity cmd
+
+PARITY_CMD = os.environ.get("PARITY_CMD") or f"python3 {GT}/suite/parity-ref.py"
+
+
+def call_parity(mountpoint: str, band: int, report: str | None = None,
+                log: str | None = None) -> tuple[int, str]:
+    """Run the parity-rewrite verb under test (story selfheal.10, case 8).
+
+    Contract — the same shape as REPAIR_CMD, one verb along:
+      `<cmd> <mountpoint> <band>`
+      exit 0 rewritten - 2 still-mismatched - 3 refused - 1 internal error
+      PARITY_REPORT=<path> writes a JSON sidecar; the suite reads `outcome`,
+      `reason`, `reason_code`, `mismatch_before`, `mismatch_after`, `array`.
+
+    A PARITY_CMD may carry flags of its own (the ANAS dev entry's
+    `--assume-mismatch` stands in for the completed-scrub evidence a loop rig
+    has no job queue for); they are part of the command string and are passed
+    before the two positional arguments."""
+    import shlex
+    cmd = shlex.split(PARITY_CMD) + [mountpoint, str(band)]
+    env = dict(os.environ)
+    if report:
+        env["PARITY_REPORT"] = report
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL)
+    out = (r.stdout + r.stderr).strip()
+    if log:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "w") as fh:
+            fh.write(f"$ {' '.join(cmd)}\nrc={r.returncode}\n{out}\n")
+    return r.returncode, out
