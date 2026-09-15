@@ -23,16 +23,25 @@
  *   POST /identity/users                    → 202 { job }  (CreateShareUserRequest)
  *   POST /identity/users/:name/smb-password → 202 { job }  (SetSmbPasswordRequest)
  *   PUT  /identity/users/:name              → 202 { job }  (SetUserEnabledRequest)
+ *   DELETE /identity/users/:name            → 202/409 (confirm-gated)
  *   POST /identity/groups                   → 202 { job }  (CreateGroupRequest)
  *   PUT  /identity/groups/:name/members     → 202 { job }  (UpdateGroupMembersRequest)
+ *   DELETE /identity/groups/:name           → 202/409 (confirm-gated)
+ *
+ * Delete (identity.1d) is need-gated (selection + a LOCAL row) and runs the
+ * daemon confirm-code flow through ANAS.confirmAndRun — the daemon's hard
+ * refusals (referenced-by-share, primary-group-in-use) surface as a plain
+ * error alert, the confirm gate's warnings in the Yes/No dialog.
  *
  * Test hooks:
  *   view panel cls   'anas-view anas-view-users'
  *   grids            'anas-grid-users' / 'anas-grid-groups'
  *   toolbar buttons  'anas-btn-refresh' (shared reload),
  *                    'anas-btn-user-add' / 'anas-btn-user-smbpw' /
- *                    'anas-btn-user-toggle' / 'anas-btn-user-groups',
- *                    'anas-btn-group-add' / 'anas-btn-group-members'
+ *                    'anas-btn-user-toggle' / 'anas-btn-user-groups' /
+ *                    'anas-btn-user-delete',
+ *                    'anas-btn-group-add' / 'anas-btn-group-members' /
+ *                    'anas-btn-group-delete'
  *   windows          'anas-win-user-create' / 'anas-win-smb-password' /
  *                    'anas-win-group-create' / 'anas-win-group-members'
  *   fields           'anas-fld-user-name' / 'anas-fld-user-fullname' /
@@ -68,10 +77,11 @@
     }
 
     // Basic client-side mirror of the daemon's IdentityName validation
-    // (identity.ts): lowercase/underscore start, then lowercase/digits/_/-, with
-    // an optional trailing $ for machine accounts. The daemon is authoritative;
+    // (identity.ts, identity.1a): a letter or underscore start (upper OR
+    // lowercase — useradd accepts mixed case), then letters/digits/_/-, with an
+    // optional trailing $ for machine accounts. The daemon is authoritative;
     // this only catches obvious typos before the round-trip.
-    var NAME_RE = /^[a-z_][a-z0-9_-]*\$?$/;
+    var NAME_RE = /^[A-Za-z_][A-Za-z0-9_-]*\$?$/;
 
     // ---- Selection helpers -------------------------------------------------
 
@@ -100,6 +110,22 @@
             return '<span style="color:#888;">' + enc(t('(empty)')) + '</span>';
         }
         return enc(arr.join(', '));
+    }
+
+    function renderGroupName(v, metaData, record) {
+        // identity.1c: a group whose name matches a user with this group as its
+        // primary group is that user's PRIVATE group — a pre-existing account
+        // ANAS did not create (ANAS users are made with -N, so no phantom
+        // same-named group appears). Label it so it can be recognised as such.
+        var priv = record.get('privateGroupOf');
+        if (!priv) {
+            return enc(v);
+        }
+        return enc(v)
+            + ' <span class="anas-badge-private-group" title="'
+            + enc(t('User-private group — the primary group of user') + ' ' + enc(priv))
+            + '" style="color:#888;font-size:0.85em;">'
+            + enc(t('private group of') + ' ') + enc(priv) + '</span>';
     }
 
     function renderSmb(v) {
@@ -287,6 +313,7 @@
         setDisabled(grid, 'userSmbpw', !local);
         setDisabled(grid, 'userToggle', !local);
         setDisabled(grid, 'userGroups', !local);
+        setDisabled(grid, 'userDelete', !local);
         var toggle = grid.down('#userToggle');
         if (toggle) {
             // Label follows selection: a locked user is re-enabled, else disabled.
@@ -299,6 +326,7 @@
             return;
         }
         setDisabled(grid, 'groupMembers', !isLocal(selectedRow(grid)));
+        setDisabled(grid, 'groupDelete', !isLocal(selectedRow(grid)));
     }
 
     // ---- New user window (anas-win-user-create) ----------------------------
@@ -331,7 +359,7 @@
                             emptyText: 'jsmith',
                             allowBlank: false,
                             regex: NAME_RE,
-                            regexText: t('Lowercase letters, digits, underscore and hyphen only.'),
+                            regexText: t('Letters, digits, underscore and hyphen only; may start with a letter or underscore.'),
                             maxLength: 32,
                         },
                         {
@@ -419,7 +447,7 @@
         }
         var name = trim(win.down('#name').getValue());
         if (!name || !NAME_RE.test(name)) {
-            ANAS.alertMsg('Invalid input', t('Enter a valid username (lowercase letters, digits, _ and -).'));
+            ANAS.alertMsg('Invalid input', t('Enter a valid username (letters, digits, _ and -).'));
             return;
         }
         var pw = win.down('#smbPassword').getValue() || '';
@@ -616,6 +644,71 @@
             });
         } catch (e) {
             ANAS.warn('toggle confirm failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // ---- Delete (identity.1d) — confirm-gated through the daemon ------------
+    //
+    // Need-gated: a selected, LOCAL row (the toolbar gating above). The daemon
+    // is the authority on what is safe (Principle 14): its hard refusals
+    // (referenced-by-share, primary-group-in-use) arrive as a plain 409 with NO
+    // confirm code and surface as an error alert naming the reason; the confirm
+    // gate's warnings (the account goes away, the files keep their uid/gid, the
+    // SMB passdb entry is dropped) render in the Yes/No dialog.
+
+    function deleteUser(node, view, rec) {
+        if (!rec || !isLocal(rec)) {
+            return;
+        }
+        var userName = rec.get('name');
+        try {
+            ANAS.confirmAndRun({
+                node: node,
+                method: 'del',
+                path: '/identity/users/' + encodeURIComponent(userName),
+                view: view,
+                failTitle: 'Delete failed',
+                successMsg: t('Share user deleted') + ': ' + userName,
+                onComplete: function () {
+                    reloadAll(view, node);
+                },
+                confirmTitle: 'Delete user',
+                confirmIntro: '<b>'
+                    + enc(t('Delete share user') + ' "' + userName + '"?') + '</b>',
+                confirmButtonText: 'Delete',
+                confirmCls: 'anas-win-user-delete',
+                confirmButtonCls: 'anas-btn-user-delete-confirm',
+            });
+        } catch (e) {
+            ANAS.warn('user delete failed: ' + ANAS.errText(e));
+        }
+    }
+
+    function deleteGroup(node, view, rec) {
+        if (!rec || !isLocal(rec)) {
+            return;
+        }
+        var groupName = rec.get('name');
+        try {
+            ANAS.confirmAndRun({
+                node: node,
+                method: 'del',
+                path: '/identity/groups/' + encodeURIComponent(groupName),
+                view: view,
+                failTitle: 'Delete failed',
+                successMsg: t('Group deleted') + ': ' + groupName,
+                onComplete: function () {
+                    reloadAll(view, node);
+                },
+                confirmTitle: 'Delete group',
+                confirmIntro: '<b>'
+                    + enc(t('Delete group') + ' "' + groupName + '"?') + '</b>',
+                confirmButtonText: 'Delete',
+                confirmCls: 'anas-win-group-delete',
+                confirmButtonCls: 'anas-btn-group-delete-confirm',
+            });
+        } catch (e) {
+            ANAS.warn('group delete failed: ' + ANAS.errText(e));
         }
     }
 
@@ -820,7 +913,7 @@
                             emptyText: 'media',
                             allowBlank: false,
                             regex: NAME_RE,
-                            regexText: t('Lowercase letters, digits, underscore and hyphen only.'),
+                            regexText: t('Letters, digits, underscore and hyphen only; may start with a letter or underscore.'),
                             maxLength: 32,
                         },
                     ],
@@ -860,7 +953,7 @@
         }
         var name = trim(win.down('#name').getValue());
         if (!name || !NAME_RE.test(name)) {
-            ANAS.alertMsg('Invalid input', t('Enter a valid group name (lowercase letters, digits, _ and -).'));
+            ANAS.alertMsg('Invalid input', t('Enter a valid group name (letters, digits, _ and -).'));
             return;
         }
 
@@ -1089,6 +1182,9 @@
                 { name: 'gid', type: 'int' },
                 { name: 'members', type: 'auto' },
                 { name: 'local', type: 'bool' },
+                // Present only on a user-private group (identity.1c); absent =
+                // a plain group, exactly as an older daemon would send it.
+                'privateGroupOf',
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
@@ -1208,6 +1304,17 @@
                                 openUserGroups(node, findView(btn), selectedRow(grid));
                             },
                         },
+                        {
+                            text: t('Delete'),
+                            itemId: 'userDelete',
+                            cls: 'anas-btn-user-delete',
+                            iconCls: 'fa fa-trash',
+                            disabled: true,
+                            handler: function (btn) {
+                                var grid = btn.up('grid');
+                                deleteUser(node, findView(btn), selectedRow(grid));
+                            },
+                        },
                     ]),
                     listeners: {
                         afterrender: function (grid) {
@@ -1233,8 +1340,8 @@
                         {
                             text: t('Name'),
                             dataIndex: 'name',
-                            width: 160,
-                            renderer: Ext.String.htmlEncode,
+                            width: 220,
+                            renderer: renderGroupName,
                         },
                         {
                             text: t('GID'),
@@ -1272,6 +1379,17 @@
                             handler: function (btn) {
                                 var grid = btn.up('grid');
                                 openGroupMembers(node, findView(btn), selectedRow(grid));
+                            },
+                        },
+                        {
+                            text: t('Delete'),
+                            itemId: 'groupDelete',
+                            cls: 'anas-btn-group-delete',
+                            iconCls: 'fa fa-trash',
+                            disabled: true,
+                            handler: function (btn) {
+                                var grid = btn.up('grid');
+                                deleteGroup(node, findView(btn), selectedRow(grid));
                             },
                         },
                     ]),

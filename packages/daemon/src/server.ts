@@ -314,7 +314,9 @@ export function createServer(opts?: ServerOptions) {
     // args, so command-only fallbacks let dev-mode mutations succeed.
     mock.addFixture({ command: '/usr/sbin/useradd', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/usermod', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/userdel', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/groupadd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/groupdel', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/gpasswd', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/smbpasswd', result: { stdout: '', stderr: '', exitCode: 0 } })
     // Command-only getent fallback (exit 0, non-parseable stdout). Registered
@@ -517,6 +519,9 @@ export function createServer(opts?: ServerOptions) {
     executor,
     jobQueue,
     confirmStore,
+    // The delete routes read it to refuse an identity a share still names in
+    // `valid users` — the SAME path the share routes edit.
+    smbConfPath,
     // The dev mock never spawns anything, so probing the real /usr/bin/smbpasswd
     // would make the SMB paths untestable on a machine without samba.
     ...(opts?.mock ? { smbpasswdAvailable: async () => true } : {}),

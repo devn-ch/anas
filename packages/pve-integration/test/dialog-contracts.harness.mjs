@@ -285,6 +285,13 @@ function makeComponent(cfg, parent) {
       if (attr[2] === undefined) { return v !== undefined && v !== null }
       return String(v) === attr[2]
     }
+    // 'panel[anasUsersView]' — an xtype with a property-PRESENCE selector
+    // (the Share Users view looks itself up from its own toolbar buttons).
+    const xattr = sel.match(/^([A-Za-z_$][\w$]*)\[([A-Za-z_$][\w$]*)\]$/)
+    if (xattr) {
+      const v = cmp[xattr[2]]
+      return cmp.xtype === xattr[1] && v !== undefined && v !== null
+    }
     // 'grid' is ExtJS's alias for gridpanel (the AHR toolbar's handlers walk
     // up('grid') from a tbar button to a gridpanel) — model the alias.
     if (sel.charAt(0) === '#') { return cmp.itemId === sel.slice(1) }
@@ -8355,6 +8362,159 @@ async function disksStaleHealthChecks() {
   ok('disks: an absent marker (old daemon) renders the cell exactly as before', old === fresh, old)
 }
 
+// ============================================================================
+//  Share Users (identity.1) — mixed-case names, need-gated confirm-gated
+//  delete on both grids, and the private-group label
+// ============================================================================
+
+const USER_ROWS = [
+  { name: 'Alice', uid: 1000, fullName: 'Alice Example', primaryGroup: 'users', groups: ['users', 'smbusers'], smbEnabled: true, locked: false, local: true },
+  { name: 'aduser', uid: 6000, fullName: null, primaryGroup: null, groups: [], smbEnabled: false, locked: false, local: false },
+]
+const GROUP_ROWS = [
+  // A pre-existing user-private group (identity.1c): the same name as user
+  // `Alice`, whose primary gid is this group.
+  { name: 'alice', gid: 2000, members: ['Alice'], local: true, privateGroupOf: 'Alice' },
+  { name: 'smbusers', gid: 1001, members: ['Alice', 'backup-svc'], local: true },
+  { name: 'adgroup', gid: 6001, members: ['aduser'], local: false },
+]
+const USER_ROUTES = {
+  'GET /identity/users': { data: USER_ROWS },
+  'GET /identity/groups': { data: GROUP_ROWS },
+}
+
+async function openUsersView(routes = USER_ROUTES) {
+  const ANAS = loadSource('80-users.js', routes)
+  const view = makeComponent(ANAS.views.users.factory('harness'), null)
+  const usersGrid = view.down('#usersGrid')
+  const groupsGrid = view.down('#groupsGrid')
+  usersGrid.fireEvent('afterrender', usersGrid)
+  groupsGrid.fireEvent('afterrender', groupsGrid)
+  await settle()
+  return { view, usersGrid, groupsGrid }
+}
+
+async function shareUsersChecks() {
+  const { usersGrid, groupsGrid } = await openUsersView()
+  ok('users: both grids exist', !!usersGrid && !!groupsGrid)
+  eq('users: the user rows loaded', usersGrid.getStore().getCount(), USER_ROWS.length)
+  eq('groups: the group rows loaded', groupsGrid.getStore().getCount(), GROUP_ROWS.length)
+
+  // --- (a) the client-side name rule mirrors the schema: mixed case legal ---
+  jobs.length = 0
+  warnings.length = 0
+  findCmp(usersGrid, 'anas-btn-user-add').handler(null)
+  await settle()
+  let win = openWindow()
+  ok('create: the New User dialog opened', !!win && !!win.down('#name'))
+  if (win) {
+    const nameField = win.down('#name')
+    // The FIELD regex and the submit-handler regex are the same constant —
+    // assert the constant through the field config.
+    ok('create: the name rule accepts a mixed-case name', nameField.regex.test('Alice') === true)
+    ok('create: the name rule still rejects a leading digit', nameField.regex.test('9bad') === false)
+    ok('create: the name rule still rejects a leading dash', nameField.regex.test('-x') === false)
+    ok('create: the name rule accepts a trailing $', nameField.regex.test('machine$') === true)
+    ok('create: the field hint no longer says lowercase', !/lowercase/i.test(nameField.regexText), nameField.regexText)
+
+    // The submit gate: an invalid name alerts (the NEW wording) and sends nothing.
+    nameField.setValue('9bad')
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    ok('create: an invalid name sends nothing', jobs.length === 0, JSON.stringify(jobs))
+    ok('create: it alerts with the mixed-case wording',
+      warnings.some(w => /Enter a valid username \(letters, digits, _ and -\)/.test(w)),
+      JSON.stringify(warnings))
+
+    // …and a mixed-case name does send, verbatim.
+    nameField.setValue('Alice')
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create: a mixed-case name POSTs verbatim',
+      [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path, jobs[0] && jobs[0].body],
+      ['post', '/identity/users', { name: 'Alice' }])
+    if (!win.destroyed) { win.close() }
+  }
+
+  // The group dialog carries the same rule and its own message.
+  jobs.length = 0
+  warnings.length = 0
+  created.windows.length = 0
+  findCmp(groupsGrid, 'anas-btn-group-add').handler(null)
+  await settle()
+  win = openWindow()
+  ok('group create: the dialog opened', !!win && !!win.down('#name'))
+  if (win) {
+    const gname = win.down('#name')
+    ok('group create: the name rule accepts a mixed-case name', gname.regex.test('Media') === true)
+    ok('group create: the field hint no longer says lowercase', !/lowercase/i.test(gname.regexText), gname.regexText)
+    gname.setValue('9bad')
+    win.buttonCmps.find(b => b.cls === 'anas-btn-group-create-submit').handler(null)
+    await settle()
+    eq('group create: an invalid name sends nothing', jobs.length, 0)
+    ok('group create: it alerts with the mixed-case wording',
+      warnings.some(w => /Enter a valid group name \(letters, digits, _ and -\)/.test(w)),
+      JSON.stringify(warnings))
+    if (!win.destroyed) { win.close() }
+  }
+
+  // --- (c) the private-group label on the group Name cell -------------------
+  const nameCol = groupsGrid.columns.find(c => c.dataIndex === 'name')
+  ok('groups: the Name column has the private-group renderer', !!nameCol && typeof nameCol.renderer === 'function')
+  const privCell = nameCol.renderer('alice', {}, makeRecord(GROUP_ROWS[0]))
+  ok('groups: a private group is labelled as one', /private group of\s*Alice/.test(privCell), privCell)
+  const plainCell = nameCol.renderer('smbusers', {}, makeRecord(GROUP_ROWS[1]))
+  ok('groups: a plain group renders bare', plainCell === 'smbusers', plainCell)
+
+  // --- (d) delete: need-gated, confirm-code flow, refresh --------------------
+  // No selection: both Delete doors are dead.
+  let state = toolbarState(usersGrid, ['userDelete'])
+  ok('delete(user): no selection — Delete is disabled', state.userDelete.disabled === true)
+  // A directory user: read-only, still dead.
+  usersGrid.selectRow(1)
+  state = toolbarState(usersGrid, ['userDelete', 'userSmbpw', 'userToggle'])
+  ok('delete(user): a directory user — Delete is disabled', state.userDelete.disabled === true)
+  ok('delete(user): the other mutations stay disabled too', state.userSmbpw.disabled === true && state.userToggle.disabled === true)
+  // A LOCAL user: live.
+  usersGrid.selectRow(0)
+  state = toolbarState(usersGrid, ['userDelete'])
+  ok('delete(user): a local user — Delete is enabled', state.userDelete.disabled === false)
+
+  jobs.length = 0
+  apiGets.length = 0
+  usersGrid.down('#userDelete').handler(usersGrid.down('#userDelete'))
+  await settle()
+  eq('delete(user): exactly one request', jobs.length, 1)
+  eq('delete(user): it DELETEs the selected user',
+    [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path],
+    ['del', '/identity/users/Alice'])
+  ok('delete(user): it goes through the CONFIRM-CODE flow (confirmAndRun), not a plain job',
+    jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === false,
+    JSON.stringify(jobs[0] || {}))
+  ok('delete(user): the grids REFRESH after the job is accepted',
+    apiGets.includes('/identity/users') && apiGets.includes('/identity/groups'),
+    JSON.stringify(apiGets))
+
+  // The group door: local row live, directory row dead.
+  groupsGrid.selectRow(2)
+  state = toolbarState(groupsGrid, ['groupDelete'])
+  ok('delete(group): a directory group — Delete is disabled', state.groupDelete.disabled === true)
+  groupsGrid.selectRow(1)
+  state = toolbarState(groupsGrid, ['groupDelete'])
+  ok('delete(group): a local group — Delete is enabled', state.groupDelete.disabled === false)
+
+  jobs.length = 0
+  groupsGrid.down('#groupDelete').handler(groupsGrid.down('#groupDelete'))
+  await settle()
+  eq('delete(group): exactly one request', jobs.length, 1)
+  eq('delete(group): it DELETEs the selected group',
+    [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path],
+    ['del', '/identity/groups/smbusers'])
+  ok('delete(group): it goes through the confirm-code flow too',
+    jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === false,
+    JSON.stringify(jobs[0] || {}))
+}
+
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
@@ -8493,6 +8653,11 @@ await scrubToolbarRepairChecks()
 warnings.length = 0
 created.windows.length = 0
 await disksStaleHealthChecks()
+// Share Users (identity.1) — mixed-case name rule, need-gated confirm-gated
+// delete on both grids, and the private-group label.
+warnings.length = 0
+created.windows.length = 0
+await shareUsersChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

@@ -343,10 +343,12 @@ One generic endpoint backing directory pickers and gentle path validation across
 | `GET` | `/v1/users/:uid` | User detail | `200` |
 | `PUT` | `/v1/users/:uid` | Modify a user | `202` with job |
 | `PUT` | `/v1/users/:uid/smbpassword` | Set/update SMB password | `202` with job |
+| `DELETE` | `/v1/identity/users/:name` | Remove a LOCAL share user (confirm-gated; a hard `409` when a share/ACL references it, or when it is directory-provided) — `userdel` without `-r`: its files keep their uid; the SMB passdb entry is removed if present | `202`/`409` with job |
 | `GET` | `/v1/groups` | List groups | `200` |
 | `POST` | `/v1/groups` | Create a group | `202` with job |
 | `GET` | `/v1/groups/:gid` | Group detail | `200` |
 | `PUT` | `/v1/groups/:gid` | Modify a group (members) | `202` with job |
+| `DELETE` | `/v1/identity/groups/:name` | Remove a LOCAL group (confirm-gated; hard `409`s: `primary-group-in-use` when it is a local user's primary group, and `referenced-by-share` when a share/ACL names it) | `202`/`409` with job |
 
 #### Jobs
 
@@ -632,7 +634,7 @@ The base three principals (owner / owning-group / everyone) are **mode bits** (`
 
 ### Identity — share users & groups (Epic 8)
 
-Users/groups are read **only** via `getent`/nsswitch (source-agnostic — local, LDAP, AD all surface the same; NEVER parse `/etc/passwd`). ANAS creates only **share** identities: no login shell, no Unix password (`useradd -M -s /usr/sbin/nologin`) — they exist to own files (uid/gid → NFS) and optionally hold an SMB password (Samba passdb). They cannot log into the box or PVE. Directory-provided users are read-only here (provisioned in AD/LDAP — Epic 14). All mutations are jobs.
+Users/groups are read **only** via `getent`/nsswitch (source-agnostic — local, LDAP, AD all surface the same; NEVER parse `/etc/passwd`). ANAS creates only **share** identities: no login shell, no Unix password, and no user-private group (`useradd -N -M -s /usr/sbin/nologin`) — they exist to own files (uid/gid → NFS) and optionally hold an SMB password (Samba passdb). They cannot log into the box or PVE. Directory-provided users are read-only here (provisioned in AD/LDAP — Epic 14). All mutations are jobs.
 
 | Operation | Command |
 |-----------|---------|
@@ -640,11 +642,13 @@ Users/groups are read **only** via `getent`/nsswitch (source-agnostic — local,
 | `identity.groups` | `getent group` |
 | `identity.user.local` | `getent -s files passwd <name>` (manageable vs directory) |
 | `identity.smb.list` | `pdbedit -L` (which users have an SMB passdb entry) |
-| `identity.user.add` | `useradd -M -s /usr/sbin/nologin [-c <gecos>] [-G <groups>] <name>` |
+| `identity.user.add` | `useradd -N -M -s /usr/sbin/nologin [-c <gecos>] [-G <groups>] <name>` (`-N`: no user-private group) |
 | `identity.user.disable` | `usermod --lock --expiredate 1 <name>` + `smbpasswd -d <name>` |
 | `identity.user.enable` | `usermod --unlock --expiredate '' <name>` + `smbpasswd -e <name>` |
+| `identity.user.delete` | `userdel <name>` (no `-r` — its files keep their uid) + `smbpasswd -x <name>` (only if a passdb entry exists) |
 | `identity.group.add` | `groupadd <name>` |
 | `identity.group.members` | `gpasswd -a` / `gpasswd -d <user> <group>` |
+| `identity.group.delete` | `groupdel <name>` |
 | `identity.smbpasswd.set` | `smbpasswd -a -s <name>` (password on stdin, never argv) |
 | `identity.smbpasswd.clear` | `smbpasswd -x <name>` |
 
