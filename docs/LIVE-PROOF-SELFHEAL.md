@@ -1471,3 +1471,96 @@ recently written stripe reads its own cache on this kernel and reported `mismatc
 the member, so the parity group is computed from direct member-row reads with md's number as
 corroboration; the engine re-ran the selfheal.2 suite on the node afterwards at **49/49 cases, 18/18
 negative controls** (`test/self-heal/suite/LAST-RUN-engine.md`).
+
+### `selfheal.11` — Reconcile mirror (2026-09-15, kernel 7.0.14-17-pve)
+
+Driven end to end through the REAL API on the stunt node, on an AHR pool ANAS created for the
+purpose: two 2 GiB virtio SCSI spares (`ANAS_HOT20`/`21`) hot-attached, `tier: ahr1` → **one RAID1
+band**, `/dev/md/sh11-r1` over `/dev/sdb1` and `/dev/sdc1`. Every call went to the daemon on
+`/run/anas/anasd.sock` with the identity headers and the `x-anas-confirm` retry; every verdict below
+was checked against the system's own truth — `/proc/mdstat`, `/sys/block/md127/md/*`, O_DIRECT reads
+of the member partitions, and `dmesg` — never against the API's own answer. The pool was created,
+exercised and destroyed through the API and the spares detached afterwards.
+
+**The rot was placed where the verb is actually needed.** md's read-balance is not contractual, so
+the injector asked instead of assuming: corrupt one leg, cold-read block 300 through btrfs (a
+single-device btrfs has one copy and cannot retry, so an EIO means md served the rotten leg).
+
+```
+rot on /dev/sdb1: cold read EIO => md served the ROTTEN leg
+rot now on leg 1 (/dev/sdc1); md serves leg 0
+cold read of block 300 through btrfs: MATCH
+```
+
+So the rot sat on the leg md does NOT serve — the residual case the story names, where a scrub reads
+the good copy, finds nothing, and the band stays mismatched.
+
+**The scrub produced exactly the evidence the verb gates on** (`POST /v1/ahr/sh11/scrub`):
+
+```
+{"scrubbed": "sh11", "btrfsErrors": null, "checkedArrays": 1, "bandsChecked": ["sh11-r1"],
+ "parityMismatches": [{"band": "sh11-r1", "bandIndex": 1, "array": "/dev/md/sh11-r1",
+                       "mismatchCnt": 128, "level": "raid1"}]}
+```
+
+`mismatchCnt: 128` for one rotted 4 KiB block is GT-22's mirror unit, and `level: "raid1"` is what
+makes the mirror verb reachable and Rewrite parity refused.
+
+**The confirm gate** (`POST /v1/ahr/sh11/mirror-reconcile {"band":1}` → 409 +
+`X-Anas-Confirm-Code`) carried all seven warnings: both arms and their cost, the rows left exactly as
+they are, the row neither leg can satisfy, that the pool stays online and undegraded, that md's own
+repair is not used and must not be run by hand, and that it is never automatic.
+
+**The job** (202 → completed) fell through to arm B, as constructed:
+
+```
+{"pool": "sh11", "band": 1, "array": "/dev/md/sh11-r1", "arm": "compare",
+ "passes": [{"corrected": 0, "mismatchAfter": 128}],
+ "rowsCompared": 523003, "rowsDiffering": 1, "rowsWritten": {"leg0": 1, "leg1": 0},
+ "freeSpaceRows": 0, "uncheckedRows": 0, "unresolvedRows": 0,
+ "mismatchBefore": 128, "mismatchAfter": 0, "outcome": "reconciled",
+ "durations": {"scrubMs": 19, "compareMs": 81317, "checkMs": 32140, "totalMs": 113584}}
+```
+
+Arm A's pass corrected nothing and the whole-band check still read 128, so arm A stopped after ONE
+pass rather than re-rolling the same coin flip; arm B then compared all 523,003 rows of both legs,
+found the single differing row, arbitrated it against the checksum btrfs stored for it, and wrote
+leg 0's copy back THROUGH md.
+
+**Verified against the system, not the API:**
+
+```
+leg 0 (/dev/sdb1) block 300: MATCH sha=09ea0ad8bcbcbfdc
+leg 1 (/dev/sdc1) block 300: MATCH sha=09ea0ad8bcbcbfdc
+independent whole-band md check: mismatch_cnt = 0
+cold read of block 300 through btrfs: MATCH
+```
+
+md wrote both legs, as it does. And the invariant, on the kernel's own record for this array across
+the whole run — `dmesg` was cleared before it started:
+
+```
+md: resync of RAID array md127     md: md127: resync done.
+md: check of RAID array md127      md: md127: check done.      (×4)
+```
+
+Four checks (the scrub's phase 1, arm A's, the verb's verifying one, and the independent one) and
+**no `md: repair of RAID array` line at all**. Teardown through the API left nothing behind.
+
+**Verdict: PROVEN**, with one finding.
+
+#### F1 — the confirm gate's arm-B estimate was 2.4× optimistic (FIXED)
+
+The gate promised *"2.0 GiB per leg, about 34 s at a deliberately conservative 60 MiB/s, so real
+disks usually finish sooner"*. It took **81.3 s** — 26 MiB/s per leg. The 60 MiB/s figure is the
+parity rewrite's disk-sequential floor, and it is the right number for arm A, where btrfs does the
+reading. Arm B's reads go through ANAS's own path (`readDirect`: `dd | base64` per window, decoded
+in the daemon), and THAT is the limit, not the platters — so the disks finishing sooner was never
+going to happen. On a 20 TB leg the difference is 97 hours promised against ~240 measured, which is
+the kind of estimate the parity rewrite's own note says must not ship.
+
+Arm B now has its own rate (`MIRROR_COMPARE_RATE_BYTES_S`, 20 MiB/s — set BELOW the measurement so
+the number is a ceiling), and the warning says what the limit is: *"That rate is ANAS's own read
+path rather than the disks': measured at 26 MiB/s per leg on a live pool, and estimated here at
+20 MiB/s so the number is a ceiling on the wait."* At that rate a 20 TB leg reads in about twelve
+days, which is why arm A runs first and why the operator sees the number before agreeing to it.

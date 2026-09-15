@@ -19,6 +19,7 @@ never the ANAS install, never `/dev/sda*` or `/dev/zd*`.
 | 5 | above-md rot (junk written THROUGH md, parity agrees): pre-check diagnoses it, exit 3, `precheck_mismatch == 0`, and the nothing-written claim is proven on disk (5-disk, run regardless of the exit): the rot's bytes are exactly the injector's (undisturbed) and no member sector changed outside measured btrfs housekeeping — md's super region, the tx-probe's measured superblock-mirror blocks, non-DATA chunk ranges; a copy of the junk at any offset fails as CONTENT, whitelist included | 5-neg: below-md rot in the same file repairs normally, not exit 3 |
 | 6 | RAID1 (2 legs, GT-16: no `rmw_level`, no `stripe_cache_size`, `chunk_size` reads 0): corrupt the marker block on ONE leg behind md — the signature is on BOTH legs, the injector picks one hit and records which — repair must exit 0 and the block must read back correct on BOTH legs afterwards (md writes every leg); post-repair cold snapshot read matches | 6-neg, AFTER the repair (deterministic leg observability): the repair restored the original bytes, so the signature is back on every leg; the control corrupts one leg behind md and FAILS THE OTHER — with only the corrupt leg left, md has no choice but to serve it, and the cold btrfs read of the block MUST EIO (stored csum vs the junk). The EIO is asserted, not recorded; the failed leg is re-added and the rebuild waited out |
 | 7 | **Two-band rig — the AHR pool shape (review finding R1).** Two md arrays (bands) as the PVs of one VG, one LV spanning both in band order with DIFFERENT chunks on purpose (band A RAID5 6×200 MiB @ 64K, band B RAID5 4×200 MiB @ 512K) — the LV is a linear concatenation, and the segment that owns each byte comes from the dm table, never from one array's geometry. The rig is filled past segment 1 until a marker block lands in segment 2 (band B); corrupt that block on its member (the oracle scans the members of BOTH arrays and records which one it hit) and repair: exit 0 using band B's OWN geometry, the member block reads back the original, an evicted bounded check over band B's stripe reads 0, cold snapshot read matches. The assertion R1 exists to be caught by runs REGARDLESS of the repair's exit: no DATA write on band A — the repair's own snapshot commits a btrfs transaction whose superblock/metadata writes can all sit in segment 1, so every changed band-A 4K block is mapped back to its LV byte through band A's geometry and must fall in md's superblock region, a measured superblock-mirror block, or a SYSTEM/METADATA chunk stripe. The mirrors are measured by the tx-probe (7-txprobe): the suite runs the SAME transaction the repair runs (RO snapshot create + delete) before the baseline and records the band-A blocks it writes — a measured block inside a DATA chunk FAILS the suite (the assertion would have a blind spot). A second, classification-independent assertion guards the whitelist itself: the range whitelist is hundreds of MiB of legitimate housekeeping, and a wrong-band write of the repair's CANDIDATE landing in it would be carved out and pass — so no changed band-A 4K block may be a byte-for-byte copy of the candidate (the candidate a correct repair writes is exactly the original block), counted as CONTENT and failing wherever it landed, whitelist included | 7-neg: a marker in segment 1 (band A) repairs normally — both segments of the concatenated LV are reachable, so the segment-2 repair is not a rig fluke; 7-neg2: the post-repair cold snapshot read of the segment-1 block matches |
+| 9a / 9b / 9-neg | **Reconcile mirror (selfheal.11), on a RAID1 rig of its own.** md counts DISAGREEING LEGS and btrfs reads through md, so what the checksum pass sees depends on which leg md's read-balance served. The suite does not assume that: `_place_rot` corrupts one leg, asks md (a cold single-block read through btrfs EIOs only when md served the rotten copy — a single-device btrfs has one copy and cannot retry), and if the answer is the wrong way round it restores that leg and corrupts the other. **9a** puts the rot on the leg md SERVES — the ordinary scrub then heals the whole band through md (GT-22 UNEXPECTED(1)) — and **9b** puts it on the leg md does NOT serve, with arm A held to one pass (`--passes 1`) so the fall-through to compare-legs is deterministic rather than a second roll of the read-balance. Both assert the same implementation-agnostic facts: exit 0 / `reconciled`, BOTH legs holding the original block afterwards (md writes every leg), and an independent whole-band check reading 0; 9b additionally asserts that exactly ONE row was written and that it came from the leg that matched. Which ARM answered is recorded, not asserted — the reference `MIRROR_CMD` is compare-legs only | 9-neg: rot on BOTH legs with DIFFERENT junk. Neither copy satisfies the stored checksum, so there is nothing to arbitrate and NOTHING may be written — writing either leg would be the coin flip `mdadm --action=repair` makes. The verb must exit 2 with `residual`, `unresolved_rows: 1` and `rows_written` all zero, and both legs must still be byte-identical to the junk that was injected. **Every case-9 row also asserts the epic's invariant against the KERNEL's own log** — md announces `md: repair of RAID array mdN` when it takes a repair (captured on the node, kernel 7.0.14-17-pve), so the assertion holds for any implementation rather than for one verb's source |
 | 8 | **Parity rewrite (selfheal.10), on a rig of its own.** P-MEMBER rot in GT-18's shape: the PARITY member's stripe row is junked behind md while every data member is left alone — btrfs sees nothing, a bounded md check counts 8, and the file still reads MATCH. The verb under test (`PARITY_CMD`) must run a fresh btrfs scrub, find it clean, repair the WHOLE band, check it, and report `mismatch_cnt` 0; the case then re-proves GT-18(d)'s three facts independently — an evicted bounded check over the stripe reads 0, the file still reads MATCH (against the `regen` ground truth, not an earlier read), and the parity row is once again the XOR of the data rows — and asserts the md knobs are back at their defaults. The rot's injection is asserted on disk (8-inject: the parity row's digest actually changed). The rig is its own because the verb scrubs the WHOLE filesystem and any finding aborts it, so it cannot follow case 5, which leaves its above-md rot in place by design | 8-neg: DATA-member rot — the case `md repair` gets WRONG (it would rewrite parity to match the junk and bless it, GT-18's negative). The verb must exit 3 with `data-corruption-found`, and the refusal is asserted on disk (8-neg-no-repair): `last_sync_action` unchanged AND an evicted bounded check over the stripe STILL counts the mismatch (the parity was not rewritten to match the junk) AND the parity member's row is byte-identical to its pre-refusal digest; 8-no-evidence: the verb run with the dev-only `--assume-mismatch` stripped and no `--evidence` file must exit 3 with `no-parity-mismatch` and issue no md action (the evidence gate) |
 
 Each case records its verdict and a detail line; the final line of the report
@@ -43,6 +44,13 @@ REPORT_NAME=LAST-RUN-engine.md test/self-heal/suite/run-suite.sh
 # remains as the dev bypass (8-no-evidence strips it and passes no file).
 PARITY_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-parity.js" \
 REPORT_NAME=LAST-RUN-parity.md test/self-heal/suite/run-suite.sh
+
+# the ANAS mirror reconcile (selfheal.11) — the case-9 verb. No flag: the
+# suite writes the evidence file from its own whole-band check and passes it
+# as `--evidence`, and case 9b passes `--passes 1` so arm A's fall-through to
+# compare-legs is deterministic.
+MIRROR_CMD="node /opt/anas/packages/daemon/dist/bin/selfheal-mirror.js" \
+REPORT_NAME=LAST-RUN-mirror.md test/self-heal/suite/run-suite.sh
 ```
 
 `run-suite.sh` rsyncs this directory (+ `../gt/lib.sh`, `../gt/00-rig.sh` and
@@ -59,6 +67,26 @@ the ssh boundary explicitly — ssh carries no environment of its own.
 Requires on the node: python3, mdadm, lvm2, btrfs-progs, ~5 GB free under
 `/root`, and 10 loop devices (the two-band rig uses 6+4; the rigs are torn
 down between runs, so never more than one rig's loops at a time).
+
+`btrfs scrub status`'s error breakdown, which arm A reads its progress from, was
+captured on the node (btrfs-progs v6.14, 2026-09-15) and is printed only when a
+pass was not clean:
+
+```
+Error summary:    csum=1
+  Corrected:      1
+  Uncorrectable:  0
+  Unverified:     0
+```
+
+So is md's own announcement of a sync operation, which the case-9 rows assert
+the epic's invariant against (kernel 7.0.14-17-pve, same day, on a 2 × 200 MiB
+loop RAID1):
+
+```
+md: check of RAID array md127     md: md127: check done.
+md: repair of RAID array md127    md: md127: repair done.
+```
 
 ## REPAIR_CMD contract
 
@@ -125,14 +153,57 @@ refusal and that no md action was issued. `parity-ref.py` requires
 `--evidence` (it has no bypass) and accepts and ignores unknown flags, so one
 `PARITY_CMD` string runs against either implementation.
 
+## MIRROR_CMD contract (cases 9a/9b/9-neg, story selfheal.11)
+
+The suite calls `${MIRROR_CMD:-python3 <suite dir>/mirror-ref.py}` as
+
+```
+<cmd> [--evidence <file>] [--passes N] <mountpoint> <band>
+```
+
+— a BAND index, 1-based, in dm-table order, exactly as `PARITY_CMD`.
+
+Exit codes: `0` reconciled · `2` residual · `3` refused · `1` internal error.
+
+`MIRROR_REPORT=<path>` writes a JSON sidecar. The suite reads `outcome`,
+`reason`, `reason_code`, `arm`, `passes`, `rows_compared`, `rows_differing`,
+`rows_written` (`{leg0, leg1}`), `free_space_rows`, `unchecked_rows`,
+`unresolved_rows`, `mismatch_before`, `mismatch_after` and `array`.
+
+The EVIDENCE GATE is the parity verb's, one story along: a rig has no daemon and
+no job queue, so `--evidence <file>` (a JSON `{"mismatch_cnt": N}` with N > 0,
+written by the suite from its own whole-band check) stands in for "the pool's
+last completed scrub counted disagreeing legs on this band". With no such file
+the verb must refuse — exit 3, `no-mirror-mismatch` — before touching anything.
+There is no `--assume-mismatch` equivalent here: the suite always produces the
+file, so no bypass was ever needed.
+
+`--passes N` bounds arm A ("scrub until clean"). It is a TEST knob and not a
+bypass: case 9b holds arm A to one pass so the fall-through to arm B is
+deterministic instead of depending on whether md's read-balance served the
+rotten leg a second time. Every gate, both arms and the verifying whole-band
+check run exactly as they do in the job. `mirror-ref.py` is COMPARE-LEGS ONLY
+and accepts `--passes` in order to ignore it — a reference that also ran arm A
+would make the cases prove the same thing twice and would hide arm B behind a
+coin flip.
+
+**The invariant:** no implementation may issue `mdadm --action=repair` on the
+band. On a mirror it copies the first in-sync leg over the other without looking
+at which one is right (GT-22(f)). Every case-9 row asserts this against the
+KERNEL's log — md announces `md: repair of RAID array mdN` when it takes a
+repair — so it holds for any `MIRROR_CMD`, not only for one whose source the
+suite can read.
+
 ## Implementations that have passed
 
 | REPAIR_CMD | report | result |
 |---|---|---|
-| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 49/49 cases, 18/18 controls (2026-09-14, node re-run of the hardened suite on kernel 7.0.14-17) |
+| `python3 repair-ref.py` (the reference) | `LAST-RUN.md` | 61/61 cases, 22/22 controls (2026-09-15, node re-run with the case-9 rig on kernel 7.0.14-17) |
 | `python3 parity-ref.py` (the reference parity rewrite) | — | case 8 + its controls ride in `LAST-RUN.md` (the suite runs a `PARITY_CMD` in every full run) |
-| `node …/daemon/dist/bin/selfheal-parity.js` (the ANAS parity rewrite, selfheal.10, flag-less — the suite's `--evidence` gate) | `LAST-RUN-parity.md` | 49/49 cases, 18/18 controls (2026-09-14, node re-run on kernel 7.0.14-17) |
-| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 49/49 cases, 18/18 controls (2026-09-14, node re-run on kernel 7.0.14-17; first passed 2026-09-13 with case 7 on the two-band rig) |
+| `python3 mirror-ref.py` (the reference mirror reconcile, compare-legs only) | — | cases 9a/9b + `9-neg` ride in `LAST-RUN.md` (the suite runs a `MIRROR_CMD` in every full run) |
+| `node …/daemon/dist/bin/selfheal-parity.js` (the ANAS parity rewrite, selfheal.10, flag-less — the suite's `--evidence` gate) | `LAST-RUN-parity.md` | 61/61 cases, 22/22 controls (2026-09-15, node re-run on kernel 7.0.14-17) |
+| `node …/daemon/dist/bin/selfheal-repair.js` (the ANAS engine, selfheal.5) | `LAST-RUN-engine.md` | 61/61 cases, 22/22 controls (2026-09-15, node re-run on kernel 7.0.14-17; first passed 2026-09-13 with case 7 on the two-band rig) |
+| `node …/daemon/dist/bin/selfheal-mirror.js` (the ANAS mirror reconcile, selfheal.11) | `LAST-RUN-mirror.md` | 61/61 cases, 22/22 controls (2026-09-15, node run on kernel 7.0.14-17 — 9a answered in arm A (`corrected: 1`, check 0), 9b in arm B (50944 rows compared, one written from the leg that matched), 9-neg `residual` with nothing written) |
 
 The 2026-09-14 node re-run was the first run of the suite AS the vacuity
 review left it (5-disk, 8-neg-no-repair, 8-no-evidence, the asserted 3-map and
@@ -331,9 +402,23 @@ correctness on a rig:
   populated rig: the live supers plus metadata tree blocks, always
   0 in a DATA chunk — a probe hit inside one fails 7-txprobe, because the
   R1 assertion would then have a blind spot). The measured count still
-  varies per run (27–52 blocks: the metadata-tree tail of the transaction
-  depends on tree state), which is expected — the set is re-measured every
-  run, never assumed.
+  varies per run (27–52 blocks originally, 100–132 in the 2026-09-15 runs:
+  the metadata-tree tail of the transaction depends on tree state), which is
+  expected — the set is re-measured every run, never assumed.
+  **Whitelist gap found and closed (2026-09-15, reproduced twice):** the
+  repair's own transaction rewrote band A's PRIMARY btrfs superblock at
+  LV 65536 while the probe's transaction had not, so that one block fell
+  outside the measured set and `7-bandA-untouched` reported `data=1` on a byte
+  that is a superblock by definition. `content=0` held in both runs — the
+  classification-independent half of the assertion, and the one that would
+  catch a wrong-band write of the candidate — so nothing was ever wrong on
+  disk. The probe's limit is structural: it measures which mirrors ONE
+  transaction rewrites, and that does not bound the next one. So
+  `classify_member_changes` now also counts btrfs's FIXED superblock offsets
+  (`BTRFS_SUPER_OFFSETS` — 64 KiB, 64 MiB, 256 GiB, 1 PiB) as housekeeping.
+  They are fixed by the on-disk format and a superblock is never inside a
+  chunk, so a byte at one of them can never be file data; the measured set
+  still governs everything else, and the CONTENT check runs first.
 - **The two-band rig's LV is a linear concatenation, read from the dm table.**
   `dmsetup table <LV>` gives one `linear` segment per band (band order), each
   with its own start sector into the band array; `common.dm_segments` parses
@@ -365,6 +450,11 @@ correctness on a rig:
 - `parity-ref.py` — the reference parity rewrite (evidence gate → fresh btrfs
   scrub → whole-band `mdadm --action=repair` → whole-band check →
   `mismatch_cnt` 0); the default `PARITY_CMD`.
+- `mirror-ref.py` — the reference mirror reconcile, COMPARE-LEGS ONLY (evidence
+  gate → read both legs row by row → reverse chunk hop → arbitrate against the
+  stored csum, or against a tree node's own header csum → write the winner
+  THROUGH md → whole-band check → `mismatch_cnt` 0); the default `MIRROR_CMD`.
+  It never issues `mdadm --action=repair`.
 - `oracle.py` — THE INJECTOR: raw signature scan of the member devices,
   flip-test disambiguation, junk writes. Shares NO code with the mapping
   helper (harness rule) — locating bytes via `common.locate_block` is

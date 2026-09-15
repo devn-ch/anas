@@ -7,7 +7,10 @@ Builds a RAID5 rig (6 members), runs the cases that need it, tears it down,
 builds a RAID6 rig (7 members), runs the parity cases there, tears down; the
 hardening round adds a 512 KiB-chunk RAID5 rig (the AHR band shape — the
 parity case only, proving no chunk is hardcoded, F4) and a 2-member RAID1 rig
-for case 6 (GT-16: RAID1 has no stripe knobs at all). Then it writes
+for case 6 (GT-16: RAID1 has no stripe knobs at all); selfheal.11 adds a SECOND
+2-member RAID1 rig for the mirror-reconcile cases, because case 6's control
+leaves a fresh rot propagated across both legs and every arm-A scrub would trip
+over it. Then it writes
 report.md + report.json under /root/gtsh/suite-out/ and prints the final
 `SUITE: ...` line. Exit 0 iff every case AND every negative control passed.
 
@@ -49,6 +52,13 @@ RIG5_FILES = [("c1", "random", 8 * 1024 * 1024, 1, [300, 1500]),
 RIG5X_FILES = [("c1", "random", 16 * 1024 * 1024, 1, [300, 1500])]
 RIG6_FILES = [("r1", "random", 8 * 1024 * 1024, 1, [300, 1000, 1400, 1900])]
 RIG1_FILES = [("l1", "random", 4 * 1024 * 1024, 7, [300])]
+# Case 9 (selfheal.11) gets a RAID1 rig of its own: its arms re-scrub the WHOLE
+# filesystem, and case 6's control deliberately leaves a fresh rot propagated
+# across both legs. One marker file per case row so a case never measures the
+# band another one left behind.
+RIG9_FILES = [("m1", "random", 4 * 1024 * 1024, 13, [300]),
+              ("m2", "random", 4 * 1024 * 1024, 14, [300]),
+              ("m3", "random", 4 * 1024 * 1024, 15, [300])]
 # Case 8 (selfheal.10) gets a rig of its own: the verb scrubs the WHOLE
 # filesystem and any finding aborts it, so it cannot follow cases that leave
 # unrepaired rot behind (case 5's above-md block, by design).
@@ -89,6 +99,12 @@ def case_fn(cid: str, ctx, rec: Recorder, level: int) -> None:
         return C.case8_parity_rewrite(ctx, rec)
     if cid == "8-neg":
         return C.control8_data_rot_refused(ctx, rec)
+    if cid == "9a":
+        return C.case9a_mirror_scrub(ctx, rec)
+    if cid == "9b":
+        return C.case9b_mirror_compare(ctx, rec)
+    if cid == "9-neg":
+        return C.control9_both_legs(ctx, rec)
     raise KeyError(cid)
 
 
@@ -238,6 +254,8 @@ def meta() -> dict:
                       f"python3 {GT}/suite/repair-ref.py",
         "parity_cmd": os.environ.get("PARITY_CMD") or
                       f"python3 {GT}/suite/parity-ref.py",
+        "mirror_cmd": os.environ.get("MIRROR_CMD") or
+                      f"python3 {GT}/suite/mirror-ref.py",
     }
 
 
@@ -257,9 +275,11 @@ def write_report(rec: Recorder, notes: list[str]) -> tuple[str, str, bool]:
         f"- mdadm: {m['mdadm']}  btrfs-progs: {m['btrfs_progs']}",
         f"- REPAIR_CMD: `{m['repair_cmd']}`",
         f"- PARITY_CMD: `{m['parity_cmd']}`",
+        f"- MIRROR_CMD: `{m['mirror_cmd']}`",
         "- rigs: RAID5 (6 × 200 MiB loops), RAID6 (7 × 200 MiB loops),"
         " RAID5 at md's 512 KiB chunk (6 × 200 MiB loops, parity case only),"
-        " RAID1 (2 × 200 MiB loops), a second RAID5 rig for the parity-rewrite"
+        " RAID1 (2 × 200 MiB loops), a second RAID1 rig for the mirror-reconcile"
+        " cases, a second RAID5 rig for the parity-rewrite"
         " case, and the two-band AHR shape (RAID5"
         " 6 × 200 MiB @ 64K + RAID5 4 × 200 MiB @ 512K in one VG/LV, case 7)"
         " — built fresh per run, torn down after"
@@ -317,6 +337,13 @@ def main() -> int:
         # reads 0 — case 6 with its negative control
         ("RAID1", lambda: run_rig(1, rec, notes, files=RIG1_FILES,
                                   cases=("6",))),
+        # selfheal.11: the mirror reconcile's two arms and its negative
+        # control, on a RAID1 rig of their own — case 6's control leaves a
+        # fresh rot propagated across both legs, which every arm-A scrub here
+        # would trip over.
+        ("RAID1 mirror", lambda: run_rig(1, rec, notes, tag="r1m",
+                                         files=RIG9_FILES,
+                                         cases=("9a", "9b", "9-neg"))),
         # selfheal.10: P-member rot — the one shape `md repair` is right for —
         # and its negative control, data-member rot, which the verb must refuse
         # rather than bless (GT-18)

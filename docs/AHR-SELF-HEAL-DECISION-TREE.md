@@ -102,7 +102,7 @@ every entry on it is a fault where a restore is the only action left.
 | R6 | compressed-extent rot | 33 | 2 | 0 | 1 |
 | R7 | rot in a file without checksums (NOCOW / prealloc / nodatasum) | 7 | 2 | 0 | 0 |
 | R8 | rot in an extent referenced only by a snapshot (outsideMount) | 8 | 4 | 0 | 0 |
-| R9 | mismatch on a RAID1 band (the legs disagree) | 39 | 7 | 0 | 0 |
+| R9 | mismatch on a RAID1 band (the legs disagree) | 62 | 20 | 0 | 0 |
 | R10 | member failure / degraded array before, during or after a scrub or repair | 22 | 7 | 0 | 0 |
 | R11 | URE during a rebuild (md bad-block list) | 36 | 5 | 0 | 0 |
 | R12 | daemon SIGKILL / OOM / upgrade-restart mid-repair or mid-scrub | 14 | 7 | 0 | 0 |
@@ -119,7 +119,7 @@ every entry on it is a fault where a restore is the only action left.
 | R23 | the pool's top-level mount held by a backup during a repair | 12 | 3 | 0 | 0 |
 | R24 | the operator names a path outside the pool — a symlink, a bind mount | 5 | 4 | 0 | 0 |
 
-**24 roots · 249 nodes · 58 terminal leaves · 4 with no code · 6 with no test ·
+**24 roots · 272 nodes · 71 terminal leaves · 4 with no code · 6 with no test ·
 0 orphan nodes · 58 orphan exported actions · 0 mis-applied actions.**
 
 ## The trees
@@ -919,31 +919,54 @@ flowchart TD
   P03a(["not-a-parity-band: a RAID1 mirror has no parity to recompute, and md's…"])
   E04g["RAID1: each leg read at ITS OWN data offset, a torn read retried 3×; the…"]
   E04f{"RAID1 with EVERY leg failing the stored csum"}
-  X9r[["the mirror-mismatch wording names NO verb the operator cannot reach"]]
+  X9r[["the mirror-mismatch wording names the verb that DOES apply and the one the…"]]
   E04f3(["mismatch_cnt = 0 while a DIRECT read of the legs shows they DIFFER"])
   E04f4(["mismatch_cnt &gt; 0 while the legs hold the SAME bytes"])
+  M00{"the verb's licence, taken from the newest COMPLETED scrub or repair"}
   S24[/"phase-1 warning, per band: 'rot exists in &lt;band&gt;"/]
   U02[["the parity indicator IS the door"]]
   E05a["evictStripeCache: shrink stripe_cache_size to its floor of 17, sweep ±200…"]
   E04f1{"mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows…"}
   E04f2(["mismatch_cnt &gt; 0 AND the direct read of the legs shows they differ"])
   J40(["the unrepairable bucket, advised per file: 'restore this file from backup'"])
+  M00b{"the band the request names, taken from the pool's own topology…"}
+  M01{"ARM A, 'scrub until clean' (GT-22 UNEXPECTED(1))"}
+  M10(["not-a-mirror-band: a parity band's mismatch is parity disagreeing with the…"])
+  M12(["array-busy / job-active: degraded, mid-sync, sync window still bounded…"])
+  M13(["md's own repair is refused BEFORE the process is spawned, on every door of…"])
+  M15[["the result, in the window the request was made from"]]
+  M17[["the confirm gate states both arms and their cost, that a row with no checksum…"]]
   S31["retireCheckIssued in the band loop's finally"]
   U08[["with corrupt files on the same scrub the verb is dark carrying the daemon's…"]]
   E05a2["directParityConsistent: every member's row read O_DIRECT off the MEMBER…"]
   J43{"the above-md bucket: 'parity already agreed with the bad data"}
   J50["AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort…"]
+  M01b{"a pass's progress is read from the breakdown btrfs scrub status prints…"}
+  M14(["md took an operation of its own while a whole-band check was running (a leg…"])
+  M12b(["bad-blocks-present: a leg with recorded md bad-block ranges serves EIO for…"])
+  M13b(["the guard itself THROWS rather than warning"])
   S40["phase 2/2: btrfs scrub start polled to finished"]
   E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
+  M02["a pass's whole-band check reads mismatch_cnt = 0"]
+  M03{"a pass corrects NOTHING while md still counts"}
+  M11[/"a scrub pass reported UNCORRECTABLE errors"/]
   S42{"Error summary clean: no ATTRIBUTION is read and nothing is probed"}
   E06["rmw_level = 0 on the TARGET's band for the write window"]
   J52[["the outcome is rendered back into the window the request was made from"]]
+  M04["ARM B, 'compare legs': both legs are read IN FULL with O_DIRECT at each leg's…"]
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
   E07{"reconstructionPlan: degraded re-read and each role's rd&lt;n&gt;/state…"}
+  M04b["the WHOLE chunk tree is read once, in one dump. The forward chain walks it by…"]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
   E07r5["RAID5: the one candidate is the XOR of the same stripe row on every other member"]
+  M05{"each DIFFERING row is mapped BACK up the chain - md byte to LV byte through…"}
   E08{"arbitrate: crc32c of each candidate against the stored csum, best first"}
+  M06["DATA chunk: the csum btrfs stored for that logical byte arbitrates. crc32c…"]
+  M07["METADATA or SYSTEM chunk: btrfs stores no EXTENT_CSUM for a tree block - the…"]
+  M08(["nothing can arbitrate the row, and it is LEFT EXACTLY AS IT IS"])
+  M09(["BOTH legs fail the row's checksum (or both pass while holding different bytes)"])
+  M16>"arm B decided every row it could and the verifying whole-band check STILL counts"]
   E09{"read-back guard: the md offset about to be written must hold the bytes read…"}
   E10{"pre-write re-check at the LAST instant"}
   E11["write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md"]
@@ -960,12 +983,20 @@ flowchart TD
   X9 --> X9r
   X9 --> E04f3
   X9 --> E04f4
+  X9 --> M00
   S22 --> S24
   S62 --> U02
   E04g --> E05a
   E04f --> E04f1
   E04f --> E04f2
   E04f3 --> J40
+  M00 --> M00b
+  M00 --> M01
+  M00 --> M10
+  M00 --> M12
+  M00 --> M13
+  M00 --> M15
+  M00 --> M17
   S24 --> S31
   U02 --> U07
   U02 --> U08
@@ -973,18 +1004,34 @@ flowchart TD
   E04f1 --> J43
   E04f2 --> J40
   J40 --> J50
+  M01 --> M01b
+  M01 --> M14
+  M12 --> M12b
+  M13 --> M13b
   S31 --> S40
   E05a2 --> E05
   J43 --> J50
   J50 --> J51
+  M01b --> M02
+  M01b --> M03
+  M01b --> M11
   S40 --> S42
   E05 --> E06
   J51 --> J52
+  M03 --> M04
+  M11 --> M04
   S42 --> S60
   E06 --> E07
+  M04 --> M04b
   S60 --> S64
   E07 --> E07r5
+  M04b --> M05
   E07r5 --> E08
+  M05 --> M06
+  M05 --> M07
+  M05 --> M08
+  M05 --> M09
+  M05 --> M16
   E08 --> E09
   E09 --> E10
   E10 --> E11
@@ -1004,31 +1051,54 @@ flowchart TD
 | `P03a` | refusal | `not-a-parity-band`: a RAID1 mirror has no parity to recompute, and md's repair copies the first in-sync leg over the others without looking at which is right — refused FIRST, and for good | `packages/daemon/src/services/ahr-parity-rewrite.ts:mirrorBandRefusal` | `packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:REFUSES a RAID1 mirror band outright — md repair there is a coin flip on the good copy (N1)` | `GT-16` |
 | `E04g` | action | RAID1: each leg read at ITS OWN data offset, a torn read retried 3×; the failing leg is named as the member and the passing legs become the candidates | `packages/daemon/src/services/selfheal-map.ts:memberOffsetOn` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reports the FAILING leg as the member, at that leg's own offset` | `GT-16` |
 | `E04f` | decision | RAID1 with EVERY leg failing the stored csum: the bounded check is run BEFORE the verdict, because a mirror check compares the legs with each other - md's own answer to "do these legs agree?" | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:every mirror leg fails the csum (F4)` | `GT-16` |
-| `X9r` | ui | the mirror-mismatch wording names NO verb the operator cannot reach: "mirror mismatch - not yet repairable from ANAS (selfheal.11); do not run md repair on a mirror". The verb itself is story selfheal.11 - inked, not built | `packages/pve-integration/src/69-scrubs.js:MIRROR_BAND_REASON` | `packages/pve-integration/test/dialog-contracts.harness.mjs:it says there is no parity to rewrite, and names no verb the operator cannot reach` | `GT-16` |
+| `X9r` | ui | the mirror-mismatch wording names the verb that DOES apply and the one the operator must not reach for: "no parity to rewrite - the legs disagree with each other; do not run md repair on a mirror; click to reconcile the mirror". Rewrite parity stays dark on a RAID1 row and says why (story selfheal.11) | `packages/pve-integration/src/69-scrubs.js:MIRROR_BAND_REASON` | `packages/pve-integration/test/dialog-contracts.harness.mjs:it says there is no parity to rewrite, and points at the mirror verb` | `GT-16` |
 | `E04f3` | refusal | mismatch_cnt = 0 while a DIRECT read of the legs shows they DIFFER: md's cached view of this stripe was stale (GT-23), so this is not the mirror's `above-md` at all - `unrepairable` with staleCache recorded, and the restore stands | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 over legs that DIFFER: md's cached view was stale, never above-md (GT-23)` | `GT-23` |
 | `E04f4` | refusal | mismatch_cnt > 0 while the legs hold the SAME bytes: md and the direct read disagree about this stripe - `unrepairable`, nothing written, and NEVER `above-md` (which md's own count denies). No restore advice: nothing here proves the file unrecoverable | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 over legs that hold the SAME bytes: md and the direct read disagree (GT-23)` | `GT-23` |
+| `M00` | decision | the verb's licence, taken from the newest COMPLETED scrub or repair: md counted mismatches on THIS band, the band is `raid1`, and the checksum pass was clean across the pool. A row with no recorded level is refused rather than guessed at - the two mismatch verbs are not interchangeable | `packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileEvidence` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:accepts a RAID1 band the last scrub counted mismatches on, with no findings` | `GT-22` |
 | `S24` | notification | phase-1 warning, per band: "rot exists in <band> — phase 2 (running now) checks every file's checksum; if a file is affected, it will be named" | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:phase 1 rot: a mismatch_cnt > 0 warns before phase 2 starts — and phase 2 still runs` | `GT-5` |
 | `U02` | ui | the parity indicator IS the door: `anas-win-scrub-parity` lists the bands md counted mismatches on and takes ONE | `packages/pve-integration/src/69-scrubs.js:showParityMismatches` | `packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the parity indicator opens the parity window` | `GT-18` |
 | `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
 | `E04f1` | decision | mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD` | `GT-16` |
 | `E04f2` | refusal | mismatch_cnt > 0 AND the direct read of the legs shows they differ: the legs disagree with each other and neither matches the stored csum - `unrepairable`, and here a restore IS the only action left | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE` | `GT-16` |
 | `J40` | refusal | the `unrepairable` bucket, advised per file: "restore this file from backup" **[restore-from-backup-advice]** | `packages/daemon/src/services/ahr-repair.ts:RESTORE_FILE_SENTENCE` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words` | — |
+| `M00b` | decision | the band the request names, taken from the pool's own topology (`<pool>-r<n>`, its md device and its per-leg height). A band the pool does not have is a 400 that lists the bands it does, before any confirm code is minted | `packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileArray` | `packages/daemon/src/routes/__tests__/ahr-mutate.test.ts:400 on a body that names no band, and on a band the pool does not have` | — |
+| `M01` | decision | ARM A, "scrub until clean" (GT-22 UNEXPECTED(1)): an ordinary btrfs scrub that MEETS the rot heals the whole band through md - btrfs re-reads on a csum failure, md serves the other leg, and md propagates the write-back to BOTH legs. The pass is repeated up to three times because md's read-balance is not contractual, with a whole-band md check after each | `packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:stops at the first pass whose check reads 0 — the scrub healed the band through md` | `GT-22` |
+| `M10` | refusal | `not-a-mirror-band`: a parity band's mismatch is parity disagreeing with the data, and it has a verb of its own (Rewrite parity). Not a state that passes - it never becomes true for that band. The pair with `not-a-parity-band` is what carries the epic's invariant at both doors | `packages/daemon/src/services/ahr-mirror-reconcile.ts:parityBandRefusal` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a PARITY band outright — it never becomes a mirror` | `GT-18` |
+| `M12` | refusal | `array-busy` / `job-active`: degraded, mid-sync, sync window still bounded (GT-13's trap - the whole-band check is this run's only proof), or another scrub/repair/rewrite/reconcile in flight. Every one of them re-taken immediately before arm B writes anything | `packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileArrayRefusal` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a degraded band, a busy one, and one whose sync window is still bounded` | `GT-17` |
+| `M13` | refusal | md's own `repair` is refused BEFORE the process is spawned, on every door of the executor this verb uses - `exec`, `pipeline` and `execToStream` alike (GT-22(f): on a mirror it copies leg 0 blindly, and junk on leg 0 was propagated to leg 1 on the rig). The ruling is absolute, so this is a wrapper and not a convention: there is no way past it | `packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorGuardedExecutor` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:the guarded executor never lets one through, on any of its three doors` | `GT-22` |
+| `M15` | ui | the result, in the window the request was made from: which ARM answered, the counts before and after, the rows nothing could arbitrate, and - on anything but `reconciled` - that the band is NOT clean and md repair is still the wrong thing to reach for. The notification says the same, once | `packages/pve-integration/src/69-scrubs.js:showMirrorResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:the ARM that answered is named — arm A is the ordinary scrub healing it` | — |
+| `M17` | ui | the confirm gate states both arms and their cost, that a row with no checksum is LEFT EXACTLY AS IT IS, that a row neither leg satisfies is never written, that the pool stays ONLINE and undegraded throughout (the whole difference from doing it by hand with mdadm), and that md's own repair is not used and must not be run by hand either | `packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileWarnings` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:names both arms, what is left alone, and the absence of a degraded window` | `GT-22` |
 | `S31` | action | retireCheckIssued in the band loop's `finally` — the token never outlives the iteration that took it (N3) | `packages/daemon/src/services/selfheal-syncop.ts:retireCheckIssued` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:retires the token on the SKIP paths too — md never started the check (N3)` | — |
 | `U08` | ui | with corrupt files on the same scrub the verb is dark carrying the daemon's own 409 sentence, and the handler refuses a click anyway | `packages/pve-integration/src/69-scrubs.js:parityRewriteBlocked` | `packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the handler itself refuses, not just the disabled state` | `GT-18` |
 | `E05a2` | action | directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data` | `GT-23` |
 | `J43` | decision | the `above-md` bucket: "parity already agreed with the bad data — this implicates something other than the disks (memory, controller, software)", which stays an implication | `packages/daemon/src/services/ahr-repair.ts:ABOVE_MD_SENTENCE` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words` | `GT-6` |
 | `J50` | action | AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort / notExamined, always summing to the blocks attempted | `packages/daemon/src/services/ahr-repair.ts:repairAhrFiles` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:the notification names all five counts, and they add up (review R9, seventh pass F3)` | — |
+| `M01b` | decision | a pass's progress is read from the breakdown `btrfs scrub status` prints under its error summary: `Corrected` is how many blocks the scrub healed through md this time round, and `Uncorrectable` is the count that means no copy can satisfy a checksum. A clean pass prints no breakdown and both read zero | `packages/daemon/src/services/ahr-mirror-reconcile.ts:parseScrubErrorCounts` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:reads the breakdown btrfs prints under its error summary` | `GT-22` |
+| `M14` | refusal | md took an operation of its own while a whole-band check was running (a leg failing puts it into `recover`): the run walks away with every knob exactly as md left it, and reports `residual` with `foreign-sync-op`. Same waiter, same ownership rule as the parity rewrite - one place decides | `packages/daemon/src/services/ahr-parity-rewrite.ts:waitForOwnSyncOp` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:walks away when md takes an operation of its own mid-check` | `GT-13` |
+| `M12b` | refusal | `bad-blocks-present`: a leg with recorded md bad-block ranges serves EIO for them and holds no correct copy, so a row inside one cannot be read off that leg at all - and arm B's whole method is reading both legs. Replace the member first; not a wait-and-retry state | `packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorBadBlocksRefusal` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a band with recorded md bad blocks — md holds no correct copy there` | — |
+| `M13b` | refusal | the guard itself THROWS rather than warning: a run that reached this point has a bug in ANAS, and the correct outcome of that bug is a failed job - never a blessed rot. The suite asserts the same invariant on the RUN instead of on the source: md announces `md: repair of RAID array mdN` when it takes one, and no case-9 row may find that line | `packages/daemon/src/services/ahr-mirror-reconcile.ts:assertNoMdRepair` | `suite:9-neg-no-md-repair` | `GT-22` |
 | `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
 | `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
+| `M02` | action | a pass's whole-band check reads `mismatch_cnt = 0`: the legs agree again and the run stops there. `arm: scrub`, one row per pass with its `corrected` count - the cheapest arm, and the one that costs no leg read at all | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `suite:9a-reconcile` | `GT-22` |
+| `M03` | decision | a pass corrects NOTHING while md still counts: md is not serving the rotten leg to btrfs, so repeating the same coin flip proves nothing. Arm A stops at once and arm B takes over - this is the residual case the story names | `packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a pass that corrects NOTHING while md still counts stops arm A at once` | `GT-22` |
+| `M11` | notification | a scrub pass reported UNCORRECTABLE errors: the files are NAMED and the run CARRIES ON. This is the one place the mirror verb's gates differ from Rewrite parity's - that verb aborts on any finding because md repair would bless the rot, and this one writes no row it cannot prove. A file no copy can satisfy is a fact to report (and its rows come back as `unresolvedRows`), not a reason to leave the rest of the band mismatched. The notification is a `warning` even when the band itself comes out clean | `packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:NAMES an uncorrectable file and carries on — it is a fact to report, not a refusal` | `GT-22` |
 | `S42` | decision | Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window` | `GT-3` |
 | `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
+| `M04` | action | ARM B, "compare legs": both legs are read IN FULL with O_DIRECT at each leg's OWN data offset (`rd<n>/offset` may differ) and compared in 4 KiB rows. Same IO as a check, and NO degraded window - no leg is failed, removed or re-added at any point | `packages/daemon/src/services/selfheal-map.ts:memberOffsetOn` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:reads both legs in windows and still decides every row — the result parses as the shared schema` | `GT-16` |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
 | `E07` | decision | reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes | `packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one` | — |
+| `M04b` | action | the WHOLE chunk tree is read once, in one dump. The forward chain walks it by key because it starts from a logical byte; arm B starts from an md byte and nothing in the tree is keyed by device offset, so there is no walk to make. Affordable where the csum tree is not: a chunk covers a gigabyte | `packages/daemon/src/services/selfheal-map.ts:readAllChunkItems` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:arbitrates a rotten DATA row by its stored checksum and writes the winner through md` | `GT-2` |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
 | `E07r5` | action | RAID5: the one candidate is the XOR of the same stripe row on every other member | `packages/daemon/src/services/selfheal-repair.ts:reconstruct` | `suite:2-neg` | `GT-8` |
+| `M05` | decision | each DIFFERING row is mapped BACK up the chain - md byte to LV byte through the dm segment, LV byte to btrfs logical through the covering chunk's own delta (the GT-2 hop, inverted; a DUP metadata chunk's second copy answers too, and says which copy it is). The chunk's TYPE then says which authority arbitrates the row | `packages/daemon/src/services/selfheal-map.ts:logicalForMdByte` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:is the exact inverse of the forward hop, dm offset and chunk delta included` | `GT-2` |
 | `E08` | decision | arbitrate: crc32c of each candidate against the stored csum, best first — the btrfs checksum is what decides, never md | `packages/daemon/src/services/selfheal-csum.ts:crc32c` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reconstructs it, arbitrates against the stored csum and writes it back` | `GT-11` |
+| `M06` | action | DATA chunk: the csum btrfs stored for that logical byte arbitrates. crc32c each leg's row, and the leg that matches WINS - its bytes are written THROUGH md, which writes both legs. The same write the repair engine makes, for the same reason **[md-block-write]** | `packages/daemon/src/services/selfheal-csum.ts:readStoredCsum` | `suite:9b-compare` | `GT-7` |
+| `M07` | action | METADATA or SYSTEM chunk: btrfs stores no EXTENT_CSUM for a tree block - the checksum is in the node's own header, over its own bytes. The containing 16 KiB node is read off each leg and checked the way btrfs checks it; the leg whose copy vouches for itself wins. The verdict is cached per node (a node is four rows) **[md-block-write]** | `packages/daemon/src/services/selfheal-csum.ts:verifyNode` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a METADATA row is decided by the node's own header checksum` | `GT-20` |
+| `M08` | refusal | nothing can arbitrate the row, and it is LEFT EXACTLY AS IT IS: a row in no chunk at all is free space (btrfs has never written there, and legs may disagree about it), and a DATA row with no stored csum is a NOCOW file, a prealloc range or `nodatasum`. Counted as `freeSpaceRows` / `uncheckedRows` and reported, never guessed at | `packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:counts rows in no chunk as free space and leaves them exactly as they are` | — |
+| `M09` | refusal | BOTH legs fail the row's checksum (or both pass while holding different bytes): `unresolvedRows`, nothing written, outcome `residual`. Neither copy is the file, so the file needs restoring from backup - and the band's leftover mismatch is reported rather than hidden **[restore-from-backup-advice]** | `packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand` | `suite:9-neg` | `GT-22` |
+| `M16` | residual | arm B decided every row it could and the verifying whole-band check STILL counts: `residual`, never `reconciled`. The rows with no checksum are named as the likely remainder, because they are the ones this verb deliberately did not touch | `packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand` | `packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a band that comes back still mismatched is a residual, never a success` | `GT-22` |
 | `E09` | decision | read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either) | `packages/daemon/src/services/selfheal-repair.ts:readBackGuard` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)` | — |
 | `E10` | decision | pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes | `packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write` | `GT-19` |
 | `E11` | action | write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it **[md-block-write]** | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `suite:7-member` | `GT-8` |
@@ -2017,12 +2087,24 @@ legs directly and arbitrates each disagreement against the csum tree — every
 piece already exists (`memberOffsetOn`, `readStoredCsum`, `crc32c`, the mirror
 branch of `reconstruct`, `readMemberWithRetry`). Minimum honest fix: stop the
 tooltip naming a verb the operator cannot reach.
-**CLOSED (seventh pass), half of it.** The half that was a lie is gone: the
-Scrubs row tooltip, the Rewrite-parity button reason and the parity window all
-now read *"mirror mismatch — not yet repairable from ANAS (selfheal.11); do not
-run md repair on a mirror"*, and none of them names a verb the operator cannot
-reach (leaf `X9r`, harness-checked). The verb itself is story `selfheal.11`,
-inked and not built.
+**CLOSED (seventh pass), half of it.** The half that was a lie went first: the
+Scrubs row tooltip, the Rewrite-parity button reason and the parity window
+stopped naming a verb the operator cannot reach (leaf `X9r`, harness-checked).
+
+**CLOSED IN FULL (2026-09-15, story `selfheal.11`).** R9 has its verb —
+`POST /v1/ahr/:name/mirror-reconcile`, beside Rewrite parity in the same window,
+need-gated on the band's level so exactly one of the two is ever lit. Arm A
+repeats the ordinary scrub, which GT-22 proved heals the band through md when
+md's read-balance serves the rotten leg; arm B reads both legs in full and
+arbitrates every differing row against the checksum btrfs stored for it — the
+csum tree for DATA, the node's own header checksum for METADATA and SYSTEM —
+writing only the leg that matches, THROUGH md. Rows nothing can vouch for are
+counted and left exactly as they are. The `md-action-repair` action is
+unreachable from R9 by construction: every command the service issues goes
+through a guard that throws on `--action=repair` before the process is spawned,
+and the suite's case-9 rows assert the same thing against the kernel's own log.
+The root went from 39 nodes / 7 terminal leaves to 62 / 20, all of them carrying
+code AND a test.
 
 **F2 — R1 · a repair that WROTE a proven-correct block is reported
 `unrepairable` and told to restore from backup.** *(leaf `E12a`, mis-applied

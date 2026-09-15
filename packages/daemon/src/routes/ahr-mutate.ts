@@ -4,11 +4,12 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
+import type { MirrorReconcileRefusal } from '../services/ahr-mirror-reconcile.js'
 import type { ParityRewriteRefusal } from '../services/ahr-parity-rewrite.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { relative, resolve as resolvePath } from 'node:path'
-import { AhrCreateRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, isComposableDisk, PoolName } from '@anas/shared'
+import { AhrCreateRequest, AhrMirrorReconcileRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
@@ -16,6 +17,7 @@ import { confirmGate } from '../safety/gate.js'
 import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
+import { mirrorReconcileArray, mirrorReconcileArrayRefusal, mirrorReconcileEvidence, mirrorReconcileWarnings, reconcileMirrorBand } from '../services/ahr-mirror-reconcile.js'
 import { parityRewriteArray, parityRewriteArrayRefusal, parityRewriteEvidence, parityRewriteWarnings, rewriteBandParity } from '../services/ahr-parity-rewrite.js'
 import { ahrLvPath } from '../services/ahr-paths.js'
 import { repairAhrFiles } from '../services/ahr-repair.js'
@@ -93,6 +95,28 @@ export function rewriteLunWarnings(held: IscsiHeldByLun | null): string[] {
 }
 
 /**
+ * The mirror-reconcile confirm gate's LUN disclosure (story selfheal.11).
+ *
+ * Disclosed, never refused — and for a different reason than the rewrite's. A
+ * reconcile DOES write file bytes, but every row it writes already matches the
+ * checksum btrfs stored for it, so nothing a guest can read changes: the row it
+ * would have been served either way is the row that goes down. What the
+ * operator cannot discover anywhere else on this screen is that both legs will
+ * be read flat out underneath a live guest disk for the duration.
+ */
+export function reconcileLunWarnings(held: IscsiHeldByLun | null): string[] {
+  if (!held)
+    return []
+  const sessions = held.connectedInitiators.length
+  return [
+    `A guest's disk is live on this pool: iSCSI LUN ${held.index} ('${held.name}') of target ${held.targetIqn} is served from ${held.backingPath}${
+      sessions > 0
+        ? `, with ${sessions} initiator${sessions === 1 ? '' : 's'} logged in right now (${held.connectedInitiators.join(', ')}). Every row this run writes already matches the checksum btrfs stored for it, so what the guest reads does not change. The array will be reading both legs flat out underneath that disk for the duration`
+        : '. No initiator is logged in right now. Every row this run writes already matches the checksum btrfs stored for it, so what a guest reads does not change'}`,
+  ]
+}
+
+/**
  * The repair route's LUN-session refusal (seventh pass, F10).
  *
  * A repair writes 4 KiB it has PROVEN correct, and the CoW ruling says the old
@@ -145,17 +169,20 @@ const REPAIR_REFUSED_STATES: Record<string, string> = {
  *
  * The parity rewrite (selfheal.10) joined the pair: it runs a full btrfs scrub
  * and then TWO whole-band md operations, so it fights a scrub for md's sync
- * thread and a repair for the array it is writing parity across. The exclusion
- * is mutual in every direction — this one list is what the scrub, the repair
- * and the rewrite all ask.
+ * thread and a repair for the array it is writing parity across. The mirror
+ * reconcile (selfheal.11) joined it for the same reasons and one more — arm B
+ * reads every row of both legs while arm A scrubs the pool, so it collides with
+ * every other verb at both layers. The exclusion is mutual in every direction:
+ * this one list is what all four ask.
  */
-const REPAIR_EXCLUSIVE_OPERATIONS = ['ahr.scrub', 'ahr.repair', 'ahr.parity-rewrite'] as const
+const REPAIR_EXCLUSIVE_OPERATIONS = ['ahr.scrub', 'ahr.repair', 'ahr.parity-rewrite', 'ahr.mirror-reconcile'] as const
 
 /** What to call each of them in a refusal, in the operator's words. */
 const EXCLUSIVE_OPERATION_NAMES: Record<string, string> = {
   'ahr.scrub': 'a scrub',
   'ahr.repair': 'a repair',
   'ahr.parity-rewrite': 'a parity rewrite',
+  'ahr.mirror-reconcile': 'a mirror reconcile',
 }
 
 /**
@@ -312,6 +339,7 @@ export interface AhrMutationRouteOptions {
  *   POST   /v1/ahr/:name/scrub  — btrfs scrub then md checks (202, no confirm)
  *   POST   /v1/ahr/:name/repair — repair named blocks from parity (409 confirm)
  *   POST   /v1/ahr/:name/parity-rewrite — rewrite ONE band's parity (409 confirm)
+ *   POST   /v1/ahr/:name/mirror-reconcile — reconcile ONE mirror band (409 confirm)
  *
  * All mutations are jobs (202). The expansion verbs (expand/plan/resume/
  * abandon/replace) live separately in routes/ahr-expand.ts. Reads live in
@@ -1029,6 +1057,136 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       }),
     )
     selfJobId = job.id
+    reply.code(202)
+    return { job }
+  })
+
+  // --- POST /ahr/:name/mirror-reconcile — reconcile one mirror band ---------
+  //
+  // Story selfheal.11. The R9 root's verb: md counted DISAGREEING LEGS on a
+  // RAID1 band and the checksum pass came back clean across the pool, so one
+  // leg holds something btrfs has never been asked to read. Arm A repeats the
+  // ordinary scrub (which heals the band through md when md serves the rotten
+  // leg — GT-22); arm B reads both legs and arbitrates each differing row
+  // against the checksum btrfs stored for it.
+  //
+  // md's own `repair` is NOT the fallback and never will be on a mirror: it
+  // copies the first in-sync leg over the other without arbitrating. The
+  // service refuses to spawn it at all (`assertNoMdRepair`).
+  server.post<{ Params: { name: string } }>('/ahr/:name/mirror-reconcile', async (request, reply) => {
+    const name = parsePoolName(request.params.name, reply)
+    if (!name)
+      return
+
+    const parsed = AhrMirrorReconcileRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mirror-reconcile request: ${parsed.error.issues[0]?.message}. The body names one band (\`{ "band": 2 }\`), because md counts disagreeing legs over a whole array and never says where` } }
+    }
+    const band = parsed.data.band
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const pools = await readAhrPools(executor)
+    const pool = pools.find(p => p.name === name)
+    if (!pool) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
+    }
+    const array = mirrorReconcileArray(pool, band)
+    if (!array) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `AHR pool '${name}' has no band r${band}: its bands are ${pool.arrays.map(a => `r${a.band}`).join(', ') || 'none'}` } }
+    }
+    if (!pool.mounted || pool.mountpoint.startsWith('/dev/')) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'pool-not-mounted', message: `AHR pool '${name}' is not mounted. Arm A is a btrfs scrub and arm B reads the checksum tree, and both need the filesystem online` } }
+    }
+
+    // Hard refusals, every one of them BEFORE a confirm code is minted
+    // (Principle 14). The proof may come from the pool's last completed SCRUB
+    // or from its last completed REPAIR, whichever is newer — the same
+    // shortcut the parity rewrite takes, and for the same reason.
+    const evidence = () => mirrorReconcileEvidence(name, [
+      jobQueue.findLastCompleted('ahr.scrub', name),
+      jobQueue.findLastCompleted('ahr.repair', name),
+    ], band)
+    const proof = evidence()
+    if (!proof.ok) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: proof.code, message: proof.reason } }
+    }
+    const stateRefusal = REPAIR_REFUSED_STATES[pool.state]
+    if (stateRefusal) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'array-busy', message: `AHR pool '${name}' ${stateRefusal}. Reconcile a mirror when the pool is healthy and idle` } }
+    }
+    // Set the moment the job exists, and read only from inside the handler —
+    // a run must not count ITSELF as the job that blocks it.
+    let selfMirrorJobId: string | undefined
+    const jobConflict = () => {
+      const active = conflictingAhrJob(name, selfMirrorJobId)
+      return active
+        ? `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}). A mirror reconcile scrubs the pool and reads every row of both legs. Wait for it to finish`
+        : null
+    }
+    const conflict = jobConflict()
+    if (conflict) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'job-active', message: conflict } }
+    }
+    // The node-wide half of the same exclusion (N10): this verb issues its own
+    // whole-band checks, and md runs one sync thread per array.
+    const mirrorForeignCheck = await runningAhrCheck(executor, pools)
+    if (mirrorForeignCheck) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'array-busy', message: runningAhrCheckMessage(mirrorForeignCheck.label) } }
+    }
+    // The band's own state, read from md rather than from the pool rollup. A
+    // PARITY band is refused here for good and not for now
+    // (`not-a-mirror-band` never becomes true) — it has a verb of its own.
+    let mirrorRefusal: MirrorReconcileRefusal | null
+    try {
+      mirrorRefusal = await mirrorReconcileArrayRefusal(await readMdGeometry(executor, array.device))
+    }
+    catch (error) {
+      mirrorRefusal = {
+        reason: `band r${band} of AHR pool '${name}' (${array.device}) could not be read: ${error instanceof Error ? error.message : String(error)}`,
+        code: 'array-busy',
+      }
+    }
+    if (mirrorRefusal) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: mirrorRefusal.code, message: mirrorRefusal.reason } }
+    }
+    // Is a guest's disk live on this pool? Disclosed, never refused: every row
+    // this verb writes already matches its stored checksum, so nothing a guest
+    // can read changes.
+    const mirrorHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'ahr.mirror-reconcile',
+      params: { name, band },
+      message: `Reconciling mirror band r${band} of AHR pool '${name}' makes its two legs agree again (md counted ${proof.mismatchCnt} disagreeing unit(s) there, and the pool's last checksum scrub was clean)`,
+      warnings: [...mirrorReconcileWarnings(name, array, pool.capacity.usedBytes), ...reconcileLunWarnings(mirrorHeld)],
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'ahr.mirror-reconcile',
+      { ...identity, params: { name, band } },
+      async updateProgress => reconcileMirrorBand(executor, pool, band, {
+        updateProgress,
+        evidence,
+        jobConflict,
+        attributeFindings: async since => (await attributeScrub(executor, pool, since, updateProgress)).findings ?? [],
+        pollIntervalMs: opts.scrubPollIntervalMs,
+      }),
+    )
+    selfMirrorJobId = job.id
     reply.code(202)
     return { job }
   })

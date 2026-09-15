@@ -448,10 +448,26 @@ export async function parityRewriteArrayRefusal(geo: MdGeometry): Promise<Parity
 }
 
 /** How a wait on one md operation ended. */
-type WaitResult
+export type WaitResult
   = | { ended: true }
   /** md is running something this run did not start: nothing was written. */
     | { ended: false, foreign: string }
+
+/**
+ * What {@link waitForOwnSyncOp} needs of its caller's options.
+ *
+ * `ParityRewriteOptions` satisfies it structurally, and so does the mirror
+ * reconcile's (selfheal.11) — which is the point: both verbs issue whole-band
+ * md operations and both have to answer the same question about whose
+ * operation md is running, so there is ONE waiter rather than two copies that
+ * drift.
+ */
+export interface SyncOpWaitOptions {
+  updateProgress?: (message: string) => void
+  pollIntervalMs?: number
+  startTimeoutMs?: number
+  finishCeilingMs?: number
+}
 
 /**
  * Wait for an md operation this run issued to finish, touching nothing.
@@ -474,13 +490,13 @@ type WaitResult
  * issued, where it named something else before. Without that change nothing
  * proves the op ran, and "did not start" is what gets reported.
  */
-async function waitForOwnSyncOp(
+export async function waitForOwnSyncOp(
   executor: CommandExecutor,
   geo: MdGeometry,
   label: string,
   expect: 'repair' | 'check',
   priorAction: string | null,
-  opts: ParityRewriteOptions,
+  opts: SyncOpWaitOptions,
 ): Promise<WaitResult> {
   const poll = opts.pollIntervalMs ?? AHR_SCRUB_POLL_MS
   const read = () => syncAction(executor, geo.kernel)

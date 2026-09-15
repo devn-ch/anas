@@ -7629,17 +7629,17 @@ async function rewriteParityMirrorChecks() {
   await settle()
   created.windows.length = 0
 
-  // The row's indicator must not promise a verb that does not exist here.
+  // The row's indicator must not promise the PARITY verb here.
   const cell = scrubCell(grid, rowFor(grid, 'ahr0'));
   ok('rewrite: a mirror-only mismatch row does NOT offer "click to rewrite"',
     !/Click to rewrite/.test(cell), cell)
-  // Seventh pass, F1 — the tooltip must NOT name Repair from parity as the
-  // path: that verb needs a finding with named blocks, phase 2 named none, and
-  // the mirror verb is story selfheal.11 (inked, not built). What it must say
-  // instead is what the operator must not do.
-  ok('rewrite: …it says there is no parity to rewrite, and names no verb the operator cannot reach',
+  // Story selfheal.11 — the tooltip still must NOT name Repair from parity
+  // (that verb needs a finding with named blocks, and phase 2 named none). What
+  // it names is the verb that DOES apply to a mirror band, and what the
+  // operator must not do instead.
+  ok('rewrite: …it says there is no parity to rewrite, and points at the mirror verb',
     /no parity to rewrite/.test(cell)
-      && /not yet repairable from ANAS/.test(cell)
+      && /Click to reconcile the mirror/.test(cell)
       && /do not run md repair on a mirror/.test(cell)
       && !/Repair from parity/.test(cell), cell)
 
@@ -7652,8 +7652,12 @@ async function rewriteParityMirrorChecks() {
     !/the parity is what is wrong/.test((win.items.getAt(0) || {}).html || '')
       && /RAID1 mirror bands/.test((win.items.getAt(0) || {}).html || ''),
     (win.items.getAt(0) || {}).html)
-  ok('rewrite: …and it names no verb the operator cannot reach either (F1)',
-    /not yet repairable from ANAS/.test((win.items.getAt(0) || {}).html || '')
+  // selfheal.11 — the head explains the two arms, in the order they run, and
+  // still names no verb the operator cannot reach.
+  ok('rewrite: …and the head explains the reconcile\'s two arms',
+    /re-runs the ordinary checksum scrub/.test((win.items.getAt(0) || {}).html || '')
+      && /reads BOTH legs in full/.test((win.items.getAt(0) || {}).html || '')
+      && /Rows with no checksum/.test((win.items.getAt(0) || {}).html || '')
       && !/Repair from parity/.test((win.items.getAt(0) || {}).html || ''),
     (win.items.getAt(0) || {}).html)
 
@@ -7662,10 +7666,10 @@ async function rewriteParityMirrorChecks() {
   ok('rewrite: the band\'s LEVEL rides the row', pGrid.getStore().getAt(0).get('level') === 'raid1')
   pGrid.selectRows([0])
   await settle()
-  ok('rewrite: a ticked mirror band leaves the verb dark', btn.disabled === true)
-  ok('rewrite: …with the reason the daemon would 409 with',
+  ok('rewrite: a ticked mirror band leaves the PARITY verb dark', btn.disabled === true)
+  ok('rewrite: …with the reason the daemon would 409 with, and the verb that does apply',
     /no parity to rewrite/.test(btn.tooltip || '')
-      && /not yet repairable from ANAS/.test(btn.tooltip || '')
+      && /Use Reconcile mirror for this band/.test(btn.tooltip || '')
       && !/Repair from parity/.test(btn.tooltip || ''), btn.tooltip)
 
   let sent = null
@@ -7673,6 +7677,265 @@ async function rewriteParityMirrorChecks() {
   btn.handler(btn)
   await settle()
   ok('rewrite: and the handler refuses it too — nothing is submitted for a mirror band', sent === null)
+}
+
+// Story selfheal.11 — Reconcile mirror, the OTHER verb in the parity window.
+//
+// The R9 root's mismatch: md counted disagreeing LEGS and the checksum pass
+// named no file, so one leg holds something btrfs has never been asked to read.
+// The verb is need-gated the same way Rewrite parity is, in the same window, and
+// the two are mutually exclusive by the band's level.
+async function mirrorReconcileChecks() {
+  const MIRROR = {
+    data: [scrubJob({
+      id: 'jmir2',
+      at: '2026-09-12T12:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr0-r1', 'ahr0-r2'],
+        parityMismatches: [{ band: 'ahr0-r2', bandIndex: 2, array: '/dev/md/ahr0-r2', mismatchCnt: 128, level: 'raid1' }],
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIRROR })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('mirror: the parity indicator opens the window that holds both verbs',
+    !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+
+  const pGrid = win.down('#parityGrid')
+  const btn = win.down('#reconcileMirror')
+  ok('mirror: the window carries a Reconcile mirror button', !!btn && btn.cls === 'anas-btn-mirror-reconcile')
+  if (!btn) { return }
+  ok('mirror: the verb is dark until a band is picked', btn.disabled === true)
+  ok('mirror: …and says so', /select the band to reconcile/.test(btn.tooltip || ''), btn.tooltip)
+  pGrid.selectRows([0])
+  await settle()
+  ok('mirror: one ticked RAID1 band lights the verb', btn.disabled === false)
+
+  // --- the confirm-gated request -------------------------------------------
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('mirror: the verb goes through the confirm-code door', !!sent)
+  if (!sent) { return }
+  ok('mirror: …to the pool\'s own mirror-reconcile endpoint', sent.path === '/ahr/ahr0/mirror-reconcile')
+  ok('mirror: …as a POST', sent.method === 'post')
+  ok('mirror: the body names ONE band, as a number', JSON.stringify(sent.body) === '{"band":2}')
+  ok('mirror: the confirm names the band and md\'s own count',
+    /band r2/.test(sent.confirmIntro || '') && /128 disagreeing unit\(s\) there/.test(sent.confirmIntro || ''),
+    sent.confirmIntro)
+  ok('mirror: the poll budget is raised past the default (scrubs, checks, then both legs)',
+    Number(sent.maxMs) > 15000, sent.maxMs)
+  ok('mirror: the poll rides the window, not a component that closes', sent.view === win)
+
+  // --- arm A's result, in the same window ----------------------------------
+  const panel = win.down('#parityResult')
+  ok('mirror: the result panel is hidden until there is a result', !!panel && panel.hidden === true)
+  sent.onComplete({
+    id: 'mj1',
+    status: 'completed',
+    operation: 'ahr.mirror-reconcile',
+    result: {
+      pool: 'ahr0',
+      band: 2,
+      array: '/dev/md/ahr0-r2',
+      arm: 'scrub',
+      passes: [{ corrected: 1, mismatchAfter: 0 }],
+      rowsCompared: 0,
+      rowsDiffering: 0,
+      rowsWritten: { leg0: 0, leg1: 0 },
+      freeSpaceRows: 0,
+      uncheckedRows: 0,
+      unresolvedRows: 0,
+      mismatchBefore: 128,
+      mismatchAfter: 0,
+      outcome: 'reconciled',
+      durations: { scrubMs: 1000, compareMs: 0, checkMs: 500, totalMs: 1500 },
+    },
+  })
+  await settle()
+  ok('mirror: the result appears in the window the request was made from', panel.hidden === false)
+  ok('mirror: the before and after counts are both said',
+    /mismatches before 128/.test(panel.html) && /after 0/.test(panel.html), panel.html)
+  ok('mirror: the ARM that answered is named — arm A is the ordinary scrub healing it',
+    /Arm A \(scrub until clean\)/.test(panel.html) && /1 btrfs scrub pass/.test(panel.html), panel.html)
+  ok('mirror: a reconciled band says the verifying check counted 0',
+    /The legs agree again/.test(panel.html) && /counted 0/.test(panel.html), panel.html)
+
+  // --- arm B's result: rows arbitrated one by one --------------------------
+  sent.onComplete({
+    id: 'mj2',
+    status: 'completed',
+    operation: 'ahr.mirror-reconcile',
+    result: {
+      pool: 'ahr0',
+      band: 2,
+      array: '/dev/md/ahr0-r2',
+      arm: 'compare',
+      passes: [{ corrected: 0, mismatchAfter: 128 }],
+      rowsCompared: 51200,
+      rowsDiffering: 1,
+      rowsWritten: { leg0: 0, leg1: 1 },
+      freeSpaceRows: 0,
+      uncheckedRows: 0,
+      unresolvedRows: 0,
+      mismatchBefore: 128,
+      mismatchAfter: 0,
+      outcome: 'reconciled',
+      durations: { scrubMs: 1000, compareMs: 9000, checkMs: 500, totalMs: 10500 },
+    },
+  })
+  await settle()
+  ok('mirror: arm B is named as such, with the rows it compared and wrote',
+    /Arm B \(compare legs\)/.test(panel.html) && /1 differing row\(s\)/.test(panel.html)
+      && /1 written back through md/.test(panel.html), panel.html)
+
+  // --- a residual is NOT a success -----------------------------------------
+  sent.onComplete({
+    id: 'mj3',
+    status: 'completed',
+    operation: 'ahr.mirror-reconcile',
+    result: {
+      pool: 'ahr0',
+      band: 2,
+      array: '/dev/md/ahr0-r2',
+      arm: 'compare',
+      passes: [{ corrected: 0, mismatchAfter: 128 }],
+      rowsCompared: 51200,
+      rowsDiffering: 1,
+      rowsWritten: { leg0: 0, leg1: 0 },
+      freeSpaceRows: 0,
+      uncheckedRows: 0,
+      unresolvedRows: 1,
+      mismatchBefore: 128,
+      mismatchAfter: 128,
+      outcome: 'residual',
+      reason: '1 row(s) of ahr0-r2 could not be arbitrated: neither leg satisfies the checksum btrfs stored for them',
+      durations: { scrubMs: 1, compareMs: 1, checkMs: 1, totalMs: 3 },
+    },
+  })
+  await settle()
+  ok('mirror: a residual run refuses to read as healthy',
+    /The band is NOT clean/.test(panel.html) && /Do not treat it as healthy/.test(panel.html), panel.html)
+  ok('mirror: …and repeats the one thing the operator must not reach for',
+    /do not run md repair on it/.test(panel.html), panel.html)
+  ok('mirror: …and counts the rows NEITHER leg could satisfy, never written',
+    /1 row\(s\) where NEITHER leg matched — never written/.test(panel.html), panel.html)
+  ok('mirror: …and carries the run\'s own sentence',
+    /could not be arbitrated/.test(panel.html), panel.html)
+
+  // --- rows with no checksum are reported, not hidden ----------------------
+  sent.onComplete({
+    id: 'mj4',
+    status: 'completed',
+    operation: 'ahr.mirror-reconcile',
+    result: {
+      pool: 'ahr0',
+      band: 2,
+      array: '/dev/md/ahr0-r2',
+      arm: 'compare',
+      passes: [{ corrected: 0, mismatchAfter: 128 }],
+      rowsCompared: 51200,
+      rowsDiffering: 3,
+      rowsWritten: { leg0: 1, leg1: 0 },
+      freeSpaceRows: 1,
+      uncheckedRows: 1,
+      unresolvedRows: 0,
+      mismatchBefore: 128,
+      mismatchAfter: 0,
+      outcome: 'reconciled',
+      durations: { scrubMs: 1, compareMs: 1, checkMs: 1, totalMs: 3 },
+    },
+  })
+  await settle()
+  ok('mirror: rows with no stored checksum are counted and said to be left alone',
+    /1 row\(s\) with no stored checksum \(left as they are\)/.test(panel.html), panel.html)
+  ok('mirror: …and so are rows in free space',
+    /1 row\(s\) in free space/.test(panel.html), panel.html)
+
+  // --- a job still running claims no result --------------------------------
+  sent.onComplete({ id: 'mj5', status: 'running' })
+  await settle()
+  ok('mirror: a job still running claims no result', /still running/.test(panel.html), panel.html)
+  ok('mirror: …and says where the answer will arrive', /notification/.test(panel.html), panel.html)
+}
+
+// Story selfheal.11 — the mirror verb is need-gated the same way the parity one
+// is: a PARITY band cannot be reconciled (its mismatch is parity disagreeing
+// with data), and a pool whose same scrub named corrupt files cannot be either.
+async function mirrorReconcileRefusedChecks() {
+  const PARITY_BAND = {
+    data: [scrubJob({
+      id: 'jpar',
+      at: '2026-09-12T13:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: null,
+        checkedArrays: 1,
+        bandsChecked: ['ahr0-r1'],
+        parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': PARITY_BAND })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  if (!win) { ok('mirror: the parity window opens on a parity band', false); return }
+  const pGrid = win.down('#parityGrid')
+  const mbtn = win.down('#reconcileMirror')
+  const rbtn = win.down('#rewriteParity')
+  pGrid.selectRows([0])
+  await settle()
+  ok('mirror: a parity band lights Rewrite parity and leaves Reconcile mirror dark',
+    rbtn.disabled === false && mbtn.disabled === true)
+  ok('mirror: …with the reason the daemon would 409 with (not-a-mirror-band)',
+    /is a parity band, not a mirror/.test(mbtn.tooltip || ''), mbtn.tooltip)
+
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  mbtn.handler(mbtn)
+  await settle()
+  ok('mirror: the handler itself refuses a parity band, not just the disabled state', sent === null)
+
+  // A row from a daemon too old to record the level cannot be reconciled
+  // either: the two mismatch verbs are not interchangeable, and guessing which
+  // one a band needs is exactly the guess this epic exists to avoid.
+  created.windows.length = 0
+  const ANAS2 = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': SCRUB_JOBS })
+  const view2 = makeComponent(ANAS2.views.scrubs.factory('harness'), null)
+  const grid2 = view2.down('#scrubGrid')
+  view2.fireEvent('afterrender', view2)
+  await settle()
+  created.windows.length = 0
+  grid2.fireEvent('itemclick', grid2, rowFor(grid2, 'ahr3'), null, 0, onParityLink)
+  await settle()
+  const win2 = openWindow()
+  if (!win2) { ok('mirror: the parity window opens on a level-less row', false); return }
+  win2.down('#parityGrid').selectRows([0])
+  await settle()
+  const mbtn2 = win2.down('#reconcileMirror')
+  ok('mirror: a row with no recorded level leaves the verb dark', mbtn2.disabled === true)
+  ok('mirror: …and says the two verbs are not interchangeable',
+    /did not record what level the band is/.test(mbtn2.tooltip || ''), mbtn2.tooltip)
 }
 
 // Seventh pass, F2 — the parity indicator can be fed by a completed REPAIR.
@@ -8666,6 +8929,15 @@ warnings.length = 0
 created.windows.length = 0
 await rewriteParityRefusedChecks()
 await rewriteParityMirrorChecks()
+// Story selfheal.11 — Reconcile mirror, in that same window.
+warnings.length = 0
+created.windows.length = 0
+await mirrorReconcileChecks()
+warnings.length = 0
+created.windows.length = 0
+await mirrorReconcileRefusedChecks()
+warnings.length = 0
+created.windows.length = 0
 await parityResidualFromRepairChecks()
 warnings.length = 0
 created.windows.length = 0

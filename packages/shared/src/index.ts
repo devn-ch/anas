@@ -428,6 +428,14 @@ export {
 // Self-heal repair engine schemas (story selfheal.5) + the repair job
 // (selfheal.6) + the parity rewrite (selfheal.10)
 export {
+  AhrMirrorReconcileArm,
+  AhrMirrorReconcileDurations,
+  AhrMirrorReconcileOutcome,
+  AhrMirrorReconcilePass,
+  AhrMirrorReconcileReasonCode,
+  AhrMirrorReconcileRequest,
+  AhrMirrorReconcileResult,
+  AhrMirrorReconcileWrites,
   AhrParityRewriteDurations,
   AhrParityRewriteOutcome,
   AhrParityRewriteReasonCode,

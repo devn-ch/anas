@@ -4,7 +4,9 @@ against a freshly built rig. The suite (suite.py) builds the rig, writes the
 marker files, and calls the case functions with a recorder. Cases 1–5 run on
 RAID5/6 loop rigs; case 6 is the RAID1 case (hardening round, F4/GT-16), and
 the parity case also runs once on a 512 KiB-chunk rig — the AHR band shape —
-to prove no chunk is hardcoded.
+to prove no chunk is hardcoded. Case 8 is the parity rewrite (selfheal.10) and
+case 9 the mirror reconcile (selfheal.11), each on a rig of its own because
+both verbs scrub the WHOLE filesystem.
 
 Injected-fault placement is ALWAYS via oracle.py (raw signature scan). The
 mapping helpers are used only for verification and by the negative-control
@@ -17,11 +19,12 @@ import os
 
 from common import (BS, LOGS, PARITY_CMD, SUITE_OUT, bounded_end_check,
                     bounded_window_check, btrfs_chunk_ranges,
-                    btrfs_metadata_ranges, call_parity, call_repair, components,
-                    dm_segments, drop_caches, evict_stripe_cache, fail_member,
-                    file_sector_digests, find_btrfs_dev, full_check, locate_block,
-                    make_marker, make_snap, md_attr, md_attr_or_none, md_geometry,
-                    mdsys, readd_member, read_direct, regen, remove_snap,
+                    btrfs_metadata_ranges, call_mirror, call_parity, call_repair,
+                    components, dm_segments, drop_caches, evict_stripe_cache,
+                    fail_member, file_sector_digests, find_btrfs_dev, full_check,
+                    kernel_md_log, locate_block, make_marker, make_snap, md_attr,
+                    md_attr_or_none, md_geometry, md_repair_lines, mdsys,
+                    readd_member, read_direct, regen, remove_snap,
                     restore_sync_knobs, reverse_predict, sig_for, snapshot_read,
                     subvolume_names, write_direct)
 from oracle import (ORACLE_SNAP, corrupt_block, disambiguate_data_slot,
@@ -650,6 +653,19 @@ def measure_tx_blocks(ctx: CaseCtx, devs: list[str], seg: dict) -> tuple[dict, d
     return pre, post, blocks
 
 
+# btrfs's superblock offsets are FIXED by the on-disk format — 64 KiB, 64 MiB,
+# 256 GiB, 1 PiB — and a superblock is never inside a chunk, so a byte at one of
+# them can never be file data. The tx-probe MEASURES which of them a given
+# transaction rewrites, and that is still what governs everything else; what it
+# cannot do is bound the NEXT transaction. Observed 2026-09-15 on the two-band
+# rig, twice: the repair's own transaction rewrote band A's PRIMARY super at
+# LV 65536 while the probe's had not, and `7-bandA-untouched` reported `data=1`
+# on a block that is a superblock by definition. These four offsets are
+# housekeeping by construction; the CONTENT check runs BEFORE this and is
+# unaffected, so a candidate copy landing on a super is still caught.
+BTRFS_SUPER_OFFSETS = (0x10000, 0x4000000, 0x4000000000, 0x4000000000000)
+
+
 def classify_member_changes(devs: list[str], before: dict, after: dict,
                             geo: dict, seg: dict, tx_blocks: set[int],
                             excl: list[tuple[int, int]],
@@ -657,8 +673,10 @@ def classify_member_changes(devs: list[str], before: dict, after: dict,
     """Classify every changed 4K member sector (per-sector before/after
     digests) as housekeeping or a data write. Housekeeping = md's own
     superblock region (below the data offset), a MEASURED superblock-mirror
-    block (tx_blocks), or a non-DATA (SYSTEM/METADATA) chunk range — btrfs
-    commits its own transactions there on ANY repair, even a correct one.
+    block (tx_blocks), one of btrfs's FIXED superblock offsets
+    (BTRFS_SUPER_OFFSETS), or a non-DATA (SYSTEM/METADATA) chunk range
+    — btrfs commits its own transactions there on ANY repair, even a correct
+    one.
     With `content_digest` set, a changed sector whose AFTER digest equals it
     is counted separately as CONTENT: a byte-for-byte copy of a known block
     that landed in a whitelisted range — the classification-independent
@@ -686,7 +704,8 @@ def classify_member_changes(devs: list[str], before: dict, after: dict,
                 housekeeping += 1      # md's own superblock region
                 continue
             lv = reverse_predict(i, moff, geo) - seg["ss"] * 512 + seg["start"]
-            if lv in tx_blocks or any(lo <= lv < hi for lo, hi in excl):
+            if (lv in tx_blocks or lv in BTRFS_SUPER_OFFSETS
+                    or any(lo <= lv < hi for lo, hi in excl)):
                 housekeeping += 1
             else:
                 data += 1
@@ -1314,3 +1333,243 @@ def control8_data_rot_refused(ctx: CaseCtx, rec: Recorder) -> None:
             f"last_sync_action {last_before} -> {last_after}; bounded check "
             f"mismatch_cnt={mm_after} (expected >0); parity row "
             f"unchanged={par_after == par_pre}")
+
+
+# ---------------------------------------------------------------- case 9
+
+MIRROR_REPORT_PATH = f"{SUITE_OUT}/last-mirror.json"
+# The whole-band check's evidence file the mirror verb gates on — the rig's
+# stand-in for "the pool's last completed scrub counted disagreeing legs on this
+# band" (a rig has no daemon and no job queue).
+MIRROR_EVIDENCE_PATH = f"{SUITE_OUT}/mirror-evidence.json"
+
+
+def run_mirror(ctx: CaseCtx, band: int = 1, tag: str = "m",
+               evidence: str | None = None, passes: int | None = None,
+               command: str | None = None) -> tuple[int, dict, str]:
+    """Invoke the mirror-reconcile verb under test (MIRROR_CMD, story
+    selfheal.11). The sidecar is removed first so a crashed run can never be
+    read as this one's report."""
+    if os.path.exists(MIRROR_REPORT_PATH):
+        os.unlink(MIRROR_REPORT_PATH)
+    log = f"{LOGS}/{ctx.tag}-{tag}.log"
+    rc, out = call_mirror(ctx.mp, band, report=MIRROR_REPORT_PATH, log=log,
+                          evidence=evidence, passes=passes, command=command)
+    rep = json.load(open(MIRROR_REPORT_PATH)) if os.path.exists(MIRROR_REPORT_PATH) else {}
+    return rc, rep, out
+
+
+def _mirror_evidence(ctx: CaseCtx) -> int:
+    """A whole-band check, written out as the verb's evidence file."""
+    mm = full_check(ctx.mddev)["mismatch_cnt"]
+    with open(MIRROR_EVIDENCE_PATH, "w") as fh:
+        json.dump({"band": 1, "mismatch_cnt": mm}, fh)
+    return mm
+
+
+def _place_rot(ctx: CaseCtx, name: str, block: int, on_served: bool):
+    """Inject a 4 KiB rot on the leg md DOES (or does NOT) serve reads from.
+
+    GT-22(d): md's read-balance served the rotten leg on every cold read of the
+    probe rig — but that is an observation, not a contract, and the two arms of
+    this verb are exactly the two sides of it. So the suite does not assume: it
+    corrupts one leg and asks md (a COLD single-block read through btrfs EIOs
+    only when md served the rotten copy — a single-device btrfs has one copy and
+    cannot retry), and if the answer is the wrong way round it restores that leg
+    and corrupts the other instead.
+
+    Returns (dev, member offset, leg index, the block's original bytes)."""
+    path = ctx.files[name]
+    hits = scan_members(ctx.members, sig_for(name, block))
+    if len(hits) != len(ctx.members):
+        raise RuntimeError(f"scan for {name} block {block}: {len(hits)} hits "
+                           f"across {len(ctx.members)} legs: {hits}")
+    boff = hits[0][1] - hits[0][1] % BS
+    if any(h[1] - h[1] % BS != boff for h in hits):
+        raise RuntimeError(f"legs disagree about the member offset: {hits}")
+    want = regen(name)[block * BS:(block + 1) * BS]
+
+    corrupt_block(hits[0][0], hits[0][1])
+    served_first = _cold_block(path, block) is None      # EIO => md served it
+    if served_first == on_served:
+        return hits[0][0], boff, ctx.members.index(hits[0][0]), want
+    write_direct(hits[0][0], boff, want)                 # put that leg back
+    corrupt_block(hits[1][0], hits[1][1])
+    drop_caches()
+    return hits[1][0], boff, ctx.members.index(hits[1][0]), want
+
+
+def _legs_match(ctx: CaseCtx, boff: int, want: bytes) -> tuple[bool, str]:
+    legs = []
+    for i, d in enumerate(ctx.members):
+        legs.append(f"m{i}={'ok' if read_direct(d, boff, BS) == want else 'BAD'}")
+    return all(not s.endswith("BAD") for s in legs), " ".join(legs)
+
+
+def case9a_mirror_scrub(ctx: CaseCtx, rec: Recorder) -> None:
+    """ARM A — fresh rot on the leg md SERVES: the ordinary btrfs scrub heals
+    the whole band through md (GT-22 UNEXPECTED(1)), and repeating the pass is
+    what the verb does about md's read-balance not being contractual.
+
+    The assertions are implementation-agnostic — the verb must come back
+    `reconciled`, with BOTH legs holding the original block and the band's
+    whole-band check reading 0 — because the reference MIRROR_CMD is
+    compare-legs only and answers this case through arm B. WHICH arm answered is
+    recorded in the detail line rather than asserted.
+
+    The invariant rides every case-9 row: md's own `repair` must never have run
+    on the band. That is asserted against the KERNEL's own log (md announces
+    `md: repair of RAID array mdN` when it takes one), not against
+    the verb's source, so it holds for any implementation."""
+    name = "m1"
+    dev, boff, leg, want = _place_rot(ctx, name, 300, on_served=True)
+    ok0, legs0 = _legs_match(ctx, boff, want)
+    rec.add("case", "9a-inject", "fresh rot on the leg md serves reads from "
+            "(the cold read through btrfs EIOs)", not ok0,
+            f"rot on m{leg} ({os.path.basename(dev)})@{boff}; legs now: {legs0}")
+    if ok0:
+        return
+
+    mm = _mirror_evidence(ctx)
+    rec.add("case", "9a-md-sees-it", "a whole-band md check counts the legs "
+            "disagreeing", mm > 0, f"mismatch_cnt={mm} (expected > 0; GT-22: one "
+            f"rotted 4 KiB block counts 128 on a mirror)")
+    if mm == 0:
+        return
+
+    md_before = kernel_md_log()
+    rc, rep, out = run_mirror(ctx, band=1, tag="c9a", evidence=MIRROR_EVIDENCE_PATH)
+    repairs = md_repair_lines(md_before, ctx.mddev)
+    ok = rc == 0 and rep.get("outcome") == "reconciled"
+    rec.add("case", "9a-reconcile", "the verb reconciles the band (exit 0)", ok,
+            f"rc={rc} outcome={rep.get('outcome')} arm={rep.get('arm')} "
+            f"passes={rep.get('passes')} rows_written={rep.get('rows_written')} "
+            f"reason={rep.get('reason', out)[:140]}")
+
+    okl, legs = _legs_match(ctx, boff, want)
+    rec.add("case", "9a-legs", "both legs hold the ORIGINAL block afterwards",
+            okl, f"rot was on m{leg}; now: {legs}")
+
+    after = full_check(ctx.mddev)["mismatch_cnt"]
+    rec.add("case", "9a-clean", "an independent whole-band check reads 0",
+            after == 0, f"mismatch_cnt={after}")
+
+    rec.add("case", "9a-no-md-repair", "md NEVER ran a repair on the mirror band "
+            "(the kernel's own log is the witness)", not repairs,
+            "no `md: repair of RAID array` line for this array" if not repairs
+            else f"kernel logged: {repairs}")
+    assert_knobs_default(ctx, "case 9a")
+
+
+def case9b_mirror_compare(ctx: CaseCtx, rec: Recorder) -> None:
+    """ARM B — rot on the leg md does NOT serve: the scrub reads the good leg,
+    finds nothing, and the band stays mismatched. That is the residual case the
+    story names, and the only way out is to read both legs and arbitrate every
+    differing row against the checksum btrfs stored for it.
+
+    Arm A is held to ONE pass (`--passes 1`) so the fall-through is
+    deterministic rather than a second roll of md's read-balance."""
+    name = "m2"
+    dev, boff, leg, want = _place_rot(ctx, name, 300, on_served=False)
+    cold = _cold_block(ctx.files[name], 300)
+    rec.add("case", "9b-inject", "rot on the leg md does NOT serve: the file "
+            "still reads correctly, so a scrub has nothing to correct",
+            cold == want,
+            f"rot on m{leg} ({os.path.basename(dev)})@{boff}; cold read "
+            f"{'MATCH' if cold == want else 'differs or EIO'}")
+    if cold != want:
+        return
+
+    mm = _mirror_evidence(ctx)
+    rec.add("case", "9b-md-sees-it", "md still counts the legs disagreeing, "
+            "while btrfs sees nothing at all", mm > 0, f"mismatch_cnt={mm}")
+    if mm == 0:
+        return
+
+    md_before = kernel_md_log()
+    rc, rep, out = run_mirror(ctx, band=1, tag="c9b", passes=1,
+                              evidence=MIRROR_EVIDENCE_PATH)
+    repairs = md_repair_lines(md_before, ctx.mddev)
+    written = rep.get("rows_written") or {}
+    total = int(written.get("leg0", 0)) + int(written.get("leg1", 0))
+    good = 1 - leg
+    ok = (rc == 0 and rep.get("outcome") == "reconciled" and total == 1
+          and int(written.get(f"leg{good}", 0)) == 1)
+    rec.add("case", "9b-compare", "compare-legs wrote the GOOD leg's row back "
+            "through md (exit 0, one row, from the leg that matched)", ok,
+            f"rc={rc} outcome={rep.get('outcome')} arm={rep.get('arm')} "
+            f"rows_compared={rep.get('rows_compared')} "
+            f"rows_differing={rep.get('rows_differing')} rows_written={written} "
+            f"(the good leg is m{good}); unchecked={rep.get('unchecked_rows')} "
+            f"free={rep.get('free_space_rows')} "
+            f"unresolved={rep.get('unresolved_rows')} "
+            f"reason={rep.get('reason', out)[:140]}")
+
+    okl, legs = _legs_match(ctx, boff, want)
+    rec.add("case", "9b-legs", "both legs hold the ORIGINAL block afterwards "
+            "(md wrote every leg)", okl, f"rot was on m{leg}; now: {legs}")
+
+    after = full_check(ctx.mddev)["mismatch_cnt"]
+    rec.add("case", "9b-clean", "an independent whole-band check reads 0",
+            after == 0, f"mismatch_cnt={after}")
+
+    rec.add("case", "9b-no-md-repair", "md NEVER ran a repair on the mirror band",
+            not repairs, "no `md: repair of RAID array` line for this array" if not repairs
+            else f"kernel logged: {repairs}")
+    assert_knobs_default(ctx, "case 9b")
+
+
+def control9_both_legs(ctx: CaseCtx, rec: Recorder) -> None:
+    """NEGATIVE CONTROL — rot on BOTH legs, DIFFERENT junk on each.
+
+    Neither copy satisfies the checksum btrfs stored for the row, so there is
+    nothing to arbitrate and NOTHING may be written: writing either leg would be
+    a coin flip, which is exactly what `mdadm --action=repair` does on a mirror
+    and exactly why this epic refuses it. The verb must report the row as
+    `unresolved`, come back `residual`, and leave both legs holding the junk
+    that was injected."""
+    name = "m3"
+    hits = scan_members(ctx.members, sig_for(name, 300))
+    if len(hits) != len(ctx.members):
+        rec.add("control", "9-neg-scan", "the marker block is on every leg", False,
+                f"{len(hits)} hits across {len(ctx.members)} legs")
+        return
+    boff = hits[0][1] - hits[0][1] % BS
+    junk = [corrupt_block(hits[0][0], hits[0][1]), corrupt_block(hits[1][0], hits[1][1])]
+    drop_caches()
+    distinct = junk[0] != junk[1]
+    rec.add("control", "9-neg-inject", "both legs corrupted, with DIFFERENT junk "
+            "on each", distinct,
+            f"m0={_digest12(junk[0])} m1={_digest12(junk[1])} @{boff}")
+    if not distinct:
+        return
+
+    mm = _mirror_evidence(ctx)
+    md_before = kernel_md_log()
+    rc, rep, out = run_mirror(ctx, band=1, tag="c9neg", passes=1,
+                              evidence=MIRROR_EVIDENCE_PATH)
+    repairs = md_repair_lines(md_before, ctx.mddev)
+    written = rep.get("rows_written") or {}
+    total = int(written.get("leg0", 0)) + int(written.get("leg1", 0))
+    ok = (rc == 2 and rep.get("outcome") == "residual"
+          and rep.get("unresolved_rows") == 1 and total == 0)
+    rec.add("control", "9-neg", "NEITHER leg can be proven, so nothing is written "
+            "and the run is a RESIDUAL (exit 2)", ok,
+            f"rc={rc} outcome={rep.get('outcome')} "
+            f"unresolved={rep.get('unresolved_rows')} rows_written={written} "
+            f"mismatch_before={mm} mismatch_after={rep.get('mismatch_after')} "
+            f"reason={rep.get('reason', out)[:160]}")
+
+    # On disk: both legs still hold exactly what was injected.
+    now = [read_direct(ctx.members[0], boff, BS), read_direct(ctx.members[1], boff, BS)]
+    untouched = now[0] == junk[0] and now[1] == junk[1]
+    rec.add("control", "9-neg-untouched", "both legs are byte-identical to the "
+            "junk that was injected — the verb wrote nothing at all", untouched,
+            f"m0 {_digest12(junk[0])} -> {_digest12(now[0])}; "
+            f"m1 {_digest12(junk[1])} -> {_digest12(now[1])}")
+
+    rec.add("control", "9-neg-no-md-repair", "and md NEVER ran a repair on the "
+            "band — a repair there would have copied leg 0's junk onto leg 1 "
+            "and blessed it (GT-22(f))", not repairs,
+            "no `md: repair of RAID array` line for this array" if not repairs
+            else f"kernel logged: {repairs}")

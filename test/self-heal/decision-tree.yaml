@@ -43,6 +43,7 @@ orphan_scan:
   - packages/daemon/src/services/ahr-scrub.ts
   - packages/daemon/src/services/ahr-repair.ts
   - packages/daemon/src/services/ahr-parity-rewrite.ts
+  - packages/daemon/src/services/ahr-mirror-reconcile.ts
   - packages/daemon/src/services/selfheal-repair.ts
   - packages/daemon/src/services/selfheal-map.ts
   - packages/daemon/src/services/selfheal-csum.ts
@@ -231,12 +232,12 @@ nodes:
     code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
     test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:every mismatching band warns; an unreadable counter warns about nothing'
     gt: GT-16
-    next: [S22, S62, U07, P03a, E04g, E04f, X9r, E04f3, E04f4]
+    next: [S22, S62, U07, P03a, E04g, E04f, X9r, E04f3, E04f4, M00]
   - id: X9r
     kind: ui
-    label: 'the mirror-mismatch wording names NO verb the operator cannot reach: "mirror mismatch - not yet repairable from ANAS (selfheal.11); do not run md repair on a mirror". The verb itself is story selfheal.11 - inked, not built'
+    label: 'the mirror-mismatch wording names the verb that DOES apply and the one the operator must not reach for: "no parity to rewrite - the legs disagree with each other; do not run md repair on a mirror; click to reconcile the mirror". Rewrite parity stays dark on a RAID1 row and says why (story selfheal.11)'
     code: 'packages/pve-integration/src/69-scrubs.js:MIRROR_BAND_REASON'
-    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:it says there is no parity to rewrite, and names no verb the operator cannot reach'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:it says there is no parity to rewrite, and points at the mirror verb'
     gt: GT-16
   - id: X10
     kind: decision
@@ -1861,3 +1862,158 @@ nodes:
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:RAID5: a sibling with a recorded range ends the reconstruction, by name'
     gt: none
     next: [E07a]
+
+  # ===========================================================================
+  #  Reconcile mirror (story selfheal.11) - the R9 root's verb
+  # ===========================================================================
+  - id: M00
+    kind: decision
+    label: 'the verb''s licence, taken from the newest COMPLETED scrub or repair: md counted mismatches on THIS band, the band is `raid1`, and the checksum pass was clean across the pool. A row with no recorded level is refused rather than guessed at - the two mismatch verbs are not interchangeable'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileEvidence'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:accepts a RAID1 band the last scrub counted mismatches on, with no findings'
+    gt: GT-22
+    next: [M00b, M01, M10, M12, M13, M15, M17]
+  - id: M00b
+    kind: decision
+    label: 'the band the request names, taken from the pool''s own topology (`<pool>-r<n>`, its md device and its per-leg height). A band the pool does not have is a 400 that lists the bands it does, before any confirm code is minted'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileArray'
+    test: 'packages/daemon/src/routes/__tests__/ahr-mutate.test.ts:400 on a body that names no band, and on a band the pool does not have'
+    gt: none
+  - id: M01b
+    kind: decision
+    label: 'a pass''s progress is read from the breakdown `btrfs scrub status` prints under its error summary: `Corrected` is how many blocks the scrub healed through md this time round, and `Uncorrectable` is the count that means no copy can satisfy a checksum. A clean pass prints no breakdown and both read zero'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:parseScrubErrorCounts'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:reads the breakdown btrfs prints under its error summary'
+    gt: GT-22
+    next: [M02, M03, M11]
+  - id: M01
+    kind: decision
+    label: 'ARM A, "scrub until clean" (GT-22 UNEXPECTED(1)): an ordinary btrfs scrub that MEETS the rot heals the whole band through md - btrfs re-reads on a csum failure, md serves the other leg, and md propagates the write-back to BOTH legs. The pass is repeated up to three times because md''s read-balance is not contractual, with a whole-band md check after each'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:stops at the first pass whose check reads 0 — the scrub healed the band through md'
+    gt: GT-22
+    next: [M01b, M14]
+  - id: M02
+    kind: action
+    label: 'a pass''s whole-band check reads `mismatch_cnt = 0`: the legs agree again and the run stops there. `arm: scrub`, one row per pass with its `corrected` count - the cheapest arm, and the one that costs no leg read at all'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass'
+    test: 'suite:9a-reconcile'
+    gt: GT-22
+  - id: M03
+    kind: decision
+    label: 'a pass corrects NOTHING while md still counts: md is not serving the rotten leg to btrfs, so repeating the same coin flip proves nothing. Arm A stops at once and arm B takes over - this is the residual case the story names'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a pass that corrects NOTHING while md still counts stops arm A at once'
+    gt: GT-22
+    next: [M04]
+  - id: M04
+    kind: action
+    label: 'ARM B, "compare legs": both legs are read IN FULL with O_DIRECT at each leg''s OWN data offset (`rd<n>/offset` may differ) and compared in 4 KiB rows. Same IO as a check, and NO degraded window - no leg is failed, removed or re-added at any point'
+    code: 'packages/daemon/src/services/selfheal-map.ts:memberOffsetOn'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:reads both legs in windows and still decides every row — the result parses as the shared schema'
+    gt: GT-16
+    next: [M04b]
+  - id: M04b
+    kind: action
+    label: 'the WHOLE chunk tree is read once, in one dump. The forward chain walks it by key because it starts from a logical byte; arm B starts from an md byte and nothing in the tree is keyed by device offset, so there is no walk to make. Affordable where the csum tree is not: a chunk covers a gigabyte'
+    code: 'packages/daemon/src/services/selfheal-map.ts:readAllChunkItems'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:arbitrates a rotten DATA row by its stored checksum and writes the winner through md'
+    gt: GT-2
+    next: [M05]
+  - id: M05
+    kind: decision
+    label: 'each DIFFERING row is mapped BACK up the chain - md byte to LV byte through the dm segment, LV byte to btrfs logical through the covering chunk''s own delta (the GT-2 hop, inverted; a DUP metadata chunk''s second copy answers too, and says which copy it is). The chunk''s TYPE then says which authority arbitrates the row'
+    code: 'packages/daemon/src/services/selfheal-map.ts:logicalForMdByte'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:is the exact inverse of the forward hop, dm offset and chunk delta included'
+    gt: GT-2
+    next: [M06, M07, M08, M09, M16]
+  - id: M06
+    kind: action
+    label: 'DATA chunk: the csum btrfs stored for that logical byte arbitrates. crc32c each leg''s row, and the leg that matches WINS - its bytes are written THROUGH md, which writes both legs. The same write the repair engine makes, for the same reason'
+    action: md-block-write
+    code: 'packages/daemon/src/services/selfheal-csum.ts:readStoredCsum'
+    test: 'suite:9b-compare'
+    gt: GT-7
+  - id: M07
+    kind: action
+    label: 'METADATA or SYSTEM chunk: btrfs stores no EXTENT_CSUM for a tree block - the checksum is in the node''s own header, over its own bytes. The containing 16 KiB node is read off each leg and checked the way btrfs checks it; the leg whose copy vouches for itself wins. The verdict is cached per node (a node is four rows)'
+    action: md-block-write
+    code: 'packages/daemon/src/services/selfheal-csum.ts:verifyNode'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a METADATA row is decided by the node''s own header checksum'
+    gt: GT-20
+  - id: M08
+    kind: refusal
+    label: 'nothing can arbitrate the row, and it is LEFT EXACTLY AS IT IS: a row in no chunk at all is free space (btrfs has never written there, and legs may disagree about it), and a DATA row with no stored csum is a NOCOW file, a prealloc range or `nodatasum`. Counted as `freeSpaceRows` / `uncheckedRows` and reported, never guessed at'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:counts rows in no chunk as free space and leaves them exactly as they are'
+    gt: none
+  - id: M09
+    kind: refusal
+    label: 'BOTH legs fail the row''s checksum (or both pass while holding different bytes): `unresolvedRows`, nothing written, outcome `residual`. Neither copy is the file, so the file needs restoring from backup - and the band''s leftover mismatch is reported rather than hidden'
+    action: restore-from-backup-advice
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'suite:9-neg'
+    gt: GT-22
+  - id: M16
+    kind: residual
+    label: 'arm B decided every row it could and the verifying whole-band check STILL counts: `residual`, never `reconciled`. The rows with no checksum are named as the likely remainder, because they are the ones this verb deliberately did not touch'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a band that comes back still mismatched is a residual, never a success'
+    gt: GT-22
+  - id: M10
+    kind: refusal
+    label: '`not-a-mirror-band`: a parity band''s mismatch is parity disagreeing with the data, and it has a verb of its own (Rewrite parity). Not a state that passes - it never becomes true for that band. The pair with `not-a-parity-band` is what carries the epic''s invariant at both doors'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:parityBandRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a PARITY band outright — it never becomes a mirror'
+    gt: GT-18
+  - id: M11
+    kind: notification
+    label: 'a scrub pass reported UNCORRECTABLE errors: the files are NAMED and the run CARRIES ON. This is the one place the mirror verb''s gates differ from Rewrite parity''s - that verb aborts on any finding because md repair would bless the rot, and this one writes no row it cannot prove. A file no copy can satisfy is a fact to report (and its rows come back as `unresolvedRows`), not a reason to leave the rest of the band mismatched. The notification is a `warning` even when the band itself comes out clean'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:NAMES an uncorrectable file and carries on — it is a fact to report, not a refusal'
+    gt: GT-22
+    next: [M04]
+  - id: M12
+    kind: refusal
+    label: '`array-busy` / `job-active`: degraded, mid-sync, sync window still bounded (GT-13''s trap - the whole-band check is this run''s only proof), or another scrub/repair/rewrite/reconcile in flight. Every one of them re-taken immediately before arm B writes anything'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileArrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a degraded band, a busy one, and one whose sync window is still bounded'
+    gt: GT-17
+    next: [M12b]
+  - id: M12b
+    kind: refusal
+    label: '`bad-blocks-present`: a leg with recorded md bad-block ranges serves EIO for them and holds no correct copy, so a row inside one cannot be read off that leg at all - and arm B''s whole method is reading both legs. Replace the member first; not a wait-and-retry state'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorBadBlocksRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a band with recorded md bad blocks — md holds no correct copy there'
+    gt: none
+  - id: M13
+    kind: refusal
+    label: 'md''s own `repair` is refused BEFORE the process is spawned, on every door of the executor this verb uses - `exec`, `pipeline` and `execToStream` alike (GT-22(f): on a mirror it copies leg 0 blindly, and junk on leg 0 was propagated to leg 1 on the rig). The ruling is absolute, so this is a wrapper and not a convention: there is no way past it'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorGuardedExecutor'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:the guarded executor never lets one through, on any of its three doors'
+    gt: GT-22
+    next: [M13b]
+  - id: M13b
+    kind: refusal
+    label: 'the guard itself THROWS rather than warning: a run that reached this point has a bug in ANAS, and the correct outcome of that bug is a failed job - never a blessed rot. The suite asserts the same invariant on the RUN instead of on the source: md announces `md: repair of RAID array mdN` when it takes one, and no case-9 row may find that line'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:assertNoMdRepair'
+    test: 'suite:9-neg-no-md-repair'
+    gt: GT-22
+  - id: M14
+    kind: refusal
+    label: 'md took an operation of its own while a whole-band check was running (a leg failing puts it into `recover`): the run walks away with every knob exactly as md left it, and reports `residual` with `foreign-sync-op`. Same waiter, same ownership rule as the parity rewrite - one place decides'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:waitForOwnSyncOp'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:walks away when md takes an operation of its own mid-check'
+    gt: GT-13
+  - id: M17
+    kind: ui
+    label: 'the confirm gate states both arms and their cost, that a row with no checksum is LEFT EXACTLY AS IT IS, that a row neither leg satisfies is never written, that the pool stays ONLINE and undegraded throughout (the whole difference from doing it by hand with mdadm), and that md''s own repair is not used and must not be run by hand either'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileWarnings'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:names both arms, what is left alone, and the absence of a degraded window'
+    gt: GT-22
+  - id: M15
+    kind: ui
+    label: 'the result, in the window the request was made from: which ARM answered, the counts before and after, the rows nothing could arbitrate, and - on anything but `reconciled` - that the band is NOT clean and md repair is still the wrong thing to reach for. The notification says the same, once'
+    code: 'packages/pve-integration/src/69-scrubs.js:showMirrorResult'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:the ARM that answered is named — arm A is the ordinary scrub healing it'
+    gt: none

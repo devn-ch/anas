@@ -594,3 +594,171 @@ export const AhrParityRewriteResult = z.object({
   durations: AhrParityRewriteDurations,
 })
 export type AhrParityRewriteResult = z.infer<typeof AhrParityRewriteResult>
+
+// ---------------------------------------------------------------------------
+//  Reconcile mirror (story selfheal.11) — POST /v1/ahr/:name/mirror-reconcile
+// ---------------------------------------------------------------------------
+
+/**
+ * Body of POST /v1/ahr/:name/mirror-reconcile — the ONE mirror band to
+ * reconcile.
+ *
+ * A band at a time, like the parity rewrite and for the same reason: md counts
+ * disagreeing legs over a whole array and never says WHERE they disagree, so
+ * the honest scope of "the legs of this band disagree somewhere" is the band —
+ * and the operator confirms one band's worth of reading with that band's own
+ * estimate in front of them.
+ */
+export const AhrMirrorReconcileRequest = z.object({
+  band: z.number().int().positive(),
+})
+export type AhrMirrorReconcileRequest = z.infer<typeof AhrMirrorReconcileRequest>
+
+/**
+ * Which arm of the verb answered (story selfheal.11, RULED 2026-09-14).
+ *
+ * - `scrub` — arm A, "scrub until clean". GT-22's UNEXPECTED(1): a btrfs scrub
+ *   that meets a mirror band's rot heals the whole band THROUGH md — btrfs
+ *   re-reads on a checksum failure, md's read-balance serves the other leg, and
+ *   the good block goes back to BOTH legs. md's read-balance is not
+ *   contractual, so the pass is repeated (bounded), and each pass's
+ *   `corrected` count is progress.
+ * - `compare` — arm B, "compare legs". The scrub could not reach it (md never
+ *   served the rotten leg), so both legs are read directly, row by row, and
+ *   every differing row is arbitrated against the checksum btrfs stored for it.
+ */
+export const AhrMirrorReconcileArm = z.enum(['scrub', 'compare'])
+export type AhrMirrorReconcileArm = z.infer<typeof AhrMirrorReconcileArm>
+
+/**
+ * What the run did.
+ *
+ * - `reconciled` — the legs agree and a whole-band md check counted 0.
+ * - `refused` — a precondition did not hold (see `reasonCode`). Nothing was
+ *   written.
+ * - `residual` — the run wrote what it could prove and the band is STILL not
+ *   clean: rows where neither leg matched the checksum btrfs stored for them
+ *   (`unresolvedRows`), or a check that came back non-zero anyway. Not a
+ *   success, and it must never be rendered as one.
+ */
+export const AhrMirrorReconcileOutcome = z.enum(['reconciled', 'refused', 'residual'])
+export type AhrMirrorReconcileOutcome = z.infer<typeof AhrMirrorReconcileOutcome>
+
+/**
+ * Why a run refused, for a parser. The operator's sentence is `reason`.
+ *
+ * `not-a-mirror-band` is this verb's `not-a-parity-band`: it never becomes true
+ * for a parity band, which has a verb of its own. The pair is deliberate —
+ * between them they carry the epic's standing invariant that `mdadm
+ * --action=repair` is issued on a parity band with the data proven intact and
+ * on nothing else, ever (RULED 2026-09-14).
+ *
+ * There is deliberately NO `data-corruption-found` here, and that is the one
+ * place this verb's gates differ from the parity rewrite's. That verb aborts on
+ * any finding because md repair would recompute parity from the rot and bless
+ * it; this one writes no row it cannot prove, so a file neither leg can satisfy
+ * is reported (`btrfsErrors`, `findings`, and its rows as `unresolvedRows`) and
+ * is not a reason to leave the rest of the band mismatched.
+ */
+export const AhrMirrorReconcileReasonCode = z.enum([
+  'no-mirror-mismatch',
+  'not-a-mirror-band',
+  'data-findings-present',
+  'array-busy',
+  'job-active',
+  'bad-blocks-present',
+  'foreign-sync-op',
+  'no-such-band',
+  'pool-not-mounted',
+])
+export type AhrMirrorReconcileReasonCode = z.infer<typeof AhrMirrorReconcileReasonCode>
+
+/** One arm-A pass: what the btrfs scrub corrected, and what md counted after it. */
+export const AhrMirrorReconcilePass = z.object({
+  /** `corrected_errors` of that btrfs scrub pass — every one of them is progress. */
+  corrected: z.number().int().nonnegative(),
+  /**
+   * `mismatch_cnt` of the whole-band md check that followed the pass, or null
+   * when the counter could not be read. Never reported as 0 when unknown.
+   */
+  mismatchAfter: z.number().int().nonnegative().nullable(),
+})
+export type AhrMirrorReconcilePass = z.infer<typeof AhrMirrorReconcilePass>
+
+/** How many rows each leg won, by role index — the write's own audit line. */
+export const AhrMirrorReconcileWrites = z.object({
+  leg0: z.number().int().nonnegative(),
+  leg1: z.number().int().nonnegative(),
+})
+export type AhrMirrorReconcileWrites = z.infer<typeof AhrMirrorReconcileWrites>
+
+/** How long each phase took, in milliseconds — the run's own clock. */
+export const AhrMirrorReconcileDurations = z.object({
+  /** Every arm-A btrfs scrub pass together. */
+  scrubMs: z.number().int().nonnegative(),
+  /** Arm B: reading both legs, arbitrating, and writing the winners. */
+  compareMs: z.number().int().nonnegative(),
+  /** Every whole-band md check the run issued, together. */
+  checkMs: z.number().int().nonnegative(),
+  totalMs: z.number().int().nonnegative(),
+})
+export type AhrMirrorReconcileDurations = z.infer<typeof AhrMirrorReconcileDurations>
+
+/**
+ * The result of a mirror-reconcile job (story selfheal.11).
+ *
+ * `mismatchBefore` is md's counter as it read with the band idle at the start
+ * of the run; `mismatchAfter` is the last whole-band check's own count. Both
+ * are nullable because a counter that could not be read is reported as
+ * unknown, never as zero.
+ *
+ * The four row counts are the honesty of arm B, and they are not
+ * interchangeable:
+ *  - `rowsWritten` — a leg matched the checksum btrfs stored for the row, and
+ *    its bytes went through md to both legs.
+ *  - `freeSpaceRows` — the row is in no chunk at all. btrfs has never written
+ *    there, nothing knows what it should hold, and legs are allowed to
+ *    disagree about free space. Skipped, never written.
+ *  - `uncheckedRows` — the row is in a DATA chunk with NO stored checksum (a
+ *    hand-set NOCOW file, a prealloc range, `nodatasum`). There is nothing to
+ *    arbitrate with. Skipped, never written.
+ *  - `unresolvedRows` — both legs failed. Nothing written, and the band's
+ *    residual is reported rather than hidden.
+ */
+export const AhrMirrorReconcileResult = z.object({
+  /** The AHR pool the band belongs to. */
+  pool: z.string(),
+  /** Band index (1-based), as the request named it. */
+  band: z.number().int().positive(),
+  /** The md array that band is (`/dev/md/tank-r2`), or null when unresolved. */
+  array: z.string().nullable(),
+  /**
+   * The arm the run ended in. `scrub` while arm A is still running or answered;
+   * `compare` from the moment arm A gives up, which includes the refusals taken
+   * at arm B's own gate (the preconditions are re-read there, and one of them
+   * can have stopped being true during a scrub that took hours).
+   */
+  arm: AhrMirrorReconcileArm,
+  /** One entry per arm-A btrfs scrub pass, in order. */
+  passes: z.array(AhrMirrorReconcilePass).default([]),
+  /** 4 KiB rows arm B read off both legs. Zero when arm A answered. */
+  rowsCompared: z.number().int().nonnegative().default(0),
+  /** Of those, the rows whose legs held different bytes. */
+  rowsDiffering: z.number().int().nonnegative().default(0),
+  rowsWritten: AhrMirrorReconcileWrites.default({ leg0: 0, leg1: 0 }),
+  freeSpaceRows: z.number().int().nonnegative().default(0),
+  uncheckedRows: z.number().int().nonnegative().default(0),
+  unresolvedRows: z.number().int().nonnegative().default(0),
+  mismatchBefore: z.number().int().nonnegative().nullable(),
+  mismatchAfter: z.number().int().nonnegative().nullable(),
+  outcome: AhrMirrorReconcileOutcome,
+  /** One sentence for the operator — always set on anything but `reconciled`. */
+  reason: z.string().optional(),
+  reasonCode: AhrMirrorReconcileReasonCode.optional(),
+  /** A btrfs scrub pass's `Error summary:` line, verbatim, when it was not clean. */
+  btrfsErrors: z.string().nullable().optional(),
+  /** The corrupt files a refusing pass named, when attribution ran. */
+  findings: z.array(AhrScrubFinding).optional(),
+  durations: AhrMirrorReconcileDurations,
+})
+export type AhrMirrorReconcileResult = z.infer<typeof AhrMirrorReconcileResult>

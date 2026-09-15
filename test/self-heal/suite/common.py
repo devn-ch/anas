@@ -986,3 +986,75 @@ def call_parity(mountpoint: str, band: int, report: str | None = None,
         with open(log, "w") as fh:
             fh.write(f"$ {' '.join(cmd)}\nrc={r.returncode}\n{out}\n")
     return r.returncode, out
+
+
+# ---------------------------------------------------------------- mirror cmd
+
+MIRROR_CMD = os.environ.get("MIRROR_CMD") or f"python3 {GT}/suite/mirror-ref.py"
+
+
+def call_mirror(mountpoint: str, band: int, report: str | None = None,
+                log: str | None = None, evidence: str | None = None,
+                passes: int | None = None,
+                command: str | None = None) -> tuple[int, str]:
+    """Run the mirror-reconcile verb under test (story selfheal.11, cases 9).
+
+    Contract - the same shape as REPAIR_CMD and PARITY_CMD, one verb along:
+      `<cmd> [--evidence <file>] [--passes N] <mountpoint> <band>`
+      exit 0 reconciled - 2 residual - 3 refused - 1 internal error
+      MIRROR_REPORT=<path> writes a JSON sidecar; the suite reads `outcome`,
+      `reason`, `reason_code`, `arm`, `passes`, `rows_compared`,
+      `rows_differing`, `rows_written`, `free_space_rows`, `unchecked_rows`,
+      `unresolved_rows`, `mismatch_before`, `mismatch_after` and `array`.
+
+    The EVIDENCE GATE is the parity verb's, one story along: a rig has no
+    daemon and no job queue, so `--evidence <file>` (a JSON `{"mismatch_cnt":
+    N}` with N > 0, produced by the suite's own bounded check) stands in for
+    "the pool's last completed scrub counted disagreeing legs on this band".
+    Without it the verb must refuse: exit 3, `no-mirror-mismatch`.
+
+    `--passes N` bounds arm A ("scrub until clean"). Case 9b passes 1 so the
+    run falls through to arm B deterministically instead of depending on
+    whether md happened to serve the rotten leg a second time; the reference
+    accepts the flag and ignores it (it is compare-legs only)."""
+    import shlex
+    base = shlex.split(command if command is not None else MIRROR_CMD)
+    cmd = base + (["--evidence", evidence] if evidence else []) \
+        + (["--passes", str(passes)] if passes is not None else []) \
+        + [mountpoint, str(band)]
+    env = dict(os.environ)
+    if report:
+        env["MIRROR_REPORT"] = report
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL)
+    out = (r.stdout + r.stderr).strip()
+    if log:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "w") as fh:
+            fh.write(f"$ {' '.join(cmd)}\nrc={r.returncode}\n{out}\n")
+    return r.returncode, out
+
+
+def kernel_md_log() -> list[str]:
+    """The kernel ring buffer's md lines, right now.
+
+    md announces every sync operation it starts. Captured verbatim on the node
+    (kernel 7.0.14-17-pve, 2026-09-15) on a 2 x 200 MiB loop RAID1:
+
+        md: check of RAID array md127     /  md: md127: check done.
+        md: repair of RAID array md127    /  md: md127: repair done.
+
+    That is what lets the case-9 rows assert the epic's invariant on the RUN
+    rather than on the verb's source: whatever the implementation, if md ever
+    took a repair on the mirror band the kernel said so."""
+    r = subprocess.run(["dmesg"], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+    return [l for l in r.stdout.splitlines() if "md:" in l]
+
+
+def md_repair_lines(before: list[str], mddev: str) -> list[str]:
+    """New `md: repair of RAID array <kernel>` lines for this array."""
+    kernel = os.path.basename(os.path.realpath(mddev))
+    fresh = kernel_md_log()[len(before):]
+    return [l for l in fresh
+            if re.search(rf"md: repair of RAID array {re.escape(kernel)}\b", l)]

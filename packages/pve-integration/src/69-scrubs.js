@@ -114,7 +114,8 @@
  * 'anas-grid-scrub-findings' (itemId '#findingsGrid'), repair button
  * 'anas-btn-repair-parity' and result panel '#repairResult'; parity window
  * 'anas-win-scrub-parity' with grid 'anas-grid-scrub-parity' (itemId
- * '#parityGrid'), button 'anas-btn-parity-rewrite' (itemId '#rewriteParity')
+ * '#parityGrid'), buttons 'anas-btn-parity-rewrite' (itemId '#rewriteParity')
+ * and 'anas-btn-mirror-reconcile' (itemId '#reconcileMirror', selfheal.11),
  * and result panel '#parityResult'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
@@ -540,9 +541,11 @@
                             + 'Click to rewrite that band\'s parity from the data as it stands.')
                         : t('md counted mismatches on these bands, but the checksum scrub found no corrupt files. '
                             + 'No band here is a parity band, so there is no parity to rewrite: a RAID1 mirror\'s '
-                            + 'legs disagree with each other. md\'s repair on a mirror copies the first in-sync leg '
-                            + 'over the others without looking at which one is right, so do not run md repair on a '
-                            + 'mirror: a mirror mismatch is not yet repairable from ANAS. Click for the detail.'));
+                            + 'legs disagree with each other, and one leg holds something btrfs has never been asked '
+                            + 'to read. md\'s repair on a mirror copies the first in-sync leg over the others without '
+                            + 'looking at which one is right, so do not run md repair on a mirror. '
+                            + 'Click to reconcile the mirror: ANAS re-scrubs first, then compares the legs row by row '
+                            + 'and writes back the one the checksum vouches for.'));
                 spans.push('<span class="anas-scrub-parity-link" style="color:var(--anas-warn,#b06a12);'
                     + 'cursor:pointer;text-decoration:underline;" title="' + enc(parityTip) + '">'
                     + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
@@ -1419,9 +1422,17 @@
     // array, and the operator confirms one array's worth of reading with that
     // array's own numbers in front of them.
     //
+    // Since selfheal.11 the window carries BOTH mismatch verbs, because it is
+    // where both facts are told: Rewrite parity for a parity band, Reconcile
+    // mirror for a RAID1 one. Exactly one of them can be lit for a given band,
+    // and the other says why it is dark rather than disappearing — an operator
+    // who has just read "md counted mismatches on r2" needs to know which verb
+    // applies, and that the one they were reaching for is the wrong one.
+    //
     // Test hooks: window 'anas-win-scrub-parity' with grid
-    // 'anas-grid-scrub-parity' (itemId '#parityGrid'), button
-    // 'anas-btn-parity-rewrite' (itemId '#rewriteParity') and result panel
+    // 'anas-grid-scrub-parity' (itemId '#parityGrid'), buttons
+    // 'anas-btn-parity-rewrite' (itemId '#rewriteParity') and
+    // 'anas-btn-mirror-reconcile' (itemId '#reconcileMirror'), and result panel
     // '#parityResult'.
 
     // Is the verb available at all, and if not, WHY — one rule, used by the
@@ -1432,11 +1443,23 @@
     // A RAID1 band has no parity to rewrite, and md's `repair` on a mirror
     // copies the first in-sync leg over the others without arbitrating — a
     // coin flip that overwrites the good copy half the time. The daemon
-    // refuses it (409 `not-a-parity-band`); the button says so first, so the
-    // operator is not sent to a refusal to find out.
+    // refuses Rewrite parity on it (409 `not-a-parity-band`); the button says
+    // so first, so the operator is not sent to a refusal to find out — and it
+    // names the verb that DOES apply (story selfheal.11).
     var MIRROR_BAND_REASON = 'a RAID1 mirror band has no parity to rewrite. md\'s repair on a mirror '
         + 'copies the first in-sync leg over the others without looking at which one is right, so '
-        + 'do not run md repair on a mirror: a mirror mismatch is not yet repairable from ANAS';
+        + 'do not run md repair on a mirror. Use Reconcile mirror for this band';
+
+    // What Reconcile mirror does, in the operator's terms — the two arms, in
+    // the order the job runs them, and what each one costs. One sentence pair,
+    // used by the window's head and by the confirm intro, so the operator reads
+    // the same explanation in both places.
+    var MIRROR_ARMS = 'Reconcile mirror makes the two legs agree again without ever taking one out of the '
+        + 'array. It first re-runs the ordinary checksum scrub (up to three times): a scrub that meets the '
+        + 'rot heals the band through md by itself, and md decides whether it does. If the mismatch survives '
+        + 'that, it reads BOTH legs in full, compares them row by row, and for each differing row writes back '
+        + 'the leg that matches the checksum btrfs stored for it. Rows with no checksum — free space, a '
+        + 'NOCOW file, a preallocated range — are counted and left exactly as they are.';
 
     function parityRewriteBlocked(win, hasFindings) {
         if (hasFindings) {
@@ -1460,14 +1483,52 @@
         return '';
     }
 
+    // Story selfheal.11 — the OTHER verb in this window, and the mirror image
+    // of the rule above: Reconcile mirror applies to a RAID1 band and to
+    // nothing else. Same need-gating, same "say why on a dark button rather
+    // than hide it", same refusal the daemon would 409 with.
+    function mirrorReconcileBlocked(win, hasFindings) {
+        if (hasFindings) {
+            return t('the same scrub named corrupt files. Repair those from parity first. Both arms of the '
+                + 'reconcile treat the checksum tree as the authority, and a file that already fails its '
+                + 'checksum is not one a leg can be arbitrated against');
+        }
+        var grid = win.down('#parityGrid');
+        var sel = grid && typeof grid.getSelection === 'function' ? grid.getSelection() : [];
+        if (!sel || !sel.length) {
+            return t('select the band to reconcile');
+        }
+        if (sel.length > 1) {
+            return t('one band at a time: md counts disagreeing legs over a whole array, and the estimate is that array\'s');
+        }
+        if (!(Number(sel[0].get('bandIndex')) > 0)) {
+            return t('this scrub did not record the band number. Scrub the pool again');
+        }
+        var level = String(sel[0].get('level') || '');
+        if (!level) {
+            return t('this scrub did not record what level the band is, and the two mismatch verbs are not '
+                + 'interchangeable. Scrub the pool again');
+        }
+        if (level !== 'raid1') {
+            return t('a ' + level + ' band is a parity band, not a mirror. Its mismatch is parity disagreeing '
+                + 'with the data, which is what Rewrite parity is for');
+        }
+        return '';
+    }
+
     function updateParityButton(win, hasFindings) {
         var btn = win.down('#rewriteParity');
-        if (!btn) {
-            return;
+        if (btn) {
+            var why = parityRewriteBlocked(win, hasFindings);
+            btn.setDisabled(!!why);
+            btnSetTip(btn, why);
         }
-        var why = parityRewriteBlocked(win, hasFindings);
-        btn.setDisabled(!!why);
-        btnSetTip(btn, why);
+        var mbtn = win.down('#reconcileMirror');
+        if (mbtn) {
+            var mwhy = mirrorReconcileBlocked(win, hasFindings);
+            mbtn.setDisabled(!!mwhy);
+            btnSetTip(mbtn, mwhy);
+        }
     }
 
     // The result, in the same window the request was made from: what md's
@@ -1506,6 +1567,103 @@
                 + String(res.btrfsErrors)));
         }
         panel.update(lines.join('<br>'));
+    }
+
+    // The mirror reconcile's result, in the same window (story selfheal.11).
+    // Which ARM answered is the first thing said — arm A means the ordinary
+    // scrub healed it, arm B means rows had to be arbitrated one by one — and
+    // the skipped counts are said whenever they are non-zero, because a row
+    // with no checksum was left exactly as it was and the operator has to know
+    // the band was not fully decided.
+    function showMirrorResult(win, job) {
+        var panel = win.down('#parityResult');
+        if (!panel) {
+            return;
+        }
+        panel.setHidden(false);
+        if (!job || job.status !== 'completed' || !job.result) {
+            panel.update(enc(t('The mirror reconcile is still running. It re-scrubs the pool and may then read both '
+                + 'legs of the band in full; its outcome arrives as a PVE notification.')));
+            return;
+        }
+        var res = job.result;
+        var before = (res.mismatchBefore === null || res.mismatchBefore === undefined)
+            ? t('unknown') : String(res.mismatchBefore);
+        var after = (res.mismatchAfter === null || res.mismatchAfter === undefined)
+            ? t('unknown') : String(res.mismatchAfter);
+        var passes = (res.passes || []).length;
+        var lines = [enc(t('Band') + ' r' + Number(res.band) + ': ' + t('mismatches before') + ' ' + before
+            + ' · ' + t('after') + ' ' + after + ' · ' + t('outcome') + ' ' + String(res.outcome || ''))];
+        lines.push(enc(res.arm === 'compare'
+            ? t('Arm B (compare legs)') + ': ' + passes + ' ' + t('scrub pass(es) did not reach it, so both legs were '
+                + 'read and compared') + '. ' + Number(res.rowsDiffering || 0) + ' ' + t('differing row(s)') + ', '
+                + ((res.rowsWritten && (Number(res.rowsWritten.leg0 || 0) + Number(res.rowsWritten.leg1 || 0))) || 0)
+                + ' ' + t('written back through md')
+            : t('Arm A (scrub until clean)') + ': ' + passes + ' ' + t('btrfs scrub pass(es); md served the rotten leg '
+                + 'and btrfs healed the band through it')));
+        var skipped = [];
+        if (Number(res.uncheckedRows || 0) > 0) {
+            skipped.push(Number(res.uncheckedRows) + ' ' + t('row(s) with no stored checksum (left as they are)'));
+        }
+        if (Number(res.freeSpaceRows || 0) > 0) {
+            skipped.push(Number(res.freeSpaceRows) + ' ' + t('row(s) in free space (nothing knows what they should hold)'));
+        }
+        if (Number(res.unresolvedRows || 0) > 0) {
+            skipped.push(Number(res.unresolvedRows) + ' ' + t('row(s) where NEITHER leg matched — never written'));
+        }
+        if (skipped.length) {
+            lines.push(enc(t('Not decided') + ': ' + skipped.join(' · ')));
+        }
+        if (res.outcome === 'reconciled') {
+            lines.push(enc(t('The legs agree again, and the verifying check counted 0.')));
+        } else if (res.outcome === 'residual') {
+            lines.push(enc(t('The band is NOT clean. Do not treat it as healthy, and do not run md repair on it — on a '
+                + 'mirror that copies the first in-sync leg over the other without looking at which one is right. '
+                + 'The PVE notification has the detail.')));
+        }
+        if (res.reason) {
+            lines.push(enc(String(res.reason)));
+        }
+        if (res.btrfsErrors) {
+            lines.push(enc(t('A scrub pass found errors') + ': ' + String(res.btrfsErrors)));
+        }
+        panel.update(lines.join('<br>'));
+    }
+
+    function reconcileMirror(node, pool, win, hasFindings) {
+        if (mirrorReconcileBlocked(win, hasFindings)) {
+            return;
+        }
+        var grid = win.down('#parityGrid');
+        var rec = grid.getSelection()[0];
+        var band = Number(rec.get('bandIndex'));
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/ahr/' + encodeURIComponent(pool) + '/mirror-reconcile',
+            body: { band: band },
+            view: win,
+            // Up to three whole-pool scrubs, a whole-band check after each, and
+            // then possibly a full read of both legs. Hours, not seconds.
+            maxMs: 120000,
+            confirmTitle: t('Reconcile mirror'),
+            confirmIntro: enc(t('Reconciling mirror band') + ' r' + band + ' ' + t('of pool') + ' ' + pool
+                + ' (' + t('md counted') + ' ' + Number(rec.get('mismatchCnt')) + ' '
+                + t('disagreeing unit(s) there') + '). ' + t('The daemon will:')),
+            confirmButtonText: t('Reconcile mirror'),
+            failTitle: t('Reconcile mirror failed'),
+            onSubmitted: function () {
+                ANAS.toast(t('Mirror reconcile started on') + ' ' + pool + ' r' + band);
+                updateParityButton(win, hasFindings);
+            },
+            onComplete: function (job) {
+                try {
+                    showMirrorResult(win, job);
+                } catch (e) {
+                    ANAS.warn('mirror reconcile result failed: ' + ANAS.errText(e));
+                }
+            }
+        });
     }
 
     function rewriteParity(node, pool, win, hasFindings) {
@@ -1595,18 +1753,14 @@
                         : (allMirror
                             ? t('md counted mismatches on these bands and the checksum pass found nothing. These are '
                                 + 'RAID1 mirror bands: md counted legs that disagree with each other, and there is '
-                                + 'no parity here to rewrite. md\'s repair on a mirror copies the first in-sync leg '
-                                + 'over the others without looking at which one is right, so do not run md repair '
-                                + 'on a mirror: a mirror mismatch is not yet repairable from ANAS.')
+                                + 'no parity here to rewrite. ') + t(MIRROR_ARMS)
                             : t('md counted parity mismatches on these bands and the checksum pass found nothing. On a '
                                 + 'parity band the data is right, and the parity is what is wrong. Rewriting recomputes '
                                 + 'that band\'s parity from the data as it stands. A fresh checksum scrub of the whole '
                                 + 'pool runs first (usually the longest part of the run), and any finding aborts it.')
                             + (anyMirror
-                                ? ' ' + t('A RAID1 band in this list has no parity to rewrite. md\'s repair on a mirror '
-                                    + 'copies the first in-sync leg over the others without looking at which one is '
-                                    + 'right, so do not run md repair on a mirror: a mirror mismatch is not yet '
-                                    + 'repairable from ANAS.')
+                                ? ' ' + t('A RAID1 band in this list has no parity to rewrite: its legs disagree with '
+                                    + 'each other. ') + t(MIRROR_ARMS)
                                 : '')))
                 },
                 {
@@ -1661,6 +1815,17 @@
                     iconCls: 'fa fa-refresh',
                     disabled: true,
                     handler: function () { rewriteParity(node, pool, win, hasFindings); }
+                },
+                {
+                    // Story selfheal.11 — the mirror's own verb, beside the
+                    // parity one. Exactly one of the two can ever be lit for a
+                    // given band, and the dark one says why.
+                    text: t('Reconcile mirror'),
+                    itemId: 'reconcileMirror',
+                    cls: 'anas-btn-mirror-reconcile',
+                    iconCls: 'fa fa-clone',
+                    disabled: true,
+                    handler: function () { reconcileMirror(node, pool, win, hasFindings); }
                 },
                 {
                     text: t('Close'),

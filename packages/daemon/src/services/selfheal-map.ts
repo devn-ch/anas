@@ -1239,6 +1239,84 @@ export async function locateLogical(
   return locateLogicalIn(logical, chunk, ctx.bands)
 }
 
+// ---------------------------------------------------------------------------
+//  The chain, run backwards (story selfheal.11)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every CHUNK_ITEM of the filesystem, in ONE dump, merged into the run's cache.
+ *
+ * The forward chain never needs this: it starts from a logical byte and the
+ * chunk tree is keyed BY logical byte, so one bounded `dump-tree -b` walk lands
+ * on the covering item. The mirror reconcile (selfheal.11) starts from an md
+ * byte and asks the opposite question — "which chunk was mapped HERE?" — and
+ * nothing in the tree is keyed by device offset, so there is no walk to make.
+ * The only honest answer is to read the whole chunk tree once.
+ *
+ * That is affordable where the csum tree is not (README: 8 TB of data carries
+ * ~8 GB of checksums, which is why the engine never dumps THAT one). A chunk
+ * covers a gigabyte of data or a quarter of one of metadata, so the same 8 TB
+ * carries a few thousand chunk items — one bounded read, once per run, and
+ * every later `coveringChunk` for that run is answered from the cache it fills.
+ */
+export async function readAllChunkItems(
+  executor: CommandExecutor,
+  ctx: SelfhealContext,
+): Promise<ChunkItem[]> {
+  const r = await executor.exec(BTRFS, ['inspect-internal', 'dump-tree', '-t', '3', ctx.srcDevice])
+  if (r.exitCode !== 0)
+    throw new SelfhealMapError(`btrfs inspect-internal dump-tree -t 3 ${ctx.srcDevice} failed: ${r.stderr.trim()}`)
+  mergeChunks(ctx, parseChunkItems(r.stdout))
+  return ctx.chunks
+}
+
+/** Where an md byte came from, read back up the chain. */
+export interface LogicalForMdByte {
+  /** The btrfs logical bytenr mapped onto this md byte. */
+  logical: number
+  /** Byte offset within the btrfs device (the LV) — the middle of the hop. */
+  lvByte: number
+  /** The chunk that covers it — `type` says DATA, METADATA or SYSTEM. */
+  chunk: ChunkItem
+  /**
+   * Which COPY of that chunk this md byte is. A `single` chunk has one (0); a
+   * `DUP` metadata chunk has two, and the same logical byte is at two different
+   * device offsets, so the copy has to be carried rather than assumed.
+   */
+  copy: number
+}
+
+/**
+ * md byte → LV byte → btrfs logical: the inverse of the forward hop
+ * (`locateLogicalIn` + {@link logicalToLvByte}), for ONE band.
+ *
+ * `null` is a real answer and the common one: an md byte in no chunk at all is
+ * FREE SPACE. btrfs has never written there, nothing on this node knows what it
+ * should hold, and two mirror legs are entitled to disagree about it — so a
+ * caller must skip such a row rather than pick a winner for it.
+ *
+ * Pure, and given the chunk list rather than fetching it, for the same reason
+ * `locateLogicalIn` is: the whole chain can then be asserted against captured
+ * rig output with no executor anywhere near it.
+ */
+export function logicalForMdByte(
+  mdByte: number,
+  band: SelfhealBand,
+  chunks: readonly ChunkItem[],
+): LogicalForMdByte | null {
+  const seg = band.segment
+  const lvByte = mdByte + seg.startSector * 512 - seg.offsetSector * 512
+  if (lvByte < 0)
+    return null
+  for (const chunk of chunks) {
+    for (const [copy, deviceOffset] of chunkStripeOffsets(chunk).entries()) {
+      if (lvByte >= deviceOffset && lvByte < deviceOffset + chunk.length)
+        return { logical: lvByte - deviceOffset + chunk.logical, lvByte, chunk, copy }
+    }
+  }
+  return null
+}
+
 /** The inode number of a path. */
 async function inodeOf(executor: CommandExecutor, path: string): Promise<number> {
   const r = await executor.exec(STAT, ['-c', '%i', path])

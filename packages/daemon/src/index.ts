@@ -75,7 +75,7 @@ async function main() {
         // snapshot are in USE; reconciling over them sweeps the pin and widens
         // the window under a live run (sixth pass, N9).
         activeJob: pool => decorated.jobQueue.findActive(
-          ['ahr.repair', 'ahr.parity-rewrite', 'ahr.scrub'],
+          ['ahr.repair', 'ahr.parity-rewrite', 'ahr.mirror-reconcile', 'ahr.scrub'],
           pool,
         ) ?? null,
         // The mdcheck-ownership note (the preset ruling, F7) reads the node's
