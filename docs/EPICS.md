@@ -295,6 +295,20 @@ Reference PASS (41/41 cases, 14/14 negative controls); the engine's record
 
 **identity.1** As a user, I want share users and groups to work the way the system underneath allows (GitHub #60): (a) **mixed-case names** — the identity name schema accepts what `useradd` accepts (`[A-Za-z_][A-Za-z0-9_-]*\$?`), UI validation mirrors it; (b) **SMB password presence is matched case-insensitively** — Samba treats names case-insensitively and may store a different case than passwd, so the Share Users list compares passwd and passdb names folded; (c) **no user-private group** — share users are created with `useradd -N` and the default group, so no phantom same-named group appears (existing users keep theirs; the list explains a private group when one exists); (d) **delete verbs** — `DELETE /v1/identity/users/:name` and `DELETE /v1/identity/groups/:name`, confirm-gated (409 + `X-Anas-Confirm-Code`) with warnings naming the shares/ACLs that reference the identity and the files it owns (ownership is NOT changed; the uid/gid stays on disk), refusing a group that is any user's primary group or a user referenced by a share until the reference is removed; `smbpasswd -x` for a user with a passdb entry; UI Delete buttons on both grids; DESIGN.md API table rows. Tests at both boundaries + harness. *(Reporter's 4 symptoms map to a–d.)*
 
+### 0.4.0 — accepted 2026-09-14 (operator: "a full and solid release"); work starts after 0.3.2 ships
+
+> Theme: the NAS reaches out, boots the fleet, and serves its clients' history. Stories below are AUTHORIZED in scope; each still gets its detailed story text (and PXE its design pass) before dispatch.
+
+**rclone.1** Cloud sync via rclone (GitHub #57) — one-way copy/sync of a dataset or share path to an rclone remote on the schedule-unit pattern; rclone installed as a dependency like samba; remotes configured through ANAS with secrets held like backup credentials (0600, write-only); a job + notification per run; no cloud-vendor APIs, no two-way sync, no restore UI in the first cut.
+
+**pxe.1** PXE boot images — DESIGN FIRST (own session): images stored on a dataset, served by wiring up existing tools (dnsmasq proxyDHCP + TFTP, HTTP for UEFI boot), an iPXE menu generated from what is on the share; proxyDHCP ONLY, never own DHCP; scoped per bridge; two uses: (a) VM installers/live images, (b) other PVE nodes — the Proxmox installer with an answer file served over HTTP (automated install of a new/replacement node from the NAS) and a rescue image (the bare-metal end of DR). The node hosting ANAS cannot netboot from itself.
+
+**smbsvc.1** Snapshot self-service on SMB shares — Previous Versions via `vfs_shadow_copy2` over the existing snapshot schedules (snapshot-name contract to settle) + **smbsvc.2** a recycle bin via `vfs_recycle` (purge policy to settle); per-share checkboxes; surgical smb.conf edits. **smbsvc.3** Time Machine target — a per-share checkbox (`vfs_fruit` + `fruit:time machine` + a forced size cap), no avahi in v1; folded in because it is the same Samba vfs family.
+
+**backup2.11** Backup source guard — a backup pre-flight refuses an archive path on a configured-but-unmounted mount (the 2026-08 boot-race incident); the facts are already in the inventory.
+
+**disks.1** Periodic SMART re-probe — measured disks are probed once per daemon lifetime today; re-probe on a bounded cadence honouring `-n standby` (never wake a disk), so health and the standby/stale marks stay current.
+
 ## 4. Candidates (serious; not authorized)
 
 One paragraph each. Promotion to §3 is an operator call.
