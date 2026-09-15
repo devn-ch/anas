@@ -42,12 +42,13 @@ import { DEFAULT_SYSTEMD_DIR } from './snapshot-schedule-units.js'
  */
 
 const ZFS = '/usr/sbin/zfs'
-const SYSTEMCTL = '/usr/bin/systemctl'
+/** The one systemctl binary, exported for the callers that read unit state too. */
+export const SYSTEMCTL = '/usr/bin/systemctl'
 const SCRUB_PROPERTY = 'org.debian:periodic-scrub'
 /** The mdadm timers ANAS takes over (`start` fires the check, `continue` resumes it). */
 const MDCHECK_TIMERS = ['mdcheck_start.timer', 'mdcheck_continue.timer']
 /** The one we READ mdcheck state from (`Also=` keeps them in lockstep). */
-const MDCHECK_PRIMARY = 'mdcheck_start.timer'
+export const MDCHECK_PRIMARY = 'mdcheck_start.timer'
 
 // --- ZFS: org.debian:periodic-scrub property --------------------------------
 

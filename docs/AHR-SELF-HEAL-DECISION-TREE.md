@@ -98,7 +98,7 @@ every entry on it is a fault where a restore is the only action left.
 | R2 | btrfs csum error — one data member rotted below md | 49 | 4 | 0 | 0 |
 | R3 | two damaged members in one stripe (RAID5 unrepairable / RAID6 Q path) | 15 | 1 | 0 | 0 |
 | R4 | rot that arrived THROUGH md (parity agrees with the bad data) | 33 | 4 | 0 | 0 |
-| R5 | metadata rot (csum tree / fs tree) in a DUP copy | 26 | 3 | 1 | 1 |
+| R5 | metadata rot (csum tree / fs tree) in a DUP copy | 29 | 4 | 1 | 1 |
 | R6 | compressed-extent rot | 33 | 2 | 0 | 1 |
 | R7 | rot in a file without checksums (NOCOW / prealloc / nodatasum) | 7 | 2 | 0 | 0 |
 | R8 | rot in an extent referenced only by a snapshot (outsideMount) | 8 | 4 | 0 | 0 |
@@ -119,8 +119,8 @@ every entry on it is a fault where a restore is the only action left.
 | R23 | the pool's top-level mount held by a backup during a repair | 12 | 3 | 0 | 0 |
 | R24 | the operator names a path outside the pool — a symlink, a bind mount | 5 | 4 | 0 | 0 |
 
-**24 roots · 246 nodes · 57 terminal leaves · 4 with no code · 6 with no test ·
-0 orphan nodes · 54 orphan exported actions · 0 mis-applied actions.**
+**24 roots · 249 nodes · 58 terminal leaves · 4 with no code · 6 with no test ·
+0 orphan nodes · 58 orphan exported actions · 0 mis-applied actions.**
 
 ## The trees
 
@@ -157,7 +157,7 @@ flowchart TD
   U02r[["the Scrubs parity indicator reads the NEWER of the pool's last completed…"]]
   S07["the band is idle (just proven), so the window is widened back to md's own…"]
   S08["mdadm --action=check on the band"]
-  S42{"Error summary clean: no journal is read and nothing is probed"}
+  S42{"Error summary clean: no ATTRIBUTION is read and nothing is probed"}
   P04["confirm gate: what parity is recomputed FROM, the fresh scrub that aborts the…"]
   J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
   S07a(["the widen did not take: the band is skipped rather than checked over a sliver…"])
@@ -285,7 +285,7 @@ flowchart TD
 | `U02r` | ui | the Scrubs parity indicator reads the NEWER of the pool's last completed scrub and its last completed repair, so the residual opens the same door a scrub's row does | `packages/pve-integration/src/69-scrubs.js:latestParityByPool` | `packages/pve-integration/test/dialog-contracts.harness.mjs:the Scrubs row shows the parity indicator from the REPAIR job (F2)` | — |
 | `S07` | action | the band is idle (just proven), so the window is widened back to md's own 0..max before the check goes in | `packages/daemon/src/services/ahr-scrub.ts:restoreSyncWindow` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:restores a sync window an interrupted repair left bounded` | `GT-13` |
 | `S08` | action | `mdadm --action=check` on the band — issued without `run`, so one band's refusal is a line, never the job's failure | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:records a band whose check mdadm refuses` | `GT-5` |
-| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
+| `S42` | decision | Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window` | `GT-3` |
 | `P04` | action | confirm gate: what parity is recomputed FROM, the fresh scrub that aborts the run, the NOCOW blind spot, and a duration that INCLUDES phase 1's whole-pool scrub | `packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteWarnings` | `packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:the estimate INCLUDES phase 1's full-pool checksum scrub (N8)` | — |
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
 | `S07a` | refusal | the widen did not take: the band is skipped rather than checked over a sliver of itself | `packages/daemon/src/services/ahr-scrub.ts:restoreSyncWindow` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:restores a sync window an interrupted repair left bounded` | `GT-13` |
@@ -560,7 +560,7 @@ flowchart TD
   S40["phase 2/2: btrfs scrub start polled to finished"]
   S20{"mismatch_cnt on this band"}
   S17{"the check went idle: mismatch_cnt read after the settle (the counter…"}
-  S42{"Error summary clean: no journal is read and nothing is probed"}
+  S42{"Error summary clean: no ATTRIBUTION is read and nothing is probed"}
   S23["mismatch_cnt = 0: the band counts as checked and reports clean"]
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
@@ -635,7 +635,7 @@ flowchart TD
 | `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
 | `S20` | decision | `mismatch_cnt` on this band | `packages/daemon/src/services/ahr-scrub.ts:mismatchCount` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a genuine fast check whose counter was ZEROED is counted — and reported clean` | `GT-5` |
 | `S17` | decision | the check went idle: `mismatch_cnt` read after the settle (the counter finalizes as the sync thread winds down) | `packages/daemon/src/services/ahr-scrub.ts:mismatchCount` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the mismatch counter is read from the sysfs file the 11.17 hook reads` | `GT-18` |
-| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
+| `S42` | decision | Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window` | `GT-3` |
 | `S23` | action | mismatch_cnt = 0: the band counts as checked and reports clean | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a genuine fast check whose counter was ZEROED is counted — and reported clean` | `GT-5` |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
@@ -648,13 +648,16 @@ flowchart TD
   E04b{"the csum leaf must pass its OWN node checksum (crc32c of bytes 32…nodesize…"}
   E04c(["both DUP copies fail: CsumUnreadableError with reason code csum-unreadable"])
   S46["path-less errors (unable to fixup, read/super) counted as unattributed…"]
+  X5c["the kernel's read error corrected lines are counted in the two windows ANAS…"]
   X5r>"a DUP metadata rot is repaired by the RW MOUNT's read path, not by the scrub"]
   E05a["evictStripeCache: shrink stripe_cache_size to its floor of 17, sweep ±200…"]
   J42(["csum-unreadable: re-scrub after the metadata is repaired (a btrfs scrub…"])
   S50["the finding rides the result: findings[], errorsAttributed, unattributed, truncated"]
+  X5n[/"ONE sentence on the notification the run already earns"/]
   E05a2["directParityConsistent: every member's row read O_DIRECT off the MEMBER…"]
   J50["AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort…"]
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
+  X5u[["the Scrubs row carries the count of the newest completed scrub"]]
   E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
@@ -673,13 +676,16 @@ flowchart TD
   X5 --> E04b
   X5 --> E04c
   X5 --> S46
+  X5 --> X5c
   X5 --> X5r
   E04b --> E05a
   E04c --> J42
   S46 --> S50
+  X5c --> X5n
   E05a --> E05a2
   J42 --> J50
   S50 --> S60
+  X5n --> X5u
   E05a2 --> E05
   J50 --> J51
   S60 --> S64
@@ -704,13 +710,16 @@ flowchart TD
 | `E04b` | decision | the csum leaf must pass its OWN node checksum (crc32c of bytes 32…nodesize, and its own bytenr): a failed copy 0 falls back to the DUP chunk's second copy | `packages/daemon/src/services/selfheal-csum.ts:readStoredCsum` | `packages/daemon/src/services/__tests__/selfheal-csum.test.ts:falls back to the DUP chunk's SECOND copy when the first has rotted` | `GT-20` |
 | `E04c` | refusal | both DUP copies fail: CsumUnreadableError with reason code `csum-unreadable` — nothing is known about the data block, and the words "restore from backup" are deliberately absent | `packages/daemon/src/services/selfheal-csum.ts:CsumUnreadableError` | `packages/daemon/src/services/__tests__/selfheal-csum.test.ts:REFUSES a csum leaf that fails its own node checksum, on both DUP copies` | `GT-20` |
 | `S46` | action | path-less errors (`unable to fixup`, read/super) counted as `unattributed`, deduped against the logicals already attributed | `packages/daemon/src/services/ahr-scrub.ts:parseUnattributedScrubError` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:errors with no path are counted unattributed — and never counted twice` | `GT-3` |
-| `X5r` | residual | a DUP metadata rot is repaired by the RW MOUNT's read path, not by the scrub: `btrfs scrub` reports 0 corrected and the only durable evidence is a one-time dmesg `read error corrected` line, which ANAS's attribution does not parse | — | — | `GT-20` |
+| `X5c` | action | the kernel's `read error corrected` lines are counted in the two windows ANAS already reads (selfheal.12 — never a watcher): the scrub's journal window and a repair job's own window, both filtered to the pool's dm device, and the count plus the member devices ride the result as `metadataCorrected {count, devices}` | `packages/daemon/src/services/ahr-scrub.ts:readCorrectedReads` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub that corrected metadata says so — result and notification` | `GT-20` |
+| `X5r` | residual | a DUP metadata rot is repaired by the RW MOUNT's read path, not by the scrub: `btrfs scrub` reports 0 corrected, and the only durable evidence is a one-time kernel `read error corrected` line — which is exactly what ANAS now counts in the windows it already reads (selfheal.12), so the residual is the SENTENCE, not silence | — | — | `GT-20` |
 | `E05a` | action | evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone | `packages/daemon/src/services/selfheal-repair.ts:memberDataSectors` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array` | `GT-14` |
 | `J42` | refusal | `csum-unreadable`: re-scrub after the metadata is repaired (a btrfs scrub repairs metadata copies), and explicitly do NOT restore | `packages/daemon/src/services/ahr-repair.ts:CSUM_UNREADABLE_SENTENCE` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:a csum-unreadable unrepairable block is told to re-scrub, not restore (D10)` | `GT-20` |
 | `S50` | action | the finding rides the result: findings[], errorsAttributed, unattributed, truncated | `packages/daemon/src/services/ahr-scrub.ts:attributeScrub` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:round-trips a full finding through JSON unchanged` | — |
+| `X5n` | notification | ONE sentence on the notification the run already earns: "btrfs corrected N metadata read(s) from the mirror copy during this run. A member is returning bad metadata. Check that disk's SMART data in Disks." — and a CLEAN scrub whose only signal is this count earns its own warning, because the summary says nothing (GT-20) | `packages/daemon/src/services/ahr-scrub.ts:metadataCorrectedSentence` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the sentence rides the EXISTING notification when the scrub already found errors` | `GT-20` |
 | `E05a2` | action | directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23) | `packages/daemon/src/services/selfheal-repair.ts:directParityConsistent` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data` | `GT-23` |
 | `J50` | action | AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort / notExamined, always summing to the blocks attempted | `packages/daemon/src/services/ahr-repair.ts:repairAhrFiles` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:the notification names all five counts, and they add up (review R9, seventh pass F3)` | — |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
+| `X5u` | ui | the Scrubs row carries the count of the newest completed scrub — amber, labelled, with what happened / what it means / what to check as the tooltip — so a clean scrub never reads as a clean bill | `packages/pve-integration/src/69-scrubs.js:correctedFor` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: a corrected-metadata count shows on the row, labelled` | — |
 | `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
@@ -927,7 +936,7 @@ flowchart TD
   S40["phase 2/2: btrfs scrub start polled to finished"]
   E05{"precheck: a bounded md check over the TARGET stripe and its mismatch_cnt…"}
   J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
-  S42{"Error summary clean: no journal is read and nothing is probed"}
+  S42{"Error summary clean: no ATTRIBUTION is read and nothing is probed"}
   E06["rmw_level = 0 on the TARGET's band for the write window"]
   J52[["the outcome is rendered back into the window the request was made from"]]
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
@@ -1012,7 +1021,7 @@ flowchart TD
 | `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
 | `E05` | decision | precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both | `packages/daemon/src/services/selfheal-repair.ts:parityAgreement` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations` | `GT-5` |
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
-| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
+| `S42` | decision | Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window` | `GT-3` |
 | `E06` | action | `rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7) | `packages/daemon/src/services/selfheal-repair.ts:repairBlock` | `packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write — the GT-7 poison is the default` | `GT-7` |
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
@@ -1051,7 +1060,7 @@ flowchart TD
   J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
   S40["phase 2/2: btrfs scrub start polled to finished"]
   J52[["the outcome is rendered back into the window the request was made from"]]
-  S42{"Error summary clean: no journal is read and nothing is probed"}
+  S42{"Error summary clean: no ATTRIBUTION is read and nothing is probed"}
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
   X10 --> RT02
@@ -1101,7 +1110,7 @@ flowchart TD
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
 | `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
-| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
+| `S42` | decision | Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window` | `GT-3` |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
 
@@ -1141,7 +1150,7 @@ flowchart TD
   S40["phase 2/2: btrfs scrub start polled to finished"]
   S20{"mismatch_cnt on this band"}
   S17{"the check went idle: mismatch_cnt read after the settle (the counter…"}
-  S42{"Error summary clean: no journal is read and nothing is probed"}
+  S42{"Error summary clean: no ATTRIBUTION is read and nothing is probed"}
   S23["mismatch_cnt = 0: the band counts as checked and reports clean"]
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
@@ -1221,7 +1230,7 @@ flowchart TD
 | `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
 | `S20` | decision | `mismatch_cnt` on this band | `packages/daemon/src/services/ahr-scrub.ts:mismatchCount` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a genuine fast check whose counter was ZEROED is counted — and reported clean` | `GT-5` |
 | `S17` | decision | the check went idle: `mismatch_cnt` read after the settle (the counter finalizes as the sync thread winds down) | `packages/daemon/src/services/ahr-scrub.ts:mismatchCount` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the mismatch counter is read from the sysfs file the 11.17 hook reads` | `GT-18` |
-| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
+| `S42` | decision | Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window` | `GT-3` |
 | `S23` | action | mismatch_cnt = 0: the band counts as checked and reports clean | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a genuine fast check whose counter was ZEROED is counted — and reported clean` | `GT-5` |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
@@ -1339,7 +1348,7 @@ flowchart TD
   RC5[/"one journald line per band; a pass with nothing to say says nothing at all"/]
   S40["phase 2/2: btrfs scrub start polled to finished"]
   J51[/"ONE PVE notification: info when every block repaired, warning otherwise…"/]
-  S42{"Error summary clean: no journal is read and nothing is probed"}
+  S42{"Error summary clean: no ATTRIBUTION is read and nothing is probed"}
   J52[["the outcome is rendered back into the window the request was made from"]]
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
@@ -1392,7 +1401,7 @@ flowchart TD
 | `RC5` | notification | one journald line per band; a pass with nothing to say says nothing at all | `packages/daemon/src/services/selfheal-reconcile.ts:reconcileWasQuiet` | `packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:writes nothing and says nothing` | — |
 | `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
 | `J51` | notification | ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20 | `packages/daemon/src/services/ahr-repair.ts:repairBody` | `packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so` | — |
-| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
+| `S42` | decision | Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window` | `GT-3` |
 | `J52` | ui | the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts | `packages/pve-integration/src/69-scrubs.js:showRepairResult` | `packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from` | — |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
@@ -1624,7 +1633,7 @@ flowchart TD
   U03[["'N band(s) not checked', with the band and the why as the tooltip"]]
   S31["retireCheckIssued in the band loop's finally"]
   S40["phase 2/2: btrfs scrub start polled to finished"]
-  S42{"Error summary clean: no journal is read and nothing is probed"}
+  S42{"Error summary clean: no ATTRIBUTION is read and nothing is probed"}
   S60["AhrScrubResultSchema.parse — validated at the daemon boundary before it…"]
   S64[["the Scrubs row: the findings link, the amber parity indicator and the muted…"]]
   X17 --> S11
@@ -1661,7 +1670,7 @@ flowchart TD
 | `U03` | ui | "N band(s) not checked", with the band and the why as the tooltip | `packages/pve-integration/src/69-scrubs.js:skippedFor` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: a scrub that skipped a band says how many, labelled` | — |
 | `S31` | action | retireCheckIssued in the band loop's `finally` — the token never outlives the iteration that took it (N3) | `packages/daemon/src/services/selfheal-syncop.ts:retireCheckIssued` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:retires the token on the SKIP paths too — md never started the check (N3)` | — |
 | `S40` | action | phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite) | `packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially` | `GT-3` |
-| `S42` | decision | Error summary clean: no journal is read and nothing is probed | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing` | `GT-3` |
+| `S42` | decision | Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold | `packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window` | `GT-3` |
 | `S60` | action | AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result | `packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool` | `packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema — and stay optional` | — |
 | `S64` | ui | the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip | `packages/pve-integration/src/69-scrubs.js:renderLastScrub` | `packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled` | — |
 

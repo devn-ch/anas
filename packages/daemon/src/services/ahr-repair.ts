@@ -1,7 +1,10 @@
-import type { AhrArray, AhrPool, AhrRepairBlockOutcome, AhrRepairFile, AhrRepairFileOutcome, AhrRepairResult, AhrScrubParityMismatch, IscsiHeldByLun } from '@anas/shared'
+import type { AhrArray, AhrMetadataCorrected, AhrPool, AhrRepairBlockOutcome, AhrRepairFile, AhrRepairFileOutcome, AhrRepairResult, AhrScrubParityMismatch, IscsiHeldByLun } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { SelfhealRepairOptions } from './selfheal-repair.js'
 import { AhrRepairResult as AhrRepairResultSchema, SELFHEAL_CSUM_UNREADABLE } from '@anas/shared'
+// One window reader, one sentence: the scrub owns them and the repair reuses
+// them rather than growing second copies (single source of truth).
+import { metadataCorrectedSentence, readCorrectedReads } from './ahr-scrub.js'
 import { heldByLunOnce } from './iscsi-held.js'
 import { pveNotify } from './pve-notify.js'
 import { repairBlock } from './selfheal-repair.js'
@@ -225,6 +228,11 @@ function repairBody(
   }
   if (result.aboveMd > 0)
     tail.push(`Blocks diagnosed above md were not written: ${ABOVE_MD_SENTENCE}.`)
+  // selfheal.12 — metadata (DUP) copies btrfs corrected from their mirror
+  // during THIS run's window. Said here like every other fact the run
+  // discovered, and only when the count is above zero.
+  if (result.metadataCorrected && result.metadataCorrected.count > 0)
+    tail.push(metadataCorrectedSentence(result.metadataCorrected))
   // F2 — a repaired block whose band still counts a parity mismatch. The file
   // is right; the band's parity is not, and Rewrite parity is the verb for it.
   // Said here so the operator does not have to wait hours for a fresh two-phase
@@ -255,6 +263,9 @@ export async function repairAhrFiles(
   options?: AhrRepairOptions,
 ): Promise<AhrRepairResult> {
   const repair = options?.repair ?? repairBlock
+  // The run's own start — the bound of the journal window the corrected
+  // metadata reads (selfheal.12) are counted in at the end.
+  const startedAt = new Date()
   // The LUN lookup (D10). Only asked for files that actually came back
   // unrepairable — the one bucket whose advice names a restore verb.
   const lunHeld = options?.lunHeld ?? (async (path: string): Promise<IscsiHeldByLun | null> => {
@@ -414,6 +425,20 @@ export async function repairAhrFiles(
   const residualRows = [...residuals.values()]
   residualRows.sort((a, b) => a.bandIndex - b.bandIndex)
 
+  // selfheal.12 — the run's OWN window, read once at the end (the same helper
+  // the scrub uses): a cold read here can trigger the same metadata
+  // correction a scrub does, and the sentence rides this job's notification.
+  // Fail-open: an unreadable journal costs the count, never the repair.
+  let metadataCorrected: AhrMetadataCorrected | undefined
+  try {
+    const corrected = await readCorrectedReads(executor, pool, startedAt)
+    if (corrected.count > 0)
+      metadataCorrected = corrected
+  }
+  catch {
+    // No count rather than an invented clean bill.
+  }
+
   const result = AhrRepairResultSchema.parse({
     pool: pool.name,
     files: outcomes,
@@ -423,6 +448,7 @@ export async function repairAhrFiles(
     mappingAbort,
     notExamined,
     parityResiduals: residualRows,
+    ...(metadataCorrected ? { metadataCorrected } : {}),
     blocks: total,
   })
 

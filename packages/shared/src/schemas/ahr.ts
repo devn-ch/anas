@@ -733,6 +733,26 @@ export const AhrScrubSkippedBand = z.object({
 export type AhrScrubSkippedBand = z.infer<typeof AhrScrubSkippedBand>
 
 /**
+ * Metadata (DUP) copies btrfs corrected from their mirror during one window
+ * (story selfheal.12, GT-20).
+ *
+ * The kernel logs one `read error corrected` line per metadata read it could
+ * not checksum and served from the mirror copy instead — and a RW mount or a
+ * read repairs the rotten copy as a side effect, so `btrfs scrub` reports
+ * nothing. The line is the only durable evidence that a member is returning
+ * bad metadata, so the scrub and the repair both count it in the journal
+ * window they already read. `devices` are the member paths the corrected reads
+ * were served from — the disks whose SMART data to check.
+ */
+export const AhrMetadataCorrected = z.object({
+  /** Corrected metadata reads seen in the window, one per kernel line. */
+  count: z.number().int().nonnegative(),
+  /** The member devices the corrected reads were served from, first-seen order. */
+  devices: z.array(z.string().min(1)),
+})
+export type AhrMetadataCorrected = z.infer<typeof AhrMetadataCorrected>
+
+/**
  * The result of an AHR scrub job (POST /v1/ahr/:name/scrub).
  *
  * Everything past `checkedArrays` is story selfheal.3 and OPTIONAL: a result
@@ -791,5 +811,12 @@ export const AhrScrubResult = z.object({
   unattributed: z.number().int().nonnegative().optional(),
   /** True when more files were attributed than the 200 the list carries. */
   truncated: z.boolean().optional(),
+  /**
+   * Metadata (DUP) copies btrfs corrected from their mirror during this
+   * scrub's journal window (selfheal.12, GT-20). Optional and additive — a
+   * result from an older daemon omits it, and a window that read nothing
+   * simply leaves it off.
+   */
+  metadataCorrected: AhrMetadataCorrected.optional(),
 })
 export type AhrScrubResult = z.infer<typeof AhrScrubResult>

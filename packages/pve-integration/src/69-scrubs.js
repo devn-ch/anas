@@ -101,6 +101,12 @@
  * files on the same scrub the verb is greyed with the reason the daemon would
  * 409 with: rewriting parity over rot makes it permanent.
  *
+ * CORRECTED METADATA (selfheal.12) — the kernel's `read error corrected` line
+ * is the one durable evidence that a member is returning bad metadata, and it
+ * is a CLEAN scrub's only signal (GT-20: the summary reports nothing). The
+ * count from the newest completed scrub's journal window rides the Last scrub
+ * cell, amber, with what happened and what to check as its tooltip.
+ *
  * Test hooks: view cls 'anas-view anas-view-scrubs', grid cls 'anas-grid-scrub',
  * scrub toggle 'anas-btn-scrub-toggle', run 'anas-btn-scrub-run', stop
  * 'anas-btn-scrub-stop', toolbar repair 'anas-btn-scrub-repair' (selfheal.9),
@@ -262,6 +268,11 @@
             // neither may read as a clean bill.
             parity: (kind === 'ahr' && parityByPool) ? parityFor(parityByPool, target.pool) : null,
             skipped: (kind === 'ahr' && findingsByPool) ? skippedFor(findingsByPool, target.pool) : null,
+            // The metadata (DUP) copies btrfs corrected from their mirror
+            // during the newest completed scrub's journal window (selfheal.12,
+            // GT-20) — the one rot signal a CLEAN scrub can hold, so it reads
+            // on the row even when nothing else was found.
+            metadataCorrected: (kind === 'ahr' && findingsByPool) ? correctedFor(findingsByPool, target.pool) : null,
             // A stable per-row key (kind+pool) so selection survives a poll.
             rowKey: kind + ':' + (target.pool || '')
         };
@@ -373,6 +384,16 @@
         return (list && list.length) ? list : null;
     }
 
+    // The newest scrub's corrected metadata reads (selfheal.12) — present even
+    // on a CLEAN scrub, which is exactly where GT-20 proved this signal lives:
+    // the summary reports nothing, the kernel's `read error corrected` line is
+    // the only evidence, and the row must not read as a clean bill.
+    function correctedFor(byPool, pool) {
+        var entry = byPool[pool];
+        var mc = entry && entry.result && entry.result.metadataCorrected;
+        return (mc && Number(mc.count) > 0) ? mc : null;
+    }
+
     // Pool: the shared fs-tag chip ("zfs"/"ahr") + the full pool name — reads
     // identically to the Snapshots target column (parallel construction).
     function renderScrubPool(v, meta, rec) {
@@ -461,16 +482,19 @@
 
         // An AHR scrub that FOUND something — or whose phase 1 counted parity
         // mismatches phase 2 could not attribute (the parity-only-rot case,
-        // D1), or that had to skip a band (D8) — outranks the "md keeps no
+        // D1), or that had to skip a band (D8), or that corrected metadata
+        // from a mirror copy (selfheal.12, GT-20) — outranks the "md keeps no
         // record" line: it is the one thing on this row an operator has to act
         // on. ONE cell, ONE span: the findings link (the door to the file
-        // list), the amber parity indicator, and the muted skipped-band count
-        // share it, each with its own tooltip. The md caveat and the in-memory
-        // scope still ride the trailing muted text rather than a second cell.
+        // list), the amber parity indicator, the muted skipped-band count and
+        // the corrected-metadata count share it, each with its own tooltip.
+        // The md caveat and the in-memory scope still ride the trailing muted
+        // text rather than a second cell.
         var findings = rec.get('findings');
         var parity = rec.get('parity');
         var skipped = rec.get('skipped');
-        if (findings || parity || skipped) {
+        var corrected = rec.get('metadataCorrected');
+        if (findings || parity || skipped || corrected) {
             var spans = [];
             if (findings) {
                 var files = (findings.result.findings || []).length;
@@ -532,6 +556,21 @@
                 }
                 spans.push('<span style="color:var(--anas-muted,gray);" title="' + enc(why.join('\n')) + '">'
                     + enc(skipped.length + ' ' + (skipped.length === 1 ? t('band not checked') : t('bands not checked')))
+                    + '</span>');
+            }
+            // selfheal.12 — the count of metadata reads btrfs corrected from
+            // the mirror copy during that scrub, amber like the other rot
+            // evidence, with what happened / what it means / what to do as the
+            // tooltip. A clean scrub whose only finding is this still reads
+            // here rather than as "md keeps no record".
+            if (corrected) {
+                var n = Number(corrected.count) || 0;
+                var correctedTip = t('btrfs corrected') + ' ' + n + ' '
+                    + t('metadata read(s) from the mirror copy during that scrub. A member is returning bad '
+                        + 'metadata. Check that disk\'s SMART data in Disks.');
+                spans.push('<span class="anas-scrub-corrected" style="color:var(--anas-warn,#b06a12);" title="'
+                    + enc(correctedTip) + '">'
+                    + enc(n + ' ' + (n === 1 ? t('metadata read corrected') : t('metadata reads corrected')))
                     + '</span>');
             }
             return '<span>' + spans.join(' ')
@@ -1849,7 +1888,8 @@
                 { name: 'running', type: 'auto' },
                 { name: 'findings', type: 'auto' },
                 { name: 'parity', type: 'auto' },
-                { name: 'skipped', type: 'auto' }],
+                { name: 'skipped', type: 'auto' },
+                { name: 'metadataCorrected', type: 'auto' }],
             data: [],
             sorters: [{ property: 'kind', direction: 'ASC' }, { property: 'pool', direction: 'ASC' }]
         });

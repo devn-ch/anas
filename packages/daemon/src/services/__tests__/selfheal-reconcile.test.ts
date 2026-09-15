@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { reconcileSelfhealState, reconcileWasQuiet } from '../selfheal-reconcile.js'
+import { renderScrubServiceUnit } from '../scrub-schedule-units.js'
+import { mdcheckReenabledNote, reconcileSelfhealState, reconcileWasQuiet } from '../selfheal-reconcile.js'
 import { SELFHEAL_SNAPSHOT_PREFIX } from '../selfheal-repair.js'
 
 /**
@@ -34,6 +35,8 @@ class FakeNode implements CommandExecutor {
   readonly deleted: string[] = []
   /** What `btrfs subvolume list` reports (the §12 sweep reads it). */
   subvolList = ''
+  /** What `systemctl is-enabled mdcheck_start.timer` prints (the preset note reads it). */
+  mdcheckIsEnabled = ''
 
   constructor(bands: { kernel: string, knobs: Record<string, string> }[]) {
     this.root = mkdtempSync(join(tmpdir(), 'anas-reconcile-'))
@@ -78,6 +81,13 @@ class FakeNode implements CommandExecutor {
     }
     if (command === '/usr/bin/findmnt')
       return { stdout: '', stderr: '', exitCode: 1 }
+    if (command === '/usr/bin/systemctl') {
+      // is-enabled exits nonzero for `disabled` but still prints the word —
+      // the same shape the real systemctl shows.
+      if (args[0] === 'is-enabled')
+        return { stdout: this.mdcheckIsEnabled, stderr: '', exitCode: this.mdcheckIsEnabled.trim().startsWith('enabled') ? 0 : 1 }
+      return ok('')
+    }
     return { stdout: '', stderr: `unexpected ${command}`, exitCode: 127 }
   }
 
@@ -298,5 +308,77 @@ describe('selfheal reconcile — it never throws', () => {
     const report = await reconcileSelfhealState(node, { pools: [twoBands] })
     assert.equal(node.knob('md127', 'rmw_level'), '1', 'the readable band was still put back')
     assert.deepEqual(report.errors, [], 'an unassembled band is the boot scan\'s problem, not an error here')
+  })
+})
+
+describe('selfheal reconcile — mdcheck re-enabled under ANAS ownership (preset ruling, F7)', () => {
+  const SCHEDULE = { kind: 'ahr-scrub' as const, cadence: 'monthly' as const, pools: ['tank'] }
+  const NOTE = 'mdcheck timers are enabled while ANAS periodic scrub owns md checks '
+    + '(a systemctl preset or a manual enable turned them back on). Both will run. '
+    + 'Disable them with: systemctl disable --now mdcheck_start.timer mdcheck_continue.timer'
+
+  it('the pure decision: only units WITH pools plus mdcheck enabled produce the note', () => {
+    assert.equal(mdcheckReenabledNote(SCHEDULE, true), NOTE)
+    assert.equal(mdcheckReenabledNote(SCHEDULE, false), null, 'mdcheck off is the owned state')
+    assert.equal(mdcheckReenabledNote({ ...SCHEDULE, pools: [] }, true), null, 'no pools — the toggle does not own mdcheck')
+    assert.equal(mdcheckReenabledNote(null, true), null, 'no ANAS units — the legacy state, the UI note covers it')
+  })
+
+  it('says it at daemon start, once, and disables nothing', async () => {
+    const node = new FakeNode([{ kernel: 'md127', knobs: healthy() }])
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = node.root
+    node.mdcheckIsEnabled = 'enabled\n'
+    const dir = mkdtempSync(join(tmpdir(), 'anas-reconcile-units-'))
+    try {
+      writeFileSync(join(dir, 'anas-scrub.service'), renderScrubServiceUnit(SCHEDULE))
+      const report = await reconcileSelfhealState(node, { pools: [pool(node)], systemdDir: dir })
+      assert.deepEqual(report.notes, [NOTE])
+      assert.equal(reconcileWasQuiet(report), false)
+      // The ruling is a NOTE and no more: no disable, no unit write — the one
+      // systemctl call the note makes is the is-enabled read itself.
+      const writes = node.calls.filter(c => c.command === '/usr/bin/systemctl' && c.args[0] !== 'is-enabled')
+      assert.deepEqual(writes, [])
+    }
+    finally {
+      delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+      node.cleanup()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('stays silent when mdcheck is off, when the units are absent, and when no dir was handed in', async () => {
+    const disabled = new FakeNode([{ kernel: 'md127', knobs: healthy() }])
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = disabled.root
+    const dir = mkdtempSync(join(tmpdir(), 'anas-reconcile-units-'))
+    try {
+      writeFileSync(join(dir, 'anas-scrub.service'), renderScrubServiceUnit(SCHEDULE))
+      disabled.mdcheckIsEnabled = 'disabled\n'
+      assert.deepEqual((await reconcileSelfhealState(disabled, { pools: [pool(disabled)], systemdDir: dir })).notes, [])
+
+      const empty = new FakeNode([{ kernel: 'md127', knobs: healthy() }])
+      process.env.ANAS_SELFHEAL_KERNEL_ROOT = empty.root
+      empty.mdcheckIsEnabled = 'enabled\n'
+      // An empty unit dir: the toggle does not own mdcheck, so a preset
+      // turning the timers back on is just the stock node.
+      const noUnits = mkdtempSync(join(tmpdir(), 'anas-reconcile-units-'))
+      try {
+        assert.deepEqual((await reconcileSelfhealState(empty, { pools: [pool(empty)], systemdDir: noUnits })).notes, [])
+      }
+      finally {
+        rmSync(noUnits, { recursive: true, force: true })
+      }
+
+      // No systemdDir: the tests and the direct call never read the host's
+      // real unit directory.
+      const bare = new FakeNode([{ kernel: 'md127', knobs: healthy() }])
+      process.env.ANAS_SELFHEAL_KERNEL_ROOT = bare.root
+      bare.mdcheckIsEnabled = 'enabled\n'
+      assert.deepEqual((await reconcileSelfhealState(bare, { pools: [pool(bare)] })).notes, [])
+    }
+    finally {
+      delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+      disabled.cleanup()
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

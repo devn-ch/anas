@@ -1,7 +1,7 @@
-import type { AhrPool, AhrScrubFinding, AhrScrubResult, AhrScrubStripe } from '@anas/shared'
+import type { AhrMetadataCorrected, AhrPool, AhrScrubFinding, AhrScrubResult, AhrScrubStripe } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { ExtentItem, SelfhealContext } from './selfheal-map.js'
-import { AhrScrubResult as AhrScrubResultSchema } from '@anas/shared'
+import { AhrMetadataCorrected as AhrMetadataCorrectedSchema, AhrScrubResult as AhrScrubResultSchema } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { run } from './ahr-exec.js'
@@ -73,7 +73,10 @@ import {
  * array count.
  *
  * Findings notify at `warning` via PVE (§7.2); a clean scrub that checked
- * every band is silent — healthy/idle shows nothing (dashboard policy §7.3).
+ * every band is silent — healthy/idle shows nothing (dashboard policy §7.3) —
+ * UNLESS the run's journal window carries corrected metadata reads
+ * (selfheal.12, GT-20): the one rot signal a clean scrub can hold, which then
+ * earns its own warning.
  */
 
 const BTRFS = '/usr/bin/btrfs'
@@ -529,6 +532,85 @@ export function parseUnattributedScrubError(message: string): { device: string, 
 }
 
 /**
+ * A corrected METADATA read (story selfheal.12, GT-20's verbatim captures):
+ *
+ *   BTRFS info (device dm-0): read error corrected: ino 0 off 30834688
+ *   (dev /dev/mapper/gtsh-data sector 76608)
+ *
+ * The kernel logs one line per metadata read whose first DUP copy failed its
+ * checksum and was served — and rewritten — from the mirror. A scrub on the
+ * already-repaired array reports nothing (GT-20), so this line is the only
+ * durable evidence a member is returning bad metadata. The kind word is left
+ * open (`info`/`warning` — both spellings exist in the wild) and so is the
+ * trailing parenthetical, because the fields after `corrected:` are what
+ * matter; the same text-parse exception as the scrub warnings above applies.
+ */
+
+/** One kernel corrected-read line. */
+export interface CorrectedReadLine {
+  /** The `(device X)` name — the dm device btrfs is mounted from. */
+  device: string
+  /** The inode whose metadata was corrected (0 for tree blocks). */
+  ino: number
+  /** The logical byte offset the kernel printed. */
+  offset: number
+  /** The `dev …` member path the read was served — and rewritten — from. */
+  dev: string
+  /** The member sector the kernel printed. */
+  sector: number
+}
+
+/**
+ * The corrected-read shape: kind word open, the member parenthetical
+ * `(dev … sector …)` captured, anything after it tolerated.
+ */
+const CORRECTED_READ_RE = new RegExp(
+  '^BTRFS \\w+ \\(device ([^)]+)\\): read error corrected(?::| \\([^)]*\\):) '
+  + 'ino (\\d+) off (\\d+) \\(dev (\\S+) sector (\\d+)\\)',
+)
+
+/** Parse ONE kernel MESSAGE into a corrected metadata read, or null. */
+export function parseCorrectedRead(message: string): CorrectedReadLine | null {
+  const m = message.replace(KERNEL_STAMP_RE, '').trim().match(CORRECTED_READ_RE)
+  if (!m)
+    return null
+  return {
+    device: m[1],
+    ino: Number(m[2]),
+    offset: Number(m[3]),
+    dev: m[4],
+    sector: Number(m[5]),
+  }
+}
+
+/**
+ * The window's corrected metadata reads, counted. One kernel line is one
+ * corrected read — there is nothing to dedupe a correction against (unlike the
+ * scrub errors above, each line IS the event). `devices` are the distinct
+ * member paths, in first-seen order, so the operator is pointed at the disks
+ * to check. `device`, when given, keeps another pool's lines out of this
+ * count, exactly as the attribution's filter does — and fails open to no
+ * filter for the same reason.
+ */
+export function correctedReadsFromMessages(
+  messages: string[],
+  device?: string | null,
+): { count: number, devices: string[] } {
+  let count = 0
+  const devices = new Set<string>()
+  for (const message of messages) {
+    const line = parseCorrectedRead(message)
+    if (!line)
+      continue
+    if (device && line.device !== device)
+      continue
+    count += 1
+    devices.add(line.dev)
+  }
+  return { count, devices: [...devices] }
+}
+
+/**
  * `journalctl -k -o json` — one JSON object per line. Only the envelope is
  * parsed here; MESSAGE is handed on as text. A MESSAGE the journal stored as a
  * byte array (non-UTF-8 kernel output) is decoded rather than dropped; a line
@@ -747,13 +829,11 @@ async function mountedSubvolume(executor: CommandExecutor, pool: AhrPool): Promi
 export const AHR_SCRUB_JOURNAL_LINE_CAP = 5000
 
 /**
- * The MESSAGE pattern both error shapes carry (`journalctl -g`).
- *
- * A path-carrying scrub warning and a nameless `unable to fixup … error at
- * logical N` both contain it, so the filter keeps everything the attribution
- * can use and drops every unrelated kernel line before it reaches the buffer.
+ * The MESSAGE patterns the window is read for (`journalctl -g`): both error
+ * shapes the attribution can use, plus the corrected-metadata reads counted
+ * into `metadataCorrected` (selfheal.12) — one read of the window serves both.
  */
-const SCRUB_JOURNAL_GREP = 'error at logical'
+const SCRUB_JOURNAL_GREP = 'error at logical|read error corrected'
 
 /** The bounded journalctl argv for one scrub's window. */
 export function scrubJournalArgs(since: string, options?: { grep?: boolean, cap?: number }): string[] {
@@ -773,7 +853,7 @@ export function journalSince(when: Date): string {
 }
 
 /** The pool LV's kernel dm name (`dm-0`) — the name the kernel lines carry. */
-async function poolDmName(executor: CommandExecutor, pool: AhrPool): Promise<string | null> {
+export async function poolDmName(executor: CommandExecutor, pool: AhrPool): Promise<string | null> {
   try {
     const r = await executor.exec(REALPATH, [ahrLvPath(pool.name)])
     const name = r.exitCode === 0 ? r.stdout.trim().replace(DEV_PREFIX_RE, '') : ''
@@ -1131,6 +1211,43 @@ export async function attributeScrub(
     unattributed: attribution.unattributed,
     truncated: attribution.truncated || capped,
   }
+}
+
+/**
+ * The corrected metadata reads in ONE window, for one pool (story selfheal.12).
+ *
+ * Read through the SAME bounded argv as the attribution — the grep
+ * alternation now carries the corrected-read shape, and the no-`-g` fallback
+ * stands — so one definition of "read the kernel journal for this window"
+ * serves the scrub and the repair alike (the repair imports this helper rather
+ * than growing a second one). Fail-open at the caller: a journal that cannot
+ * be read costs the count, never the run, and never invents a clean bill.
+ */
+export async function readCorrectedReads(
+  executor: CommandExecutor,
+  pool: AhrPool,
+  since: Date,
+): Promise<{ count: number, devices: string[] }> {
+  const args = scrubJournalArgs(journalSince(since))
+  let r = await executor.exec(JOURNALCTL, args)
+  if (r.exitCode !== 0) {
+    // Same fallback as the attribution: no PCRE2 means the whole window is
+    // read rather than nothing being read at all.
+    r = await executor.exec(JOURNALCTL, scrubJournalArgs(journalSince(since), { grep: false }))
+  }
+  const device = await poolDmName(executor, pool)
+  return correctedReadsFromMessages(kernelJournalMessages(r.stdout), device)
+}
+
+/**
+ * The one operator sentence the corrected count earns (selfheal.12) — shared
+ * by the scrub and the repair notifications so the two windows say it in the
+ * same words. Only ever composed when `count` is above zero.
+ */
+export function metadataCorrectedSentence(corrected: { count: number, devices: string[] }): string {
+  const n = corrected.count
+  return `btrfs corrected ${n} metadata read(s) from the mirror copy during this run. `
+    + 'A member is returning bad metadata. Check that disk\'s SMART data in Disks.'
 }
 
 /** The notification body: the summary sentence, then the files it is about. */
@@ -1635,6 +1752,23 @@ export async function scrubAhrPool(
     }
   }
 
+  // --- Corrected metadata reads (selfheal.12) ---------------------------------
+  // The run's own window, read at the END so the corrections this run's own
+  // scrub and probe reads triggered are inside it too (GT-20: a rotten DUP
+  // metadata copy is repaired by the read that serves it, and the scrub's own
+  // summary never says so). One more bounded, grep-filtered read of the same
+  // window — never a standing watcher. Fail-open: a journal that cannot be
+  // read costs the count, never the scrub, and never invents a clean bill.
+  let metadataCorrected: AhrMetadataCorrected | undefined
+  try {
+    const corrected = await readCorrectedReads(executor, pool, startedAt)
+    if (corrected.count > 0)
+      metadataCorrected = AhrMetadataCorrectedSchema.parse(corrected)
+  }
+  catch (err) {
+    console.error(`ahr-scrub: could not read '${name}' scrub's corrected-metadata lines: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
   // Validated at the daemon boundary before it leaves as a job result — the
   // shared schema is the contract, here as at every other boundary (Principle 6).
   // The per-band record rides with it (D1/D8): parityMismatches,
@@ -1648,6 +1782,7 @@ export async function scrubAhrPool(
     ...(bandsSkipped.length > 0 ? { bandsSkipped } : {}),
     ...(parityMismatches.length > 0 ? { parityMismatches } : {}),
     ...(btrfsErrors !== null ? { errorsReported: countErrorSummary(btrfsErrors) } : {}),
+    ...(metadataCorrected ? { metadataCorrected } : {}),
     ...attribution,
   })
 
@@ -1657,24 +1792,33 @@ export async function scrubAhrPool(
   // The PARITY-ONLY case (D1) gets its own notification: phase 1 counted
   // mismatches and phase 2 named NO file, so the promised attribution never
   // came and the operator must not read the silence as "false alarm".
+  // The corrected-metadata sentence (selfheal.12) rides whichever notification
+  // this scrub emits — and when nothing else was wrong it earns its own, so
+  // the one signal GT-20 proved exists is never silent.
   const findings = result.findings ?? []
   const parity = result.parityMismatches ?? []
   const skipped = result.bandsSkipped ?? []
+  const correctedSuffix = metadataCorrected ? `\n\n${metadataCorrectedSentence(metadataCorrected)}` : ''
   if (btrfsErrors !== null) {
-    await pveNotify(executor, 'warning', 'AHR scrub found errors', findingsBody(pool, btrfsErrors, result))
+    await pveNotify(executor, 'warning', 'AHR scrub found errors', findingsBody(pool, btrfsErrors, result) + correctedSuffix)
     if (parity.length > 0 && findings.length === 0)
-      await pveNotify(executor, 'warning', parityTitle(parity), parityBody(pool, parity, false))
+      await pveNotify(executor, 'warning', parityTitle(parity), parityBody(pool, parity, false) + correctedSuffix)
   }
   else if (parity.length > 0) {
     // Phase 1 said rot exists (its own per-band warning already went out);
     // this is the SECOND notification that closes the story: phase 2 ran
     // clean, so the checksum pass has nothing to name — the rot is parity-only.
-    await pveNotify(executor, 'warning', parityTitle(parity), parityBody(pool, parity, true))
+    await pveNotify(executor, 'warning', parityTitle(parity), parityBody(pool, parity, true) + correctedSuffix)
   }
   else if (skipped.length > 0) {
     // Nothing found AND something skipped: without this the scrub reports
     // clean while it never looked at a whole band (D8's false assurance).
-    await pveNotify(executor, 'warning', 'AHR scrub did not check every band', skippedBody(skipped))
+    await pveNotify(executor, 'warning', 'AHR scrub did not check every band', skippedBody(skipped) + correctedSuffix)
+  }
+  else if (metadataCorrected) {
+    // A CLEAN scrub that corrected metadata (the exact GT-20 shape): the
+    // summary says nothing, so this is the only notification the run gets.
+    await pveNotify(executor, 'warning', 'AHR scrub: metadata corrected from the mirror', metadataCorrectedSentence(metadataCorrected))
   }
 
   return result

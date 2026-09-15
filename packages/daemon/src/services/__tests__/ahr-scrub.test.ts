@@ -13,12 +13,15 @@ import {
   AHR_SCRUB_FINDINGS_CAP,
   AHR_SCRUB_JOURNAL_LINE_CAP,
   attributeScrubErrors,
+  correctedReadsFromMessages,
   countErrorSummary,
   findingPath,
   journalSince,
   kernelJournalMessages,
+  metadataCorrectedSentence,
   mismatchCount,
   parseBtrfsScrubStatus,
+  parseCorrectedRead,
   parseScrubWarning,
   parseUnattributedScrubError,
   runningAhrCheck,
@@ -1359,8 +1362,9 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     assert.deepEqual(call.args.slice(0, 4), ['-k', '-o', 'json', '-S'])
     assert.ok(call.args.includes('--no-pager'))
     assert.equal(call.args[call.args.indexOf('-n') + 1], String(AHR_SCRUB_JOURNAL_LINE_CAP))
-    // Both error shapes carry this; nothing else in the kernel log does.
-    assert.equal(call.args[call.args.indexOf('-g') + 1], 'error at logical')
+    // Both error shapes carry the first alternative; the corrected-metadata
+    // reads (selfheal.12) ride the same single window read as the second.
+    assert.equal(call.args[call.args.indexOf('-g') + 1], 'error at logical|read error corrected')
   })
 
   it('re-reads without -g when journalctl has no pattern matching, rather than losing the attribution', async () => {
@@ -1375,7 +1379,10 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
     const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
     const calls = executor.calls.filter(c => c.command === '/usr/bin/journalctl')
-    assert.equal(calls.length, 2)
+    // The attribution's pair (-g failing, the plain re-read answering) plus
+    // the corrected-metadata read of the same window (selfheal.12) — whose -g
+    // succeeds here, because the mock's sequence repeats its last entry.
+    assert.equal(calls.length, 3)
     assert.ok(calls[0].args.includes('-g'))
     assert.ok(!calls[1].args.includes('-g'))
     assert.ok(calls[1].args.includes('-n'), 'still line-capped')
@@ -1399,15 +1406,26 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     assert.ok(body.includes('name no file'), body)
   })
 
-  it('a clean scrub reads no journal and probes nothing', async () => {
+  it('a clean scrub probes nothing, and reads the journal only for the corrected-metadata window', async () => {
     const clean = cleanCounters(baseExecutor(), 'md127', 'md126')
     clean.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
     clean.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     clean.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
 
     const result = await scrubAhrPool(clean, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    // Read off BEFORE the deepEqual below: strict deepEqual asserts the actual
+    // against the expected literal, which narrows the static type to the four
+    // fields that literal carries.
+    assert.equal(result.metadataCorrected, undefined)
     assert.deepEqual(result, { scrubbed: 't2', btrfsErrors: null, checkedArrays: 2, bandsChecked: ['t2-r1', 't2-r2'] })
-    assert.ok(!clean.calls.some(c => c.command === '/usr/bin/journalctl'))
+    // selfheal.12 (GT-20): a clean scrub is where the corrected-metadata
+    // signal alone lives, so the window is still read — for that count only,
+    // through the same bounded grep — while nothing is probed. The journal
+    // here cannot be read at all (no fixture): the -g attempt plus its
+    // no-PCRE2 fallback, no count, no notification.
+    const journalCalls = clean.calls.filter(c => c.command === '/usr/bin/journalctl')
+    assert.equal(journalCalls.length, 2)
+    assert.equal(journalCalls[0].args[journalCalls[0].args.indexOf('-g') + 1], 'error at logical|read error corrected')
     assert.ok(!clean.calls.some(c => c.command === '/usr/bin/dd'))
   })
 
@@ -2190,5 +2208,117 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     assert.equal(legacy.parityMismatches, undefined)
     assert.equal(legacy.bandsSkipped, undefined)
     assert.equal(legacy.bandsChecked, undefined)
+  })
+})
+
+describe('corrected metadata reads (selfheal.12, GT-20)', () => {
+  // GT-20's verbatim capture (docs/AHR-SELF-HEAL-GROUND-TRUTH.md, stage (b)):
+  // the RW mount's read path repaired a rotten DUP metadata copy from its
+  // mirror, and `btrfs scrub` on the already-repaired array reported 0.
+  const GT20_CORRECTED
+    = 'BTRFS info (device dm-0): read error corrected: ino 0 off 30834688 (dev /dev/mapper/gtsh-data sector 76608)'
+
+  function journal(lines: string[]): string {
+    return `${lines.map(l => JSON.stringify({ _TRANSPORT: 'kernel', MESSAGE: l })).join('\n')}\n`
+  }
+
+  it('parses the GT-20 line field for field, in both kernel spellings', () => {
+    const line = parseCorrectedRead(GT20_CORRECTED)
+    assert.deepEqual(line, {
+      device: 'dm-0',
+      ino: 0,
+      offset: 30834688,
+      dev: '/dev/mapper/gtsh-data',
+      sector: 76608,
+    })
+    // The kind word is open (`info`/`warning`), a dmesg stamp is tolerated,
+    // and an intermediate parenthetical after `corrected` does not blind it.
+    assert.deepEqual(
+      parseCorrectedRead(`[ 3455.495994] ${GT20_CORRECTED.replace('BTRFS info', 'BTRFS warning')}`)?.dev,
+      '/dev/mapper/gtsh-data',
+    )
+    assert.deepEqual(
+      parseCorrectedRead(GT20_CORRECTED.replace('corrected: ino', 'corrected (r): ino'))?.sector,
+      76608,
+    )
+    // A scrub checksum error line is not a corrected read.
+    assert.equal(parseCorrectedRead(GT3_LINES[0]), null)
+  })
+
+  it('counts one line per correction, dedupes the devices, and keeps another pool out', () => {
+    const other = 'BTRFS info (device dm-9): read error corrected: ino 5 off 99 (dev /dev/mapper/other-data sector 3)'
+    const counted = correctedReadsFromMessages(
+      [GT20_CORRECTED, GT20_CORRECTED.replace('sector 76608', 'sector 76609'), other, GT3_LINES[0]],
+      'dm-0',
+    )
+    assert.deepEqual(counted, { count: 2, devices: ['/dev/mapper/gtsh-data'] })
+    // Fail-open: no device filter reads every line, as the attribution does.
+    assert.equal(correctedReadsFromMessages([other]).count, 1)
+    assert.deepEqual(correctedReadsFromMessages([GT3_LINES[0]], 'dm-0'), { count: 0, devices: [] })
+  })
+
+  it('a clean scrub that corrected metadata says so — result and notification', async () => {
+    const e = cleanCounters(baseExecutor(), 'md127', 'md126')
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([
+      GT20_CORRECTED,
+      'BTRFS info (device dm-9): read error corrected: ino 0 off 1 (dev /dev/mapper/other sector 2)',
+    ]), stderr: '', exitCode: 0 } })
+
+    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    // The exact GT-20 shape: a CLEAN scrub (no findings, no parity, no skips)
+    // whose journal window carries the only rot evidence there is.
+    assert.deepEqual(result.metadataCorrected, { count: 1, devices: ['/dev/mapper/gtsh-data'] })
+    const notify = e.calls.find(c => c.command === '/usr/bin/perl')
+    assert.ok(notify, 'the one signal a clean scrub holds is never silent')
+    assert.equal(notify!.args[2], 'warning')
+    assert.equal(notify!.args[3], 'AHR scrub: metadata corrected from the mirror')
+    assert.ok(notify!.args[4].includes(
+      'btrfs corrected 1 metadata read(s) from the mirror copy during this run. '
+      + 'A member is returning bad metadata. Check that disk\'s SMART data in Disks.',
+    ), notify!.args[4])
+    assert.equal(e.calls.filter(c => c.command === '/usr/bin/perl').length, 1, 'one notification')
+  })
+
+  it('no corrected reads: no count on the result, no sentence anywhere', async () => {
+    const e = cleanCounters(baseExecutor(), 'md127', 'md126')
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([GT3_LINES[0]]), stderr: '', exitCode: 0 } })
+
+    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    assert.equal(result.metadataCorrected, undefined)
+    assert.equal(e.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'a truly clean scrub stays silent (§7.3)')
+    assert.equal(metadataCorrectedSentence({ count: 3, devices: [] }).includes('btrfs corrected 3 metadata read(s)'), true)
+  })
+
+  it('the sentence rides the EXISTING notification when the scrub already found errors', async () => {
+    const e = baseExecutor()
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([GT3_LINES[0], GT20_CORRECTED]), stderr: '', exitCode: 0 } })
+    // No mapping wired: the finding is unidentified, the notification stands.
+
+    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    assert.equal(result.metadataCorrected?.count, 1)
+    const body = e.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
+    assert.ok(body.includes('csum=1'), 'the findings notification is unchanged')
+    assert.ok(body.includes('btrfs corrected 1 metadata read(s) from the mirror copy during this run'), body)
+    assert.equal(e.calls.filter(c => c.command === '/usr/bin/perl').length, 1, 'appended, never a second one')
+  })
+
+  it('metadataCorrected round-trips the shared schema — and stays optional', () => {
+    const parsed = AhrScrubResult.parse({
+      scrubbed: 't2',
+      btrfsErrors: null,
+      checkedArrays: 2,
+      metadataCorrected: { count: 2, devices: ['/dev/mapper/gtsh-data'] },
+    })
+    assert.deepEqual(parsed.metadataCorrected, { count: 2, devices: ['/dev/mapper/gtsh-data'] })
+    const legacy = AhrScrubResult.parse({ scrubbed: 't2', btrfsErrors: null, checkedArrays: 2 })
+    assert.equal(legacy.metadataCorrected, undefined)
   })
 })

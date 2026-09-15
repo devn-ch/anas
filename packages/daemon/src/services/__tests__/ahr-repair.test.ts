@@ -720,3 +720,81 @@ describe('AHR repair job — the finding\'s inode (F11)', () => {
     assert.equal(AhrRepairRequest.parse({ files: [{ path: '/mnt/a.bin', blocks: [1] }] }).files[0].inode, undefined)
   })
 })
+
+describe('AHR repair job — corrected metadata reads in its own window (selfheal.12)', () => {
+  // GT-20's verbatim kernel capture: the only durable evidence a member is
+  // returning bad metadata. The repair's cold reads touch the metadata that
+  // holds the checksums it arbitrates against, so its OWN window is read.
+  const GT20_CORRECTED
+    = 'BTRFS info (device dm-0): read error corrected: ino 0 off 30834688 (dev /dev/mapper/gtsh-data sector 76608)'
+
+  function journal(lines: string[]): string {
+    return `${lines.map(l => JSON.stringify({ _TRANSPORT: 'kernel', MESSAGE: l })).join('\n')}\n`
+  }
+
+  function executorWithJournal(lines: string[]): MockExecutor {
+    const exec = executor()
+    exec.addFixture({ command: '/usr/bin/realpath', args: ['/dev/tank/tank-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    exec.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal(lines), stderr: '', exitCode: 0 } })
+    return exec
+  }
+
+  it('carries the count in the result and the sentence in the notification', async () => {
+    const exec = executorWithJournal([
+      GT20_CORRECTED,
+      GT20_CORRECTED.replace('sector 76608', 'sector 76610'),
+      'BTRFS info (device dm-9): read error corrected: ino 0 off 1 (dev /dev/mapper/other sector 2)',
+    ])
+    const result = await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1] }],
+      () => {},
+      { repair: async (_e, req) => outcome(req.file, req.block, 'repaired', 'ok') },
+    )
+
+    assert.deepEqual(result.metadataCorrected, { count: 2, devices: ['/dev/mapper/gtsh-data'] })
+    const notify = exec.calls.find(c => c.command === '/usr/bin/perl')!
+    assert.ok(notify.args[4].includes(
+      'btrfs corrected 2 metadata read(s) from the mirror copy during this run. '
+      + 'A member is returning bad metadata. Check that disk\'s SMART data in Disks.',
+    ), notify.args[4])
+  })
+
+  it('an unreadable journal costs the count, never the repair — and no sentence appears', async () => {
+    const exec = executor() // no journalctl, no realpath: both reads fail open
+    const result = await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1] }],
+      () => {},
+      { repair: async (_e, req) => outcome(req.file, req.block, 'repaired', 'ok') },
+    )
+    assert.equal(result.metadataCorrected, undefined)
+    const body = exec.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
+    assert.ok(!body.includes('metadata read(s)'), body)
+  })
+
+  it('metadataCorrected round-trips the shared schema — and stays optional', () => {
+    const parsed = AhrRepairResult.parse({
+      pool: 'tank',
+      files: [{ path: '/a.bin', blocks: [{ block: 1, outcome: 'repaired', reason: 'ok' }] }],
+      repaired: 1,
+      unrepairable: 0,
+      aboveMd: 0,
+      blocks: 1,
+      metadataCorrected: { count: 1, devices: ['/dev/mapper/gtsh-data'] },
+    })
+    assert.deepEqual(parsed.metadataCorrected, { count: 1, devices: ['/dev/mapper/gtsh-data'] })
+    // A pre-selfheal.12 payload parses unchanged.
+    const legacy = AhrRepairResult.parse({
+      pool: 'tank',
+      files: [],
+      repaired: 0,
+      unrepairable: 0,
+      aboveMd: 0,
+      blocks: 0,
+    })
+    assert.equal(legacy.metadataCorrected, undefined)
+  })
+})

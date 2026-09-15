@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AhrScrubFinding, AhrScrubParityMismatch } from './ahr.js'
+import { AhrMetadataCorrected, AhrScrubFinding, AhrScrubParityMismatch } from './ahr.js'
 import { AbsolutePath } from './common.js'
 
 /**
@@ -468,6 +468,14 @@ export const AhrRepairResult = z.object({
    * fresh two-phase scrub to rediscover it.
    */
   parityResiduals: z.array(AhrScrubParityMismatch).default([]),
+  /**
+   * Metadata (DUP) copies btrfs corrected from their mirror during THIS
+   * repair's own window (selfheal.12, GT-20). The engine's cold reads touch
+   * the metadata that holds the checksums it arbitrates against, so a repair
+   * can trigger the same correction a scrub does. Additive and optional — a
+   * result from an older daemon, or a window that read nothing, omits it.
+   */
+  metadataCorrected: AhrMetadataCorrected.optional(),
   /** Total blocks attempted — repaired + unrepairable + aboveMd + mappingAbort + notExamined. */
   blocks: z.number().int().nonnegative(),
 })

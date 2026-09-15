@@ -7021,6 +7021,9 @@ const SCRUB_STATES = {
     // not check a whole band. Both must read on the row.
     { target: { kind: 'ahr', pool: 'ahr3' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'parity-only rot band', lastScrub: null, running: null },
     { target: { kind: 'ahr', pool: 'ahr4' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'a band md never checked', lastScrub: null, running: null },
+    // selfheal.12 (GT-20): ahr5's newest scrub was CLEAN and its only signal
+    // is the corrected-metadata count — the row must not read as a clean bill.
+    { target: { kind: 'ahr', pool: 'ahr5' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'a clean scrub that corrected metadata', lastScrub: null, running: null },
   ],
 }
 
@@ -7141,6 +7144,21 @@ const SCRUB_JOBS = {
         findings: [],
       },
     }),
+    // selfheal.12 — the GT-20 shape: a CLEAN scrub whose journal window
+    // carried the kernel's corrected-metadata reads. No findings, no parity,
+    // no skips — the count is the only thing the row has to say.
+    scrubJob({
+      id: 'j10',
+      at: '2026-09-12T10:00:00.000Z',
+      result: {
+        scrubbed: 'ahr5',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr5-r1', 'ahr5-r2'],
+        findings: [],
+        metadataCorrected: { count: 2, devices: ['/dev/mapper/gtsh-data'] },
+      },
+    }),
   ],
 }
 
@@ -7185,9 +7203,10 @@ async function scrubFindingsChecks() {
   const ahr2 = rowFor(grid, 'ahr2')
   const ahr3 = rowFor(grid, 'ahr3')
   const ahr4 = rowFor(grid, 'ahr4')
+  const ahr5 = rowFor(grid, 'ahr5')
   const tank = rowFor(grid, 'tank')
-  ok('scrubs: every pool is a row', !!ahr0 && !!ahr1 && !!ahr2 && !!ahr3 && !!ahr4 && !!tank)
-  if (!ahr0 || !ahr1 || !ahr2 || !ahr3 || !ahr4 || !tank) { return }
+  ok('scrubs: every pool is a row', !!ahr0 && !!ahr1 && !!ahr2 && !!ahr3 && !!ahr4 && !!ahr5 && !!tank)
+  if (!ahr0 || !ahr1 || !ahr2 || !ahr3 || !ahr4 || !ahr5 || !tank) { return }
 
   const found = ahr0.get('findings')
   ok('scrubs: the AHR row carries its last scrub\'s findings', !!found)
@@ -7224,6 +7243,22 @@ async function scrubFindingsChecks() {
     /ahr4-r2: md never started the check/.test(skippedCell), skippedCell)
   ok('scrubs: …and no findings link when nothing was named',
     !/anas-scrub-findings-link/.test(skippedCell), skippedCell)
+
+  // selfheal.12 — the corrected-metadata count rides the row too, amber, on
+  // the newest completed scrub — and a CLEAN scrub whose only signal is this
+  // count still reads here, never as "md keeps no record" (GT-20).
+  eq('scrubs: the corrected-metadata count rides the newest completed scrub',
+    ahr5.get('metadataCorrected') && ahr5.get('metadataCorrected').count, 2)
+  const correctedCell = scrubCell(grid, ahr5)
+  ok('scrubs: a corrected-metadata count shows on the row, labelled',
+    /2 metadata reads corrected/.test(correctedCell), correctedCell)
+  ok('scrubs: …with what happened, what it means and what to do as the tooltip',
+    /btrfs corrected 2 metadata read\(s\) from the mirror copy/.test(correctedCell)
+    && /Check that disk's SMART data in Disks/.test(correctedCell), correctedCell)
+  ok('scrubs: …and a count-only scrub names no file, so there is no findings link',
+    !/anas-scrub-findings-link/.test(correctedCell), correctedCell)
+  ok('scrubs: …and it still says the record is the last completed scrub since the daemon started',
+    /last completed scrub since the daemon started/.test(correctedCell), correctedCell)
 
   const cell = scrubCell(grid, ahr0)
   ok('scrubs: the row says how many files, labelled', /3 files with checksum errors/.test(cell), cell)
@@ -7285,7 +7320,7 @@ async function scrubFindingsChecks() {
   const grid2 = view2.down('#scrubGrid')
   view2.fireEvent('afterrender', view2)
   await settle()
-  eq('scrubs: an unreadable job list still renders every row', grid2.getStore().getCount(), 6)
+  eq('scrubs: an unreadable job list still renders every row', grid2.getStore().getCount(), SCRUB_STATES.data.length)
   eq('scrubs: …and simply has no findings to show', rowFor(grid2, 'ahr0').get('findings'), null)
 }
 

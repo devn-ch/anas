@@ -30,6 +30,7 @@ export {
   AhrLayoutPreview,
   AhrLayoutPreviewRequest,
   AhrMemberState,
+  AhrMetadataCorrected,
   AhrMountpointRequest,
   AhrPool,
   AhrPoolState,

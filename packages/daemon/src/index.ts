@@ -7,6 +7,7 @@ import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
 import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
+import { DEFAULT_SYSTEMD_DIR } from './services/snapshot-schedule-units.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
 // no-env manual launch must NOT land the trust-boundary socket in world-writable
@@ -77,9 +78,14 @@ async function main() {
           ['ahr.repair', 'ahr.parity-rewrite', 'ahr.scrub'],
           pool,
         ) ?? null,
+        // The mdcheck-ownership note (the preset ruling, F7) reads the node's
+        // unit directory — the same one the scrub toggle writes.
+        systemdDir: DEFAULT_SYSTEMD_DIR,
       })).then((report) => {
         if (reconcileWasQuiet(report))
           return
+        for (const line of report.notes)
+          server.log.warn(`selfheal reconcile: ${line}`)
         for (const line of report.restored)
           server.log.warn(`selfheal reconcile: ${line}`)
         for (const line of report.snapshots)

@@ -441,6 +441,19 @@ describe('no mdcheck adoption at daemon start (review F1/F4) — structural guar
     for (const href of await reachableFrom(INDEX_URL, false)) {
       if (href.includes('/src/routes/'))
         continue // the routes tree is the sanctioned door
+      // The preset ruling (decision-tree F7) gives selfheal-reconcile ONE
+      // read-only store read — the schedule the mdcheck-ownership note is
+      // decided from. Its writes stay guarded by the next test, which holds
+      // that file to the write verbs it may never name.
+      if (href.endsWith('/services/selfheal-reconcile.ts'))
+        continue
+      // The store layer itself, reached through the F7 read (and through
+      // ahr-scrub's borrow of mismatchCntArgs, now on the start path via
+      // selfheal-reconcile → selfheal-repair → ahr-repair): these two files
+      // legitimately name each other. What matters is that no NEW module on
+      // the start path names the store — the write surface is guarded below.
+      if (href.endsWith('/services/scrub-schedules.ts') || href.endsWith('/services/scrub-schedule-units.ts'))
+        continue
       const src = await readFile(fileURLToPath(new URL(href)), 'utf-8')
       if (STORE_RE.test(src))
         offenders.push(href.slice(SRC_ROOT.href.length))
@@ -469,6 +482,14 @@ describe('no mdcheck adoption at daemon start (review F1/F4) — structural guar
       if (rel === 'routes/scrub.ts')
         continue // the sanctioned door
       const src = await readFile(fileURLToPath(new URL(href)), 'utf-8')
+      if (rel === 'services/selfheal-reconcile.ts') {
+        // The F7 exception is READ-ONLY and narrow: the mdcheck-ownership note
+        // may read the schedule and mdcheck's is-enabled state, and may name
+        // NO write surface at all — not the unit writes, not the toggle.
+        if (/\bwriteScrubUnits\b|\bremoveScrubUnits\b|\bsetAhrScrubEnabled\b|\bsetMdcheck\b|\bmdcheckToggleArgs\b/.test(src))
+          offenders.push(rel)
+        continue
+      }
       if (/\bwriteScrubUnits\b|\bremoveScrubUnits\b|scrub-schedule-units/.test(src))
         offenders.push(rel)
     }

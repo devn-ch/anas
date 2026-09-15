@@ -165,10 +165,30 @@ nodes:
     code: 'packages/daemon/src/services/selfheal-csum.ts:verifyNode'
     test: 'packages/daemon/src/services/__tests__/selfheal-csum.test.ts:refuses one flipped byte anywhere past the header csum'
     gt: GT-20
-    next: [E04b, E04c, S46, X5r]
+    next: [E04b, E04c, S46, X5c, X5r]
+  - id: X5c
+    kind: action
+    label: "the kernel's `read error corrected` lines are counted in the two windows ANAS already reads (selfheal.12 — never a watcher): the scrub's journal window and a repair job's own window, both filtered to the pool's dm device, and the count plus the member devices ride the result as `metadataCorrected {count, devices}`"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:readCorrectedReads'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub that corrected metadata says so — result and notification'
+    gt: GT-20
+    next: [X5n]
+  - id: X5n
+    kind: notification
+    label: "ONE sentence on the notification the run already earns: \"btrfs corrected N metadata read(s) from the mirror copy during this run. A member is returning bad metadata. Check that disk's SMART data in Disks.\" — and a CLEAN scrub whose only signal is this count earns its own warning, because the summary says nothing (GT-20)"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:metadataCorrectedSentence'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the sentence rides the EXISTING notification when the scrub already found errors'
+    gt: GT-20
+    next: [X5u]
+  - id: X5u
+    kind: ui
+    label: 'the Scrubs row carries the count of the newest completed scrub — amber, labelled, with what happened / what it means / what to check as the tooltip — so a clean scrub never reads as a clean bill'
+    code: 'packages/pve-integration/src/69-scrubs.js:correctedFor'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: a corrected-metadata count shows on the row, labelled'
+    gt: none
   - id: X5r
     kind: residual
-    label: "a DUP metadata rot is repaired by the RW MOUNT's read path, not by the scrub: `btrfs scrub` reports 0 corrected and the only durable evidence is a one-time dmesg `read error corrected` line, which ANAS's attribution does not parse"
+    label: "a DUP metadata rot is repaired by the RW MOUNT's read path, not by the scrub: `btrfs scrub` reports 0 corrected, and the only durable evidence is a one-time kernel `read error corrected` line — which is exactly what ANAS now counts in the windows it already reads (selfheal.12), so the residual is the SENTENCE, not silence"
     code: none
     test: none
     gt: GT-20
@@ -608,9 +628,9 @@ nodes:
     gt: none
   - id: S42
     kind: decision
-    label: 'Error summary clean: no journal is read and nothing is probed'
+    label: 'Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold'
     code: 'packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus'
-    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub reads no journal and probes nothing'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window'
     gt: GT-3
     next: [S60]
   - id: S43

@@ -1,7 +1,9 @@
-import type { AhrPool } from '@anas/shared'
+import type { AhrPool, AhrScrubSchedule } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { AhrSnapshotOptions } from './ahr-snapshots.js'
 import { readAhrPools } from './ahr-topology.js'
+import { readScrubSchedule } from './scrub-schedule-units.js'
+import { isEnabledArgs, MDCHECK_PRIMARY, parseMdcheckEnabled, SYSTEMCTL } from './scrub-schedules.js'
 import {
   kernelName,
   MD_DEFAULT_RMW_LEVEL,
@@ -65,6 +67,11 @@ export interface SelfhealReconcileReport {
   skipped: string[]
   /** Anything that could not be read or written — never fatal. */
   errors: string[]
+  /**
+   * State notes that are the WHOLE of their story — observed, said, never
+   * acted on (the preset ruling, decision-tree F7). One line each.
+   */
+  notes: string[]
 }
 
 export interface SelfhealReconcileOptions {
@@ -72,6 +79,13 @@ export interface SelfhealReconcileOptions {
   pools?: AhrPool[]
   /** Passed to the snapshot service (tests point its runtime dir at a temp path). */
   ahrSnapshotOptions?: AhrSnapshotOptions
+  /**
+   * The systemd unit directory the `anas-scrub` units live in. Provided by the
+   * daemon (index.ts); ABSENT in the tests and the direct call, which is what
+   * keeps the mdcheck-ownership note below from reading the test host's real
+   * unit directory.
+   */
+  systemdDir?: string
   /**
    * Is a self-heal job IN FLIGHT on this pool right now (sixth pass, N9)?
    *
@@ -96,6 +110,52 @@ export function reconcileWasQuiet(report: SelfhealReconcileReport): boolean {
     && report.snapshots.length === 0
     && report.skipped.length === 0
     && report.errors.length === 0
+    && report.notes.length === 0
+}
+
+/**
+ * The mdcheck-ownership note (the preset ruling, decision-tree F7).
+ *
+ * When ANAS's periodic scrub owns md checks — the `anas-scrub` units exist
+ * WITH pools listed — the toggle has disabled mdadm's mdcheck timers. A
+ * `systemctl preset`, or a manual enable, can turn them back on (GT-21: a
+ * plain mdadm upgrade will NOT), and then TWO parity checks run on the node.
+ * ANAS notes it, once, at daemon start, and does nothing else: re-disabling is
+ * the operator's one command, stated in the note. The existing state note on
+ * the Scrubs row ("double parity check: mdcheck is on") covers the UI side.
+ *
+ * Pure so the decision is testable without a unit directory; the caller reads
+ * the two facts and hands them in.
+ */
+export function mdcheckReenabledNote(
+  schedule: AhrScrubSchedule | null,
+  mdcheckEnabled: boolean,
+): string | null {
+  if (!schedule || schedule.pools.length === 0 || !mdcheckEnabled)
+    return null
+  return 'mdcheck timers are enabled while ANAS periodic scrub owns md checks '
+    + '(a systemctl preset or a manual enable turned them back on). Both will run. '
+    + 'Disable them with: systemctl disable --now mdcheck_start.timer mdcheck_continue.timer'
+}
+
+/** The two facts the note reads: our schedule (null when the units are absent) and mdcheck's state. */
+async function mdcheckOwnershipNote(executor: CommandExecutor, dir: string): Promise<string | null> {
+  let schedule: AhrScrubSchedule | null = null
+  try {
+    schedule = await readScrubSchedule(dir)
+  }
+  catch {
+    schedule = null
+  }
+  let mdcheckEnabled = false
+  try {
+    const r = await executor.exec(SYSTEMCTL, isEnabledArgs(MDCHECK_PRIMARY))
+    mdcheckEnabled = parseMdcheckEnabled(r.stdout)
+  }
+  catch {
+    mdcheckEnabled = false
+  }
+  return mdcheckReenabledNote(schedule, mdcheckEnabled)
 }
 
 /**
@@ -107,7 +167,22 @@ export async function reconcileSelfhealState(
   executor: CommandExecutor,
   options?: SelfhealReconcileOptions,
 ): Promise<SelfhealReconcileReport> {
-  const report: SelfhealReconcileReport = { restored: [], snapshots: [], skipped: [], errors: [] }
+  const report: SelfhealReconcileReport = { restored: [], snapshots: [], skipped: [], errors: [], notes: [] }
+
+  // The mdcheck-ownership note (F7) — before the pool walk, because it does
+  // not depend on the pools being readable, and only when a unit directory was
+  // handed in (the daemon does; the tests and the direct call do not, so they
+  // never read the host's own unit directory).
+  if (options?.systemdDir) {
+    try {
+      const note = await mdcheckOwnershipNote(executor, options.systemdDir)
+      if (note)
+        report.notes.push(note)
+    }
+    catch {
+      // A note that cannot be decided says nothing — never fatal, never acted on.
+    }
+  }
 
   let pools: AhrPool[]
   try {
