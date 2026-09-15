@@ -291,6 +291,10 @@ Reference PASS (41/41 cases, 14/14 negative controls); the engine's record
 
 > **Candidate (not a story):** a journal watcher for btrfs checksum errors on AHR pools at READ time (a user hits EIO on a share before any scrub runs) → the same PVE warning as the scrub. Cheap; demand-gated.
 
+### Identities — issue #60 fixes *(0.3.2)*
+
+**identity.1** As a user, I want share users and groups to work the way the system underneath allows (GitHub #60): (a) **mixed-case names** — the identity name schema accepts what `useradd` accepts (`[A-Za-z_][A-Za-z0-9_-]*\$?`), UI validation mirrors it; (b) **SMB password presence is matched case-insensitively** — Samba treats names case-insensitively and may store a different case than passwd, so the Share Users list compares passwd and passdb names folded; (c) **no user-private group** — share users are created with `useradd -N` and the default group, so no phantom same-named group appears (existing users keep theirs; the list explains a private group when one exists); (d) **delete verbs** — `DELETE /v1/identity/users/:name` and `DELETE /v1/identity/groups/:name`, confirm-gated (409 + `X-Anas-Confirm-Code`) with warnings naming the shares/ACLs that reference the identity and the files it owns (ownership is NOT changed; the uid/gid stays on disk), refusing a group that is any user's primary group or a user referenced by a share until the reference is removed; `smbpasswd -x` for a user with a passdb entry; UI Delete buttons on both grids; DESIGN.md API table rows. Tests at both boundaries + harness. *(Reporter's 4 symptoms map to a–d.)*
+
 ## 4. Candidates (serious; not authorized)
 
 One paragraph each. Promotion to §3 is an operator call.
@@ -309,6 +313,8 @@ One paragraph each. Promotion to §3 is an operator call.
 - **Napkin only (not roadmap):** AHR userspace self-heal via btrfs checksums; "Boost" sync priority + the OS-tuning boundary rule; AHR in-place rebalance (riskiest op we could ship — honest paths stay create-time-mix or grow-with-≥largest).
 
 ---
+
+| Cloud sync via rclone (#57) | **Accepted for the release after 0.3.2** — one-way copy/sync of a dataset (or share path) to an rclone remote on the schedule-unit pattern; rclone installed as a dependency like samba; remotes configured through ANAS with secrets held like backup credentials (0600, write-only); notification per run; NO cloud-vendor APIs, NO restore UI (rclone copy-back is the operator's), NO two-way sync in the first cut. Offsite PBS backup remains the PBS S3 datastore path. | #57 |
 
 ## 5. Rejected / OBE (don't re-derive)
 
