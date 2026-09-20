@@ -143,15 +143,15 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: mockFixtures.lsblk() })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     mock.addFixture({ command: '/usr/sbin/smartctl', result: mockFixtures.smartctl() })
-    // Identity + health call used by DiskIdentityCache (smartctl -iH)
+    // Identity + health call used by DiskIdentityCache (smartctl -n standby -iH)
     const wdIdentity = { model_family: 'Western Digital Black', model_name: 'WDC WD2003FZEX-00SRLA0', form_factor: { name: '3.5 inches' }, firmware_version: '81.00A81', sata_version: { string: 'SATA 3.1, 6.0 Gb/s' }, smart_status: { passed: true } }
-    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-iH', '--json', '/dev/sda'], result: {
+    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-n', 'standby', '-iH', '--json', '/dev/sda'], result: {
       stdout: JSON.stringify({ model_family: 'Samsung 870 EVO', model_name: 'Samsung SSD 870 EVO 250GB', form_factor: { name: '2.5 inches' }, firmware_version: 'SVT02B6Q', sata_version: { string: 'SATA 3.2, 6.0 Gb/s' }, trim: { supported: true }, smart_status: { passed: true } }),
       stderr: '',
       exitCode: 0,
     } })
     for (const dev of ['/dev/sdb', '/dev/sdc', '/dev/sdd', '/dev/sde', '/dev/sdf']) {
-      mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-iH', '--json', dev], result: {
+      mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-n', 'standby', '-iH', '--json', dev], result: {
         stdout: JSON.stringify(wdIdentity),
         stderr: '',
         exitCode: 0,
@@ -314,7 +314,9 @@ export function createServer(opts?: ServerOptions) {
     // args, so command-only fallbacks let dev-mode mutations succeed.
     mock.addFixture({ command: '/usr/sbin/useradd', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/usermod', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/userdel', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/groupadd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/groupdel', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/gpasswd', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/smbpasswd', result: { stdout: '', stderr: '', exitCode: 0 } })
     // Command-only getent fallback (exit 0, non-parseable stdout). Registered
@@ -412,6 +414,17 @@ export function createServer(opts?: ServerOptions) {
     // fixtures/ahr/NOTES.md for provenance (incl. which files are
     // reconstructed/synthetic).
     mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    // Both bands' parity counters, readable and zero — the healthy pool this
+    // mock replays. A counter that cannot be READ is not coverage (sixth pass,
+    // N12): the band lands in `bandsSkipped`, not `bandsChecked`, so the dev
+    // mock has to answer with a number or its scrub reports nothing checked.
+    for (const kernel of ['md127', 'md126']) {
+      mock.addFixture({
+        command: '/usr/bin/cat',
+        args: [`/sys/block/${kernel}/md/mismatch_cnt`],
+        result: { stdout: '0\n', stderr: '', exitCode: 0 },
+      })
+    }
     mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
     mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
     mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
@@ -506,6 +519,9 @@ export function createServer(opts?: ServerOptions) {
     executor,
     jobQueue,
     confirmStore,
+    // The delete routes read it to refuse an identity a share still names in
+    // `valid users` — the SAME path the share routes edit.
+    smbConfPath,
     // The dev mock never spawns anything, so probing the real /usr/bin/smbpasswd
     // would make the SMB paths untestable on a machine without samba.
     ...(opts?.mock ? { smbpasswdAvailable: async () => true } : {}),
@@ -539,8 +555,9 @@ export function createServer(opts?: ServerOptions) {
   const subvolRuntimeDir = process.env.ANAS_AHR_SUBVOL_RUNTIME_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-subvol-${process.pid}`) : undefined)
   server.register(scheduleRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, subvolRuntimeDir })
-  // Periodic scrub (Epic 17.5) — uniform on/off surface; ZFS property + mdcheck.
-  server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue })
+  // Periodic scrub (Epic 17.5 + selfheal.4) — uniform on/off surface; ZFS
+  // property + the node-level anas-scrub timer (same unit dir as schedules).
+  server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue, systemdDir })
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
   server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath, iscsiPaths })

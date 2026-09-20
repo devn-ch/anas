@@ -1,6 +1,6 @@
 // @anas/shared — shared types, schemas, and validators
 
-export const VERSION = '0.3.1'
+export const VERSION = '0.3.2'
 
 // Access / permissions schemas (layered editor — Epic 4.7.2)
 export {
@@ -30,12 +30,18 @@ export {
   AhrLayoutPreview,
   AhrLayoutPreviewRequest,
   AhrMemberState,
+  AhrMetadataCorrected,
   AhrMountpointRequest,
   AhrPool,
   AhrPoolState,
   AhrPreviewBand,
   AhrReplacePair,
   AhrReplaceRequest,
+  AhrScrubFinding,
+  AhrScrubParityMismatch,
+  AhrScrubResult,
+  AhrScrubSkippedBand,
+  AhrScrubStripe,
   AhrSnapshot,
   AhrSnapshotName,
   AhrSpareRequest,
@@ -394,6 +400,9 @@ export {
 
 // Schedule schemas (Epic 17 — uniform ANAS-owned snapshot schedules)
 export {
+  AhrScrubPhase,
+  AhrScrubSchedule,
+  AhrScrubToggleRequest,
   LastScrub,
   PeriodicScrubState,
   RetentionBucket,
@@ -402,6 +411,7 @@ export {
   ScheduledSnapshot,
   ScheduleId,
   ScheduleRunResult,
+  ScrubCadence,
   ScrubMechanism,
   ScrubRunning,
   ScrubTarget,
@@ -414,6 +424,42 @@ export {
   SnapshotSource,
   SnapshotTarget,
 } from './schemas/schedules.js'
+
+// Self-heal repair engine schemas (story selfheal.5) + the repair job
+// (selfheal.6) + the parity rewrite (selfheal.10)
+export {
+  AhrMirrorReconcileArm,
+  AhrMirrorReconcileDurations,
+  AhrMirrorReconcileOutcome,
+  AhrMirrorReconcilePass,
+  AhrMirrorReconcileReasonCode,
+  AhrMirrorReconcileRequest,
+  AhrMirrorReconcileResult,
+  AhrMirrorReconcileWrites,
+  AhrParityRewriteDurations,
+  AhrParityRewriteOutcome,
+  AhrParityRewriteReasonCode,
+  AhrParityRewriteRequest,
+  AhrParityRewriteResult,
+  AhrRepairBlockOutcome,
+  AhrRepairFile,
+  AhrRepairFileOutcome,
+  AhrRepairRequest,
+  AhrRepairResult,
+  SELFHEAL_BAD_BLOCKS_PRESENT,
+  SELFHEAL_CSUM_UNREADABLE,
+  SELFHEAL_NOT_EXAMINED_REASONS,
+  SelfhealDiagnostics,
+  SelfhealMapping,
+  SelfhealNotExaminedReason,
+  SelfhealOutcome,
+  SelfhealOutcomeKind,
+  SelfhealParityResidual,
+  SelfhealReasonCode,
+  SelfhealReconstruction,
+  SelfhealStep,
+  SelfhealStepName,
+} from './schemas/selfheal.js'
 
 // Share schemas (SMB + NFS)
 export {

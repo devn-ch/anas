@@ -1,10 +1,12 @@
 import type { Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
 import { mockFixtures } from '../../fixtures/loader.js'
@@ -18,8 +20,11 @@ import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
-import { ahrMutationRoutes } from '../ahr-mutate.js'
+import { ahrMutationRoutes, reconcileLunWarnings, rewriteLunWarnings } from '../ahr-mutate.js'
 import { jobRoutes } from '../jobs.js'
+
+/** Where the shipped md/lvm captures live — `mdstat-check.txt` among them. */
+const AHR_FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), '../../fixtures/ahr')
 
 /**
  * AHR mutation routes (Epic 11 + AHR) — POST /v1/ahr, DELETE /v1/ahr/:name,
@@ -168,7 +173,7 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, res.json().job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(job.result, { scrubbed: 'ahr0', btrfsErrors: null, checkedArrays: 2 })
+    assert.deepEqual(job.result, { scrubbed: 'ahr0', btrfsErrors: null, checkedArrays: 2, bandsChecked: ['ahr0-r1', 'ahr0-r2'] })
   })
 })
 
@@ -416,6 +421,169 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
 })
 
 /**
+ * The scrub/repair exclusion (selfheal.6, review R7). Both verbs are full-array
+ * operations on ONE pool and must never overlap — the repair turns md's
+ * `rmw_level`, `sync_min`/`sync_max` and `stripe_cache_size` aside for the
+ * duration of each block, and a check re-reads every stripe underneath it.
+ *
+ * The exclusion is a job-queue query, and the query has to filter by STATUS: a
+ * newer TERMINAL job for the same pool must not hide an older running one.
+ */
+describe('POST /v1/ahr/:name/{scrub,repair} — the in-flight exclusion', () => {
+  let server: TestServer
+  let jobQueue: JobQueue
+  let dir: string
+
+  /** A job that never finishes — an operation still in flight on the pool. */
+  function inFlight(operation: string, name: string): string {
+    return jobQueue.submit(operation, { user: 'u', uid: 0, params: { name } }, async () => new Promise(() => {})).id
+  }
+
+  /** A job that is already over — the kind that used to HIDE a running one. */
+  async function finished(operation: string, name: string): Promise<void> {
+    jobQueue.submit(operation, { user: 'u', uid: 0, params: { name } }, async () => ({ done: true }))
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-exclusion-'))
+    await writeFile(join(dir, 'fstab'), '# empty\n')
+
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+
+    const app = Fastify({ logger: false })
+    jobQueue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+    })
+    server = app as unknown as TestServer
+  })
+  afterEach(async () => {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const repairBody = { files: [{ path: '/mnt/anas-ahr/ahr0/f1.bin', blocks: [300] }] }
+
+  it('a scrub is refused while a repair runs — even behind a newer finished repair', async () => {
+    const running = inFlight('ahr.repair', 'ahr0')
+    await finished('ahr.repair', 'ahr0')
+
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    const { message } = res.json().error
+    assert.ok(message.includes(running), `the RUNNING job is named: ${message}`)
+    assert.ok(message.includes('a repair job is in flight'), message)
+  })
+
+  it('a repair is refused while a scrub runs — even behind a newer finished scrub', async () => {
+    const running = inFlight('ahr.scrub', 'ahr0')
+    await finished('ahr.scrub', 'ahr0')
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/ahr/ahr0/repair',
+      headers: JSON_HEADERS,
+      payload: repairBody,
+    })
+    assert.equal(res.statusCode, 409)
+    const { message } = res.json().error
+    assert.ok(message.includes(running), `the RUNNING job is named: ${message}`)
+    assert.ok(message.includes('a scrub is in flight'), message)
+    // Refused BEFORE a confirm code is minted: "unsafe now" has no bypass.
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+  })
+
+  it('a SECOND scrub of the same pool is refused while the first runs', async () => {
+    const running = inFlight('ahr.scrub', 'ahr0')
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    assert.ok(res.json().error.message.includes(running))
+  })
+
+  it('a finished job on its own blocks nothing', async () => {
+    await finished('ahr.repair', 'ahr0')
+    await finished('ahr.scrub', 'ahr0')
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202)
+  })
+
+  it('a job in flight on ANOTHER pool blocks nothing', async () => {
+    inFlight('ahr.repair', 'other')
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202)
+  })
+
+  /**
+   * S6 — the exclusions above are BOTH in-process, and a daemon restart takes
+   * both with it: md's check on band r1 keeps running while the job that
+   * issued it is gone. /proc/mdstat is the one thing that still knows, so the
+   * route reads it at submit time and refuses.
+   *
+   * Staged with two mdstat reads: the topology read sees the clean node the
+   * route-time state came from, and the exclusion read — a separate read, a
+   * moment later — sees the check. That separation is the whole point: what md
+   * is doing at the instant of the gate is the authority, not what a snapshot
+   * taken earlier said.
+   */
+  it('refuses while an md check is running on a band, with no ANAS job behind it', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, results: [
+      mockFixtures.ahrMdstat(),
+      { stdout: readFileSync(join(AHR_FIXTURES, 'mdstat-check.txt'), 'utf-8'), stderr: '', exitCode: 0 },
+    ] })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+
+    const app = Fastify({ logger: false })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue: new JobQueue(),
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+    })
+    try {
+      const res = await app.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 409)
+      const { message } = res.json().error
+      assert.match(message, /^an md check is running on ahr0-r\d/)
+      assert.match(message, /started outside this job or by a previous daemon/)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no bypass for "unsafe now"')
+    }
+    finally {
+      await app.close()
+    }
+  })
+})
+
+/**
  * The scrub gate against an OFFLINE pool (issue #18 follow-up). The stock dev
  * mock's `ahr0` is healthy, so this builds the same read layer from the same
  * shipped fixtures with ONE byte changed: the LV's attr state field, 'a' →
@@ -476,5 +644,543 @@ describe('POST /v1/ahr/:name/scrub — an OFFLINE pool is refused', () => {
     // Nothing was started: no btrfs scrub, no md check.
     assert.ok(!executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'scrub'), 'no btrfs scrub')
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check'), 'no md check')
+  })
+})
+
+/**
+ * POST /v1/ahr/:name/parity-rewrite (story selfheal.10) — the confirm-gated
+ * band rewrite. Every precondition is a HARD 409 with its own `reason` code:
+ * the proof lives in the last completed scrub, and none of these is a risk an
+ * operator is allowed to accept.
+ */
+describe('POST /v1/ahr/:name/parity-rewrite', () => {
+  let server: TestServer
+  let jobQueue: JobQueue
+  let executor: MockExecutor
+  let dir: string
+  let sys: string
+
+  /** A scrub job that COMPLETED with the given result — the evidence. */
+  async function completedScrub(result: unknown, name = 'ahr0'): Promise<void> {
+    jobQueue.submit('ahr.scrub', { user: 'u', uid: 0, params: { name } }, async () => result)
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  /** A job that never finishes — an operation still in flight on the pool. */
+  function inFlight(operation: string, name: string): string {
+    return jobQueue.submit(operation, { user: 'u', uid: 0, params: { name } }, async () => new Promise(() => {})).id
+  }
+
+  /** The proof: mismatches on r1, a clean checksum pass across the pool. */
+  const CLEAN_WITH_MISMATCH = { scrubbed: 'ahr0', btrfsErrors: null, checkedArrays: 2, parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8 }] }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-parity-'))
+    await writeFile(join(dir, 'fstab'), '# empty\n')
+    // A real md sysfs tree for band r1: the route reads the BAND's state, not
+    // the pool rollup, and it reads it through the engine's own md layer.
+    sys = join(dir, 'sys/block/md127/md')
+    await mkdir(join(sys, 'rd0'), { recursive: true })
+    await mkdir(join(sys, 'rd1'), { recursive: true })
+    await mkdir(join(sys, 'rd2'), { recursive: true })
+    const knobs: Record<string, string> = {
+      'level': 'raid5',
+      'chunk_size': '524288',
+      'layout': '2',
+      'raid_disks': '3',
+      'sync_action': 'idle',
+      'last_sync_action': 'check',
+      'sync_min': '0',
+      'sync_max': 'max',
+      'sync_completed': '2089984 / 2089984',
+      'mismatch_cnt': '8',
+      'degraded': '0',
+      'array_state': 'clean',
+      'reshape_position': 'none',
+      'rd0/offset': '2048',
+      'rd0/size': '1044992',
+      'rd0/state': 'in_sync',
+      'rd1/offset': '2048',
+      'rd1/size': '1044992',
+      'rd1/state': 'in_sync',
+      'rd2/offset': '2048',
+      'rd2/size': '1044992',
+      'rd2/state': 'in_sync',
+    }
+    for (const [key, value] of Object.entries(knobs))
+      await writeFile(join(sys, key), `${value}\n`)
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = dir
+
+    executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md/ahr0-r1'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', '/dev/md/ahr0-r1'], result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+
+    const app = Fastify({ logger: false })
+    jobQueue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+    })
+    server = app as unknown as TestServer
+  })
+  afterEach(async () => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function post(body: Record<string, unknown>, headers: Record<string, string> = {}) {
+    return await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/parity-rewrite', headers: { ...JSON_HEADERS, ...headers }, payload: body })
+  }
+
+  it('400 on a body that names no band, and on a band the pool does not have', async () => {
+    await completedScrub(CLEAN_WITH_MISMATCH)
+    const empty = await post({})
+    assert.equal(empty.statusCode, 400)
+    assert.equal(empty.json().error.code, 'VALIDATION_ERROR')
+
+    const unknown = await post({ band: 9 })
+    assert.equal(unknown.statusCode, 400)
+    assert.ok(unknown.json().error.message.includes('no band r9'), unknown.json().error.message)
+    assert.ok(unknown.json().error.message.includes('r1'), 'the bands it does have are named')
+  })
+
+  it('404 on an unknown pool', async () => {
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/nope/parity-rewrite', headers: JSON_HEADERS, payload: { band: 1 } })
+    assert.equal(res.statusCode, 404)
+  })
+
+  it('409 no-parity-mismatch when no completed scrub proves anything', async () => {
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'no-parity-mismatch')
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no bypass for "unsafe now"')
+  })
+
+  it('409 no-parity-mismatch when the scrub counted mismatches on ANOTHER band', async () => {
+    await completedScrub({ scrubbed: 'ahr0', btrfsErrors: null, parityMismatches: [{ band: 'ahr0-r2', bandIndex: 2, array: '/dev/md/ahr0-r2', mismatchCnt: 4 }] })
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'no-parity-mismatch')
+  })
+
+  it('409 data-findings-present when the last scrub found data corruption', async () => {
+    await completedScrub({ scrubbed: 'ahr0', btrfsErrors: 'csum_errors=3', parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8 }] })
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'data-findings-present')
+    assert.ok(res.json().error.message.includes('Repair those files from parity first'), res.json().error.message)
+  })
+
+  it('409 job-active while a scrub is in flight on the pool', async () => {
+    await completedScrub(CLEAN_WITH_MISMATCH)
+    const running = inFlight('ahr.scrub', 'ahr0')
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'job-active')
+    assert.ok(res.json().error.message.includes(running), res.json().error.message)
+  })
+
+  it('409 array-busy when the band is not idle', async () => {
+    await completedScrub(CLEAN_WITH_MISMATCH)
+    await writeFile(join(sys, 'sync_action'), 'recover\n')
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'array-busy')
+    assert.ok(res.json().error.message.includes('recover'), res.json().error.message)
+  })
+
+  it('409 confirm with the consequences spelled out, then 202 and a job', async () => {
+    await completedScrub(CLEAN_WITH_MISMATCH)
+    const first = await post({ band: 1 })
+    assert.equal(first.statusCode, 409)
+    const body = first.json()
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(body.error.message.includes('8 mismatch'), body.error.message)
+    const warnings: string[] = body.error.warnings
+    assert.ok(warnings.some(w => w.includes('AS IT IS NOW')), 'what parity is recomputed from')
+    assert.ok(warnings.some(w => w.includes('fresh btrfs scrub')), 'the scrub that runs first')
+    assert.ok(warnings.some(w => w.includes('NOCOW')), 'the files without checksums')
+    assert.ok(warnings.some(w => w.includes('60 MiB/s')), 'the estimate and its assumption')
+    assert.ok(warnings.some(w => w.includes('never automatic')), 'never automatic')
+    const code = first.headers['x-anas-confirm-code'] as string
+    assert.ok(code)
+
+    const second = await post({ band: 1 }, { 'x-anas-confirm': code })
+    assert.equal(second.statusCode, 202)
+    assert.equal(second.json().job.operation, 'ahr.parity-rewrite')
+
+    // A code minted for r1 is not a code for r2 — the signature carries the band.
+    const other = await post({ band: 2 }, { 'x-anas-confirm': code })
+    assert.notEqual(other.statusCode, 202)
+  })
+
+  // --- Seventh pass -------------------------------------------------------
+
+  it('F2: a completed REPAIR\'s parity residual is proof enough — no fresh scrub needed', async () => {
+    // No scrub on record at all, and the operator still gets the verb: the
+    // repair wrote a block, proved it cold against its stored checksum, and saw
+    // md still counting the stripe. That IS the measurement.
+    jobQueue.submit('ahr.repair', { user: 'u', uid: 0, params: { name: 'ahr0' } }, async () => ({
+      pool: 'ahr0',
+      files: [],
+      repaired: 1,
+      unrepairable: 0,
+      aboveMd: 0,
+      mappingAbort: 0,
+      notExamined: 0,
+      parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+      blocks: 1,
+    }))
+    await new Promise(resolve => setImmediate(resolve))
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.json().error.message.includes('8 mismatch'), res.json().error.message)
+  })
+
+  it('F2: …but not from a repair that left blocks unrepaired', async () => {
+    jobQueue.submit('ahr.repair', { user: 'u', uid: 0, params: { name: 'ahr0' } }, async () => ({
+      pool: 'ahr0',
+      files: [],
+      repaired: 1,
+      unrepairable: 1,
+      aboveMd: 0,
+      mappingAbort: 0,
+      notExamined: 0,
+      parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8 }],
+      blocks: 2,
+    }))
+    await new Promise(resolve => setImmediate(resolve))
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'data-findings-present')
+  })
+
+  it('F8: 409 bad-blocks-present when a member of the band has recorded bad blocks', async () => {
+    await completedScrub(CLEAN_WITH_MISMATCH)
+    await writeFile(join(sys, 'rd1/bad_blocks'), '6368 8\n')
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'bad-blocks-present')
+    assert.ok(res.json().error.message.includes('Replace the member first'), res.json().error.message)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no bypass — this is not a risk to accept')
+  })
+
+  it('the exclusion is mutual: a rewrite blocks a scrub and a repair, and they block it', async () => {
+    await completedScrub(CLEAN_WITH_MISMATCH)
+    const rewrite = inFlight('ahr.parity-rewrite', 'ahr0')
+
+    const scrub = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(scrub.statusCode, 409)
+    assert.ok(scrub.json().error.message.includes('a parity rewrite job is in flight'), scrub.json().error.message)
+    assert.ok(scrub.json().error.message.includes(rewrite))
+
+    const repair = await server.inject({
+      method: 'POST',
+      url: '/v1/ahr/ahr0/repair',
+      headers: JSON_HEADERS,
+      payload: { files: [{ path: '/mnt/anas-ahr/ahr0/f1.bin', blocks: [300] }] },
+    })
+    assert.equal(repair.statusCode, 409)
+    assert.ok(repair.json().error.message.includes('a parity rewrite is in flight'), repair.json().error.message)
+
+    const blocked = await post({ band: 1 })
+    assert.equal(blocked.statusCode, 409)
+    assert.equal(blocked.json().error.reason, 'job-active')
+  })
+})
+
+/**
+ * Seventh pass, F10 — the LUN disclosure on the parity-rewrite confirm gate.
+ *
+ * A rewrite writes no file byte, so a guest's live disk is not a refusal here —
+ * it is the fact an operator being asked to agree to hours of whole-band
+ * reading cannot discover anywhere else on the screen. (The repair route's
+ * matching REFUSAL is in `routes/__tests__/ahr-repair.test.ts`.)
+ */
+describe('rewriteLunWarnings — the parity-rewrite LUN disclosure (F10)', () => {
+  const HELD = {
+    targetIqn: 'iqn.2026-08.dev.anas.ahr0:target1',
+    index: 1,
+    name: 'ahr0_lun1',
+    backingPath: '/mnt/anas-ahr/ahr0/images/lun1.raw',
+    connectedInitiators: [] as string[],
+    detail: 'held by LUN 1',
+  }
+
+  it('says nothing when nothing is served from the pool', () => {
+    assert.deepEqual(rewriteLunWarnings(null), [])
+  })
+
+  it('names the LUN and its live sessions, and says the guest sees nothing this run writes', () => {
+    const [line] = rewriteLunWarnings({ ...HELD, connectedInitiators: ['iqn.1993-08.org.debian:01:abc'] })
+    assert.match(line, /A guest's disk is live on this pool/)
+    assert.match(line, /LUN 1 \('ahr0_lun1'\)/)
+    assert.match(line, /1 initiator logged in right now/)
+    assert.match(line, /Nothing this run writes is visible to them/)
+    assert.match(line, /reading flat out underneath that disk/)
+    // It is a disclosure, not a refusal: no verb telling the operator to stop.
+    assert.ok(!/refused/i.test(line), line)
+  })
+
+  it('an idle LUN still gets the line, with the honest "no initiator" clause', () => {
+    const [line] = rewriteLunWarnings(HELD)
+    assert.match(line, /No initiator is logged in right now/)
+    assert.match(line, /and it writes no file/)
+  })
+
+  it('the mirror reconcile discloses it too, and says why a guest sees no change', () => {
+    assert.deepEqual(reconcileLunWarnings(null), [])
+    const [line] = reconcileLunWarnings({ ...HELD, connectedInitiators: ['iqn.1993-08.org.debian:01:abc'] })
+    assert.match(line, /A guest's disk is live on this pool/)
+    assert.match(line, /already matches the checksum btrfs stored for it/)
+    assert.match(line, /reading both legs flat out/)
+    assert.ok(!/refused/i.test(line), line)
+  })
+})
+
+/**
+ * POST /v1/ahr/:name/mirror-reconcile (story selfheal.11) — the confirm-gated
+ * mirror band reconcile.
+ *
+ * Band r2 of the dev mock's `ahr0` IS a RAID1 band (`mdadm-export-r2.txt`,
+ * `md126` in mdstat), which is what makes this route testable against the same
+ * topology the parity rewrite's tests use — and what lets the two verbs'
+ * mutually exclusive gates be asserted against each other for real.
+ */
+describe('POST /v1/ahr/:name/mirror-reconcile', () => {
+  let server: TestServer
+  let jobQueue: JobQueue
+  let executor: MockExecutor
+  let dir: string
+  let sys: string
+
+  async function completedScrub(result: unknown, name = 'ahr0'): Promise<void> {
+    jobQueue.submit('ahr.scrub', { user: 'u', uid: 0, params: { name } }, async () => result)
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  function inFlight(operation: string, name: string): string {
+    return jobQueue.submit(operation, { user: 'u', uid: 0, params: { name } }, async () => new Promise(() => {})).id
+  }
+
+  /** The proof: disagreeing legs on the RAID1 band r2, a clean checksum pass. */
+  const MIRROR_MISMATCH = {
+    scrubbed: 'ahr0',
+    btrfsErrors: null,
+    checkedArrays: 2,
+    parityMismatches: [{ band: 'ahr0-r2', bandIndex: 2, array: '/dev/md/ahr0-r2', mismatchCnt: 128, level: 'raid1' }],
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-mirror-'))
+    await writeFile(join(dir, 'fstab'), '# empty\n')
+    // A real md sysfs tree for band r2 — a two-leg mirror, GT-16's shape:
+    // no rmw_level, no stripe_cache_size, chunk_size 0, layout meaningless.
+    sys = join(dir, 'sys/block/md126/md')
+    await mkdir(join(sys, 'rd0'), { recursive: true })
+    await mkdir(join(sys, 'rd1'), { recursive: true })
+    const knobs: Record<string, string> = {
+      'level': 'raid1',
+      'chunk_size': '0',
+      'layout': '0',
+      'raid_disks': '2',
+      'sync_action': 'idle',
+      'last_sync_action': 'check',
+      'sync_min': '0',
+      'sync_max': 'max',
+      'sync_completed': '1046400 / 1046400',
+      'mismatch_cnt': '128',
+      'degraded': '0',
+      'array_state': 'clean',
+      'reshape_position': 'none',
+      'rd0/offset': '2048',
+      'rd0/size': '523200',
+      'rd0/state': 'in_sync',
+      'rd1/offset': '2048',
+      'rd1/size': '523200',
+      'rd1/state': 'in_sync',
+    }
+    for (const [key, value] of Object.entries(knobs))
+      await writeFile(join(sys, key), `${value}\n`)
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = dir
+
+    executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md/ahr0-r2'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md/ahr0-r1'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', '/dev/md/ahr0-r2'], result: { stdout: '/dev/md126\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/readlink', args: ['-f', '/dev/md/ahr0-r1'], result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+
+    const app = Fastify({ logger: false })
+    jobQueue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+    })
+    server = app as unknown as TestServer
+  })
+  afterEach(async () => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function post(body: Record<string, unknown>, headers: Record<string, string> = {}) {
+    return await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/mirror-reconcile', headers: { ...JSON_HEADERS, ...headers }, payload: body })
+  }
+
+  it('400 on a body that names no band, and on a band the pool does not have', async () => {
+    await completedScrub(MIRROR_MISMATCH)
+    const empty = await post({})
+    assert.equal(empty.statusCode, 400)
+    assert.equal(empty.json().error.code, 'VALIDATION_ERROR')
+
+    const unknown = await post({ band: 9 })
+    assert.equal(unknown.statusCode, 400)
+    assert.ok(unknown.json().error.message.includes('no band r9'), unknown.json().error.message)
+  })
+
+  it('404 on an unknown pool', async () => {
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/nope/mirror-reconcile', headers: JSON_HEADERS, payload: { band: 2 } })
+    assert.equal(res.statusCode, 404)
+  })
+
+  it('409 no-mirror-mismatch when no completed scrub proves anything', async () => {
+    const res = await post({ band: 2 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'no-mirror-mismatch')
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no bypass for "unsafe now"')
+  })
+
+  it('409 not-a-mirror-band on a PARITY band — that mismatch has a verb of its own', async () => {
+    await completedScrub({
+      scrubbed: 'ahr0',
+      btrfsErrors: null,
+      parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+    })
+    const res = await post({ band: 1 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'not-a-mirror-band')
+    assert.ok(res.json().error.message.includes('Rewrite parity'), res.json().error.message)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'never becomes true — no bypass')
+  })
+
+  it('409 data-findings-present when the same scrub named corrupt files', async () => {
+    await completedScrub({ ...MIRROR_MISMATCH, btrfsErrors: 'csum_errors=3' })
+    const res = await post({ band: 2 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'data-findings-present')
+    assert.ok(res.json().error.message.includes('Repair those files first'), res.json().error.message)
+  })
+
+  it('409 array-busy when the band is not idle', async () => {
+    await completedScrub(MIRROR_MISMATCH)
+    await writeFile(join(sys, 'sync_action'), 'recover\n')
+    const res = await post({ band: 2 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'array-busy')
+    assert.ok(res.json().error.message.includes('recover'), res.json().error.message)
+  })
+
+  it('409 bad-blocks-present when a leg carries recorded md bad blocks', async () => {
+    await completedScrub(MIRROR_MISMATCH)
+    await writeFile(join(sys, 'rd1/bad_blocks'), '6368 8\n')
+    const res = await post({ band: 2 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'bad-blocks-present')
+    assert.ok(res.json().error.message.includes('Replace the member first'), res.json().error.message)
+  })
+
+  it('409 job-active while a scrub is in flight on the pool', async () => {
+    await completedScrub(MIRROR_MISMATCH)
+    const running = inFlight('ahr.scrub', 'ahr0')
+    const res = await post({ band: 2 })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.reason, 'job-active')
+    assert.ok(res.json().error.message.includes(running), res.json().error.message)
+  })
+
+  it('409 confirm with both arms spelled out, then 202 and a job', async () => {
+    await completedScrub(MIRROR_MISMATCH)
+    const first = await post({ band: 2 })
+    assert.equal(first.statusCode, 409)
+    const body = first.json()
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(body.error.message.includes('128 disagreeing unit(s)'), body.error.message)
+    const warnings: string[] = body.error.warnings
+    assert.ok(warnings.some(w => w.includes('Arm A runs an ordinary btrfs checksum scrub')), 'arm A')
+    assert.ok(warnings.some(w => w.includes('reads BOTH legs of band r2 in full')), 'arm B')
+    assert.ok(warnings.some(w => w.includes('NOCOW')), 'the rows it cannot arbitrate')
+    assert.ok(warnings.some(w => w.includes('no single-copy window')), 'the pool stays online')
+    assert.ok(warnings.some(w => w.includes('md\'s own repair is NOT used')), 'the invariant is stated')
+    assert.ok(warnings.some(w => w.includes('never automatic')), 'never automatic')
+    const code = first.headers['x-anas-confirm-code'] as string
+    assert.ok(code)
+
+    const second = await post({ band: 2 }, { 'x-anas-confirm': code })
+    assert.equal(second.statusCode, 202)
+    assert.equal(second.json().job.operation, 'ahr.mirror-reconcile')
+
+    // A code minted for r2 is not a code for r1 — the signature carries the band.
+    const other = await post({ band: 1 }, { 'x-anas-confirm': code })
+    assert.notEqual(other.statusCode, 202)
+  })
+
+  it('the exclusion is mutual: a reconcile blocks a scrub, a repair and a rewrite, and they block it', async () => {
+    await completedScrub(MIRROR_MISMATCH)
+    const reconcile = inFlight('ahr.mirror-reconcile', 'ahr0')
+
+    const scrub = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(scrub.statusCode, 409)
+    assert.ok(scrub.json().error.message.includes(reconcile), scrub.json().error.message)
+
+    const repair = await server.inject({
+      method: 'POST',
+      url: '/v1/ahr/ahr0/repair',
+      headers: JSON_HEADERS,
+      payload: { files: [{ path: '/mnt/anas-ahr/ahr0/f1.bin', blocks: [300] }] },
+    })
+    assert.equal(repair.statusCode, 409)
+    assert.ok(repair.json().error.message.includes('a mirror reconcile is in flight'), repair.json().error.message)
+
+    const rewrite = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/parity-rewrite', headers: JSON_HEADERS, payload: { band: 1 } })
+    assert.equal(rewrite.statusCode, 409)
+
+    const blocked = await post({ band: 2 })
+    assert.equal(blocked.statusCode, 409)
+    assert.equal(blocked.json().error.reason, 'job-active')
   })
 })

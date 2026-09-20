@@ -3,7 +3,12 @@ import type { FastifyInstance } from 'fastify'
 import type { ExecOptions, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { writeFileSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { IdentityName } from '@anas/shared'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
 import { JobQueue } from '../../jobs/queue.js'
@@ -457,6 +462,8 @@ describe('share-identity routes', () => {
         executor,
         jobQueue: new JobQueue(),
         confirmStore: new ConfirmStore(),
+        // Never read on the paths this section exercises; absent file = none.
+        smbConfPath: join(tmpdir(), `anas-test-absent-${process.pid}.conf`),
         smbpasswdAvailable: async () => false,
       })
       bare = app
@@ -539,6 +546,366 @@ describe('share-identity routes', () => {
       assert.match(message, /was created, but setting the SMB password failed/)
       assert.match(message, /apt install samba/)
       assert.doesNotMatch(message, /ENOENT/)
+    })
+  })
+
+  // --- identity.1a — the name schema accepts what useradd accepts ----------
+  describe('IdentityName (identity.1a)', () => {
+    it('accepts mixed case, an underscore start, and a trailing $', () => {
+      for (const name of ['alice', 'Alice', 'ALICE', '_x', 'A-b_c9', 'a', 'machine$', 'ab$']) {
+        assert.ok(IdentityName.safeParse(name).success, `expected '${name}' to be accepted`)
+      }
+    })
+
+    it('rejects a leading digit or dash, a mid-name $, separators, and overlong names', () => {
+      for (const name of ['9lives', '-x', 'a$b', 'ab cd', 'ab:cd', 'a/b', '', 'x'.repeat(33), 'näme']) {
+        assert.equal(IdentityName.safeParse(name).success, false, `expected '${name}' to be rejected`)
+      }
+    })
+
+    it('POST /identity/users accepts a mixed-case name (202, useradd gets it verbatim)', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = recordCalls(server)
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/identity/users',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'Carol' }),
+      })
+      assert.equal(res.statusCode, 202)
+      assert.equal((res.json() as JobAccepted).job.operation, 'identity.user.add')
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      // identity.1c rides the same argv: -N (no user-private group) first.
+      assert.deepEqual(find(calls, '/usr/sbin/useradd', () => true), ['-N', '-M', '-s', '/usr/sbin/nologin', 'Carol'])
+    })
+  })
+
+  // --- identity.1d — DELETE /v1/identity/users|groups/:name ------------------
+  //
+  // Wired to a mock executor with FULL fixture control: the createServer mock
+  // registers first-match-wins fixtures for the `getent` pairs this section
+  // needs (a mixed-case user, a directory user, a passdb entry under a
+  // different case), which it cannot shadow.
+  describe('DELETE (identity.1d)', () => {
+    let app: FastifyInstance | undefined
+    let executor: MockExecutor
+    let queue: JobQueue
+    let smbConfPath: string
+    let tmpDir: string
+
+    /** The account landscape every test starts from (see bootNode). */
+    const PASSWD = [
+      'root:x:0:0:root:/root:/bin/bash',
+      'Alice:x:1000:1000:Alice Example:/home/Alice:/usr/sbin/nologin',
+      'bob:x:1001:1001:Bob:/home/bob:/usr/sbin/nologin',
+      '',
+    ].join('\n')
+    // bob is NOT in the local files DB — directory-provided, read-only.
+    const LOCAL_PASSWD = [
+      'root:x:0:0:root:/root:/bin/bash',
+      'Alice:x:1000:1000:Alice Example:/home/Alice:/usr/sbin/nologin',
+      '',
+    ].join('\n')
+    const GROUPS = [
+      'root:x:0:',
+      'Alice:x:1000:Alice',
+      'team:x:1002:bob',
+      '',
+    ].join('\n')
+    const LOCAL_GROUPS = GROUPS
+
+    /**
+     * A node with: user `Alice` (uid/gid 1000, LOCAL — her name is also a
+     * group, gid 1000: a user-private group), user `bob` (directory-provided),
+     * group `team` (gid 1002, no primary owner), an smb.conf whose [media]
+     * share names `alice` (lowercase — the case-fold case) and `@team`, and a
+     * passdb entry stored as `ALICE`.
+     */
+    async function bootNode(overrides?: { pdbedit?: string, smbConf?: string }) {
+      tmpDir = await mkdtemp(join(tmpdir(), 'anas-identity-del-'))
+      smbConfPath = join(tmpDir, 'smb.conf')
+      writeFileSync(smbConfPath, overrides?.smbConf ?? [
+        '[global]',
+        'workgroup = WORKGROUP',
+        '',
+        '[media]',
+        'path = /tank/media',
+        'valid users = alice @team',
+        '',
+      ].join('\n'))
+
+      executor = new MockExecutor()
+      queue = new JobQueue()
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: { stdout: PASSWD, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: { stdout: GROUPS, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: { stdout: LOCAL_PASSWD, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: { stdout: LOCAL_GROUPS, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'Alice'], result: { stdout: 'Alice:x:1000:1000:Alice Example:/home/Alice:/usr/sbin/nologin\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'bob'], result: { stdout: 'bob:x:1001:1001:Bob:/home/bob:/usr/sbin/nologin\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'Alice'], result: { stdout: 'Alice:x:1000:1000:Alice Example:/home/Alice:/usr/sbin/nologin\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'bob'], result: { stdout: '', stderr: '', exitCode: 2 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group', 'Alice'], result: { stdout: 'Alice:x:1000:Alice\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group', 'team'], result: { stdout: 'team:x:1002:bob\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group', 'Alice'], result: { stdout: 'Alice:x:1000:Alice\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group', 'team'], result: { stdout: 'team:x:1002:bob\n', stderr: '', exitCode: 0 } })
+      // The passdb holds a DIFFERENT case than the account database.
+      executor.addFixture({ command: '/usr/bin/pdbedit', args: ['-L'], result: { stdout: overrides?.pdbedit ?? 'ALICE:1000:Alice Example\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/userdel', result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/groupdel', result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/smbpasswd', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+      app = Fastify({ logger: false })
+      await app.register(shareIdentityRoutes, {
+        prefix: '/v1',
+        executor,
+        jobQueue: queue,
+        confirmStore: new ConfirmStore(),
+        smbConfPath,
+        smbpasswdAvailable: async () => true,
+      })
+    }
+
+    function del(url: string, confirm?: string) {
+      const headers: Record<string, string> = { ...IDENTITY_HEADERS }
+      if (confirm !== undefined)
+        headers['x-anas-confirm'] = confirm
+      return app!.inject({ method: 'DELETE', url, headers })
+    }
+
+    async function waitForQueueJob(id: string): Promise<Job> {
+      for (let i = 0; i < 50; i++) {
+        const job = queue.get(id)
+        if (job && (job.status === 'completed' || job.status === 'failed'))
+          return job
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      throw new Error(`Job ${id} did not finish`)
+    }
+
+    /** A node whose smb.conf names NOBODY — the confirm gate can be reached. */
+    const CLEAN_SMB_CONF = [
+      '[global]',
+      'workgroup = WORKGROUP',
+      '',
+      '[media]',
+      'path = /tank/media',
+      'valid users = bob',
+      '',
+    ].join('\n')
+
+    afterEach(async () => {
+      await app?.close()
+      app = undefined
+      await rm(tmpDir, { recursive: true, force: true })
+    })
+
+    it('refuses a user a share names in `valid users` (case-folded), naming the share', async () => {
+      await bootNode()
+      const res = await del('/v1/identity/users/Alice')
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { code: string, reason: string, message: string } }
+      assert.equal(error.code, 'CONFLICT')
+      assert.equal(error.reason, 'referenced-by-share')
+      assert.match(error.message, /media/)
+      // A hard refusal: no confirm code is minted and no job is submitted.
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      assert.equal(queue.list().length, 0)
+    })
+
+    it('deletes a local user through the confirm gate (202, exact argv)', async () => {
+      await bootNode({ smbConf: CLEAN_SMB_CONF })
+      // Unconfirmed: the gate answers 409 + a code + the three consequences.
+      const first = await del('/v1/identity/users/Alice')
+      assert.equal(first.statusCode, 409)
+      const challenged = first.json() as { error: { code: string, warnings: string[] } }
+      assert.equal(challenged.error.code, 'CONFIRMATION_REQUIRED')
+      assert.equal(challenged.error.warnings.length, 3)
+      assert.match(challenged.error.warnings[0], /removed from the system/)
+      assert.match(challenged.error.warnings[1], /uid \(1000\)/)
+      assert.match(challenged.error.warnings[1], /not changed/)
+      assert.match(challenged.error.warnings[2], /SMB password entry will be removed/)
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code)
+
+      // Confirmed: 202 + job; the code is single-use.
+      const ok = await del('/v1/identity/users/Alice', code)
+      assert.equal(ok.statusCode, 202)
+      const accepted = ok.json() as JobAccepted
+      assert.equal(accepted.job.operation, 'identity.user.delete')
+      const job = await waitForQueueJob(accepted.job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: true })
+
+      // Exact argv, in order: userdel first, smbpasswd -x only because the
+      // passdb has the entry (stored as ALICE — matched case-folded).
+      assert.deepEqual(find(executor.calls, '/usr/sbin/userdel', () => true), ['Alice'])
+      assert.deepEqual(find(executor.calls, '/usr/bin/smbpasswd', () => true), ['-x', 'Alice'])
+      assert.equal(find(executor.calls, '/usr/sbin/userdel', a => a.includes('-r')), undefined)
+
+      // The consumed code cannot open the gate a second time.
+      const reuse = await del('/v1/identity/users/Alice', code)
+      assert.equal(reuse.statusCode, 409)
+      assert.equal((reuse.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
+    })
+
+    it('skips smbpasswd -x when the passdb has no entry for the user', async () => {
+      await bootNode({ smbConf: CLEAN_SMB_CONF, pdbedit: '' })
+      const first = await del('/v1/identity/users/Alice')
+      assert.equal(first.statusCode, 409)
+      const challenged = first.json() as { error: { warnings: string[] } }
+      // Two warnings only — the SMB line is absent, not a blank.
+      assert.equal(challenged.error.warnings.length, 2)
+      const code = first.headers['x-anas-confirm-code'] as string
+
+      const ok = await del('/v1/identity/users/Alice', code)
+      assert.equal(ok.statusCode, 202)
+      const job = await waitForQueueJob((ok.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: false })
+      assert.equal(executor.calls.some(c => c.command === '/usr/bin/smbpasswd'), false)
+    })
+
+    it('returns 404 for an unknown user, 409 for a directory user, 400 for an invalid name', async () => {
+      await bootNode()
+      const missing = await del('/v1/identity/users/ghost')
+      assert.equal(missing.statusCode, 404)
+      const directory = await del('/v1/identity/users/bob')
+      assert.equal(directory.statusCode, 409)
+      assert.match((directory.json() as { error: { message: string } }).error.message, /directory-provided/)
+      const invalid = await del('/v1/identity/users/-rf')
+      assert.equal(invalid.statusCode, 400)
+      assert.equal((invalid.json() as { error: { code: string } }).error.code, 'VALIDATION_ERROR')
+    })
+
+    it('refuses a group that is any user’s primary group (primary-group-in-use)', async () => {
+      await bootNode()
+      // Group Alice (gid 1000) is user Alice’s primary group.
+      const res = await del('/v1/identity/groups/Alice')
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { code: string, reason: string, message: string } }
+      assert.equal(error.code, 'CONFLICT')
+      assert.equal(error.reason, 'primary-group-in-use')
+      assert.match(error.message, /Alice/)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      assert.equal(queue.list().length, 0)
+    })
+
+    it('refuses a group a share names with @ (referenced-by-share), naming the share', async () => {
+      await bootNode()
+      const res = await del('/v1/identity/groups/team')
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { reason: string, message: string } }
+      assert.equal(error.reason, 'referenced-by-share')
+      assert.match(error.message, /media/)
+      assert.equal(queue.list().length, 0)
+    })
+
+    it('deletes an unreferenced group through the confirm gate (202, exact argv)', async () => {
+      await bootNode({ smbConf: CLEAN_SMB_CONF })
+      const first = await del('/v1/identity/groups/team')
+      assert.equal(first.statusCode, 409)
+      const challenged = first.json() as { error: { code: string, warnings: string[] } }
+      assert.equal(challenged.error.code, 'CONFIRMATION_REQUIRED')
+      assert.equal(challenged.error.warnings.length, 2)
+      assert.match(challenged.error.warnings[0], /removed from the system/)
+      assert.match(challenged.error.warnings[1], /gid \(1002\)/)
+      const code = first.headers['x-anas-confirm-code'] as string
+
+      const ok = await del('/v1/identity/groups/team', code)
+      assert.equal(ok.statusCode, 202)
+      const accepted = ok.json() as JobAccepted
+      assert.equal(accepted.job.operation, 'identity.group.delete')
+      const job = await waitForQueueJob(accepted.job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { deleted: 'team' })
+      assert.deepEqual(find(executor.calls, '/usr/sbin/groupdel', () => true), ['team'])
+    })
+
+    it('group delete: 404 unknown, 400 invalid name', async () => {
+      await bootNode()
+      const missing = await del('/v1/identity/groups/ghostgroup')
+      assert.equal(missing.statusCode, 404)
+      const invalid = await del('/v1/identity/groups/-rf')
+      assert.equal(invalid.statusCode, 400)
+    })
+  })
+
+  // --- identity.1b + 1c — case-folded SMB presence, private groups ----------
+  describe('case-folded SMB presence and private groups (identity.1b/1c)', () => {
+    let app: FastifyInstance | undefined
+    let tmpDir: string
+    let smbConfPath: string
+
+    const PASSWD = [
+      'root:x:0:0:root:/root:/bin/bash',
+      'Alice:x:1000:1000:Alice Example:/home/Alice:/usr/sbin/nologin',
+      '',
+    ].join('\n')
+    const GROUPS = [
+      'root:x:0:',
+      'Alice:x:1000:Alice',
+      'plain:x:1002:',
+      '',
+    ].join('\n')
+
+    async function boot() {
+      tmpDir = await mkdtemp(join(tmpdir(), 'anas-identity-case-'))
+      smbConfPath = join(tmpDir, 'smb.conf')
+      writeFileSync(smbConfPath, '[global]\nworkgroup = WORKGROUP\n')
+      const executor = new MockExecutor()
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: { stdout: PASSWD, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: { stdout: GROUPS, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: { stdout: PASSWD, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: { stdout: GROUPS, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'Alice'], result: { stdout: 'Alice:x:1000:1000:Alice Example:/home/Alice:/usr/sbin/nologin\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'Alice'], result: { stdout: 'Alice:x:1000:1000:Alice Example:/home/Alice:/usr/sbin/nologin\n', stderr: '', exitCode: 0 } })
+      // The passdb stores the LOWERCASE form of the mixed-case account.
+      executor.addFixture({ command: '/usr/bin/pdbedit', args: ['-L'], result: { stdout: 'alice:1000:Alice Example\n', stderr: '', exitCode: 0 } })
+
+      app = Fastify({ logger: false })
+      await app.register(shareIdentityRoutes, {
+        prefix: '/v1',
+        executor,
+        jobQueue: new JobQueue(),
+        confirmStore: new ConfirmStore(),
+        smbConfPath,
+        smbpasswdAvailable: async () => true,
+      })
+      return app
+    }
+
+    afterEach(async () => {
+      await app?.close()
+      app = undefined
+      await rm(tmpDir, { recursive: true, force: true })
+    })
+
+    it('marks a user smbEnabled when the passdb holds a different case', async () => {
+      const a = await boot()
+      const res = await a.inject({ method: 'GET', url: '/v1/identity/users' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: ShareUser[] }
+      const alice = data.find(u => u.name === 'Alice')!
+      assert.equal(alice.smbEnabled, true)
+    })
+
+    it('single-user detail folds case too', async () => {
+      const a = await boot()
+      const res = await a.inject({ method: 'GET', url: '/v1/identity/users/Alice' })
+      assert.equal(res.statusCode, 200)
+      assert.equal((res.json() as { data: ShareUser }).data.smbEnabled, true)
+    })
+
+    it('marks an existing user-private group with privateGroupOf; a plain group has no key', async () => {
+      const a = await boot()
+      const res = await a.inject({ method: 'GET', url: '/v1/identity/groups' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: ShareGroup[] }
+      const priv = data.find(g => g.name === 'Alice')!
+      assert.equal(priv.privateGroupOf, 'Alice')
+      const plain = data.find(g => g.name === 'plain')!
+      assert.equal('privateGroupOf' in plain, false)
     })
   })
 })

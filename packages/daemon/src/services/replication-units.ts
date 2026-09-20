@@ -1,11 +1,15 @@
 import type { DashboardWarning, ReplicationTask, ReplicationTaskStatus, Snapshot } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
-import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
 import { parseSnapshotList, zfsSnapshotDetailArgs } from '../parsers/zfs-list.js'
 import { isTransientBackupSnapshot } from './snapshot-naming.js'
 import { deriveRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
+// The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
+// is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
+// hand-copy and its last private leftovers (third pass).
+import { listServiceUnits, markerRegex, readUnitFile, runSystemctl, unlinkQuiet } from './systemd-unit-store.js'
 
 /**
  * Recurring replication TASKS (Epic 5.5.3) — the systemd units ARE the store.
@@ -34,8 +38,6 @@ const RUNNER_SCRIPT = '/opt/anas/packages/daemon/dist/replicate-task.js'
 const UNIT_PREFIX = 'anas-repl-'
 /** The service-file line that carries the canonical task JSON (as a comment). */
 const TASK_MARKER = 'X-ANAS-Task='
-/** Matches the X-ANAS-Task line (with or without a leading `# `), capturing the JSON. */
-const TASK_MARKER_RE = /^#?\s*X-ANAS-Task=(.*)$/
 const WHITESPACE_RE = /\s/
 const DQUOTE_RE = /"/g
 
@@ -160,8 +162,9 @@ export function renderTimerUnit(task: ReplicationTask): string {
  * skips those, logging to journald).
  */
 export function parseServiceUnit(content: string): ReplicationTask | null {
+  const markerRe = markerRegex(TASK_MARKER)
   for (const line of content.split('\n')) {
-    const m = line.match(TASK_MARKER_RE)
+    const m = line.match(markerRe)
     if (!m)
       continue
     let json: unknown
@@ -196,27 +199,17 @@ export function parseServiceUnit(content: string): ReplicationTask | null {
  *  dir yields an empty list.
  */
 export async function readAllTasks(dir: string): Promise<ReplicationTask[]> {
-  let files: string[]
-  try {
-    files = await readdir(dir)
-  }
-  catch {
-    return []
-  }
-  const services = files.filter(f => f.startsWith(UNIT_PREFIX) && f.endsWith('.service'))
+  const services = await listServiceUnits(dir, UNIT_PREFIX)
   const tasks: ReplicationTask[] = []
   for (const file of services) {
-    try {
-      const content = await readFile(join(dir, file), 'utf-8')
-      const task = parseServiceUnit(content)
-      if (task)
-        tasks.push(task)
-      else
-        process.stderr.write(`[replication] skipping ${file}: no parseable X-ANAS-Task JSON\n`)
-    }
-    catch (err) {
-      process.stderr.write(`[replication] skipping ${file}: ${err instanceof Error ? err.message : String(err)}\n`)
-    }
+    // Fail-open per file: an unreadable file skips with the same warning as an
+    // unparseable one — never a broken read for the whole store.
+    const content = await readUnitFile(dir, file)
+    const task = content === null ? null : parseServiceUnit(content)
+    if (task)
+      tasks.push(task)
+    else
+      process.stderr.write(`[replication] skipping ${file}: no parseable X-ANAS-Task JSON\n`)
   }
   return tasks
 }
@@ -303,21 +296,6 @@ export async function removeTaskUnits(
     unlinkQuiet(join(dir, timerUnitName(name))),
   ])
   await runSystemctl(executor, ['daemon-reload'])
-}
-
-async function unlinkQuiet(path: string): Promise<void> {
-  try {
-    await unlink(path)
-  }
-  catch {
-    // Missing file is fine — the goal state (absent) already holds.
-  }
-}
-
-async function runSystemctl(executor: CommandExecutor, args: string[]): Promise<void> {
-  const r = await executor.exec(SYSTEMCTL, args)
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `systemctl ${args.join(' ')} exited with code ${r.exitCode}`)
 }
 
 // --- Status derivation ------------------------------------------------------

@@ -1,0 +1,42 @@
+btrfs-progs v6.14
+file tree key (256 ROOT_ITEM 0) 
+leaf 30556160 items 7 free space 15629 generation 10 owner 256
+leaf 30556160 flags 0x1(WRITTEN) backref revision 1
+fs uuid 7b588c31-0c7a-4286-a4bd-5e1b5d15ce5f
+chunk uuid 8a8c596d-e994-4e73-8627-0f76686cb15b
+	item 0 key (256 INODE_ITEM 0) itemoff 16123 itemsize 160
+		generation 9 transid 10 size 16 nbytes 0
+		block group 0 mode 40755 links 1 uid 0 gid 0 rdev 0
+		sequence 89 flags 0x0(none)
+		atime 1789323156.552431758 (2026-09-13 18:12:36)
+		ctime 1789323156.695436729 (2026-09-13 18:12:36)
+		mtime 1789323156.695436729 (2026-09-13 18:12:36)
+		otime 1789323156.552431758 (2026-09-13 18:12:36)
+	item 1 key (256 INODE_REF 256) itemoff 16111 itemsize 12
+		index 0 namelen 2 name: ..
+	item 2 key (256 DIR_ITEM 1831366612) itemoff 16073 itemsize 38
+		location key (257 INODE_ITEM 0) type FILE
+		transid 10 data_len 0 name_len 8
+		name: blob.bin
+	item 3 key (256 DIR_INDEX 2) itemoff 16035 itemsize 38
+		location key (257 INODE_ITEM 0) type FILE
+		transid 10 data_len 0 name_len 8
+		name: blob.bin
+	item 4 key (257 INODE_ITEM 0) itemoff 15875 itemsize 160
+		generation 10 transid 10 size 131072 nbytes 131072
+		block group 0 mode 100644 links 1 uid 0 gid 0 rdev 0
+		sequence 83 flags 0x0(none)
+		atime 1789323156.695436729 (2026-09-13 18:12:36)
+		ctime 1789323156.696300688 (2026-09-13 18:12:36)
+		mtime 1789323156.696300688 (2026-09-13 18:12:36)
+		otime 1789323156.695436729 (2026-09-13 18:12:36)
+	item 5 key (257 INODE_REF 256) itemoff 15857 itemsize 18
+		index 2 namelen 8 name: blob.bin
+	item 6 key (257 EXTENT_DATA 0) itemoff 15804 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13631488 nr 45056
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+total bytes 1073741824
+bytes used 208896
+uuid 7b588c31-0c7a-4286-a4bd-5e1b5d15ce5f

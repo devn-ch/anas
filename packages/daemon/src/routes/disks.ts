@@ -5,7 +5,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { parseByIdToKernel, parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { LSBLK_ARGS, parseLsblk } from '../parsers/lsblk.js'
-import { parseSmartctl } from '../parsers/smartctl.js'
+import { isSmartctlStandby, parseSmartctl, standbySmartData } from '../parsers/smartctl.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { iscsiServedSerials, normalizeSerial } from '../services/iscsi-held.js'
@@ -225,13 +225,38 @@ export async function collectDisks(
 
   const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
 
-  // Lazy-load identity cache for all disks in parallel
-  await diskIdentityCache.loadMany(disks.map(d => ({ id: d.id, path: d.path })))
+  // Lazy-load identity cache for all disks in parallel. The list doubles as
+  // the topology refresh, which may prune entries — but only when it can
+  // name the fleet: if the by-id listing came back empty or failed, every
+  // disk id fell back to serial/kernel name, and pruning on such a list
+  // would drop EVERY entry (the sleeping disks' preserved identities
+  // included). The gate is the LISTING, not the fleet (fourth pass): one disk
+  // without a by-id symlink (virtio without a serial, some USB bridges) must
+  // not veto pruning for the whole cache for ever. Only the ids that resolved
+  // through by-id count as present — a disk that fell back is named by a
+  // fallback id, which is exactly the kind of entry that goes stale, so it is
+  // pruned like any other absence once the trustworthy listing stops naming it.
+  const enumerationPrunable = byIdMap.size > 0
+  await diskIdentityCache.loadMany(
+    disks.map(d => ({ id: d.id, path: d.path })),
+    {
+      prunable: enumerationPrunable,
+      presentIds: enumerationPrunable
+        ? disks.filter(d => byIdMap.has(d.name)).map(d => d.id)
+        : undefined,
+    },
+  )
 
   // Enrich each disk with cached identity, ZFS context, and derived health.
   return disks.map((d) => {
     const identity = diskIdentityCache.getCached(d.id)
     const smartHealthy = identity ? identity.smartHealthy : null
+    // The reading is STALE when it is the disk's last known state, not a fresh
+    // probe (it was asleep, or its probe failed): surfaced so the UI can mark
+    // the health cell instead of presenting the value as current. Absent on a
+    // fresh reading (undefined keys drop out of the JSON).
+    const smartStale = identity?.stale === true ? true : undefined
+    const smartStaleReason = smartStale ? identity?.staleReason : undefined
     // Pool context joins on the kernel name (d.name), NOT the display by-id
     // (d.id) — the by-id ZFS reports and the by-id we display can differ.
     const info = poolInfo.get(d.name)
@@ -257,6 +282,8 @@ export async function collectDisks(
       formFactor: identity ? identity.formFactor : null,
       revision: identity?.firmwareVersion ?? d.revision,
       smartHealthy,
+      smartStale,
+      smartStaleReason,
       ...zfsContext,
       ...ahrContext,
       ...handsOffContext(d, servedSerials),
@@ -332,11 +359,17 @@ export async function diskRoutes(
       return { error: { code: 'NOT_FOUND', message: `Disk '${id}' not found` } }
     }
 
+    // -n standby: a spun-down disk is reported as such, never woken to read SMART.
     const smartResult = await executor.exec('/usr/sbin/smartctl', [
+      '-n',
+      'standby',
       '-a',
       '--json',
       disk.path,
     ])
+
+    if (isSmartctlStandby(smartResult))
+      return { data: standbySmartData() }
 
     const smartData = parseSmartctl(smartResult.stdout)
     return { data: smartData }

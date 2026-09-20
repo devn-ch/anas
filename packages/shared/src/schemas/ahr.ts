@@ -564,3 +564,259 @@ export const AhrCreateSnapshotRequest = z.object({
   name: AhrSnapshotName.optional(),
 })
 export type AhrCreateSnapshotRequest = z.infer<typeof AhrCreateSnapshotRequest>
+
+// ---- Scrub result (story selfheal.3, §4) ------------------------------------
+
+/**
+ * One 64 KiB btrfs stripe the kernel named in a scrub warning (GT-3).
+ *
+ * `logical` is the filesystem-logical bytenr the kernel printed; `offset` is
+ * the byte offset WITHIN the file, which kernel 7.0 reports 64 KiB-aligned —
+ * it names the stripe, not the failing 4 KiB block. `length` is the length the
+ * kernel printed for the error (4096 on the drill), kept verbatim rather than
+ * rounded up to the stripe it actually covers.
+ */
+export const AhrScrubStripe = z.object({
+  logical: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  length: z.number().int().nonnegative(),
+})
+export type AhrScrubStripe = z.infer<typeof AhrScrubStripe>
+
+/**
+ * One corrupt file an AHR scrub attributed — the answer to "WHAT is corrupt",
+ * which `Error summary: csum=2` never gives (story selfheal.3).
+ *
+ * `path` is the full path on the node: `<mountpoint>/<subvolume>/<kernel path>`.
+ * The kernel prints a subvolume-relative path plus a numeric `root`, so the
+ * subvolume id is resolved (`btrfs inspect-internal subvolid-resolve`) and the
+ * resolved name kept in `subvolume` — null when it could not be resolved (the
+ * subvolume was deleted since the scrub), in which case `path` is the raw
+ * subvolume-relative one the kernel printed and `missing` is true.
+ *
+ * `badBlocks` are 4 KiB FILE block indexes (offset/4096), found by reading each
+ * of the 16 blocks inside a named stripe with O_DIRECT — the kernel names the
+ * stripe but not the block (GT-3), so the block is evidence ANAS gathered, not
+ * something the kernel said. An empty array means no block inside the named
+ * stripe read back with an error: the file was repaired, rewritten or removed
+ * between the scrub and the probe — never assumed to be a lie about the stripe.
+ * That reading holds for an UNCOMPRESSED finding. A compressed one says so with
+ * `compressed`/`extentBlocks` (selfheal.8 — the kernel's `offset` is
+ * extent-relative there, so the stripe the kernel names is not the range that
+ * was probed), and one whose corrupt block could not be named at all says so
+ * with `unidentified` instead of leaving an empty list that reads as "nothing
+ * found".
+ */
+export const AhrScrubFinding = z.object({
+  path: z.string(),
+  /** The resolved subvolume (`@data`), or null when the id no longer resolves. */
+  subvolume: z.string().nullable(),
+  inode: z.number().int().nonnegative(),
+  /** Every stripe the kernel named for this file, in the order it named them. */
+  stripes: z.array(AhrScrubStripe),
+  /** 4 KiB file block indexes that read back with an error. */
+  badBlocks: z.array(z.number().int().nonnegative()),
+  /**
+   * The corrupt extent is COMPRESSED (selfheal.8). The kernel's scrub warning
+   * then reports `offset` relative to the extent, not to the file, so the
+   * stripe it names cannot be probed directly: the extent's real file range is
+   * resolved from its EXTENT_DATA item and THAT range is probed — one bad
+   * on-disk sector of a compressed blob makes every block of the logical extent
+   * read back EIO (GT-9b), so the failing blocks are the whole extent.
+   */
+  compressed: z.boolean().optional(),
+  /**
+   * The corrupt extent's file block range: `first` is its first 4 KiB file
+   * block, `count` its length in 4 KiB blocks. Repair is handed `first` — the
+   * engine repairs a compressed blob when given any block of the extent.
+   */
+  extentBlocks: z.object({
+    first: z.number().int().nonnegative(),
+    count: z.number().int().positive(),
+  }).optional(),
+  /**
+   * The corruption is real (the kernel named this file) but no bad block could
+   * be named: the extent covering the error could not be resolved, or nothing
+   * in the resolved range read back with an error. An empty `badBlocks` alone
+   * would read as "repaired, rewritten or removed" — which is a reading that
+   * only holds when the probe knew where to look.
+   */
+  unidentified: z.boolean().optional(),
+  /**
+   * Why the block could not be named — the operator's reason, verbatim.
+   *
+   * Present WITH a non-empty `badBlocks` too: the blocks named are real, and
+   * the reason says why the rest of the file's stripes named none.
+   */
+  reason: z.string().optional(),
+  /**
+   * At least one stripe of this file was probed WITHOUT the mapping — at the
+   * offset the kernel printed, because the btrfs-tree chain could not be
+   * followed (selfheal.5's helper unavailable, or a per-stripe resolve error).
+   *
+   * The blocks in `badBlocks` are still real (an EIO at a file offset is an
+   * EIO), but the SEARCH WINDOW is unverified: for a compressed extent the
+   * kernel's offset names the wrong 64 KiB, so bad blocks outside it would not
+   * have been found. Additive and optional — a daemon that knew nothing of it
+   * simply omits it. The UI shows the blocks AND says the window could not be
+   * verified (with `reason`), so a repair of those blocks is not read as a
+   * repair of the whole file.
+   */
+  probedUnverified: z.boolean().optional(),
+  /**
+   * The path does not exist any more (deleted between the scrub and the probe,
+   * or an unresolvable subvolume). The finding is still reported — the kernel
+   * saw the error — but no blocks were probed.
+   */
+  missing: z.boolean().optional(),
+  /**
+   * The file is OUTSIDE the pool's mounted tree. A scrub covers the whole
+   * filesystem, and an AHR pool in the §12 layout mounts `@data` while
+   * `@snapshots` sits beside it — so a corrupt block in a snapshot is a real,
+   * expected finding with no path under the mountpoint. `path` is then
+   * filesystem-relative (`@snapshots/<name>/…`) and nothing was probed: it is
+   * reachable only through a top-level mount the scrub job does not take.
+   * Distinct from `missing`, which means the file is gone.
+   */
+  outsideMount: z.boolean().optional(),
+})
+export type AhrScrubFinding = z.infer<typeof AhrScrubFinding>
+
+/**
+ * One band's phase-1 parity verdict, carried into the result (design review
+ * 2026-09-14, D1): `mismatch_cnt > 0` on a band whose phase 2 finds nothing is
+ * the PARITY-ONLY ROT case, and the per-band verdict phase 1 already computes
+ * must survive into the result — otherwise the "phase 2 will name the files"
+ * promise dies silently when phase 2 has nothing to name.
+ *
+ * `band` is the band label the scrub uses everywhere else
+ * (`<pool>-r<band>`); `array` is the md device the check ran on; `mismatchCnt`
+ * is the counter as md finalized it.
+ *
+ * `bandIndex` is the SAME band as a number — what `POST /ahr/:name/
+ * parity-rewrite` names in its body (selfheal.10) and what the rewrite's
+ * evidence gate matches on. It is carried rather than parsed back out of the
+ * label: the scrub has the index in hand when it writes the row, and a
+ * consumer digging it out of `<pool>-r<n>` with a regex would be a second,
+ * breakable definition of the same fact.
+ */
+export const AhrScrubParityMismatch = z.object({
+  band: z.string().min(1),
+  bandIndex: z.number().int().positive(),
+  array: z.string().min(1),
+  mismatchCnt: z.number().int().nonnegative(),
+  /**
+   * The band's md level (sixth pass). ADDITIVE and optional — a result from an
+   * older daemon omits it, and a consumer that cannot tell which level a band
+   * is must not offer Rewrite parity for it.
+   *
+   * It is here because `mismatch_cnt` means two different things. On RAID5/6 a
+   * mismatching stripe is parity that disagrees with the data, and the
+   * data-intact case has a verb (selfheal.10). On RAID1 md counts legs that
+   * disagree with each other and `repair` copies the FIRST in-sync leg over the
+   * rest — a coin flip that overwrites the good copy half the time. A mirror
+   * mismatch is arbitrated per block by Repair from parity, never by md repair.
+   */
+  level: ArrayLevel.optional(),
+})
+export type AhrScrubParityMismatch = z.infer<typeof AhrScrubParityMismatch>
+
+/**
+ * A band this scrub did NOT check (design review 2026-09-14, D8). `band` is
+ * the same label form as {@link AhrScrubParityMismatch.band}; `reason` is the
+ * operator-facing why, verbatim from the phase-1 walk.
+ */
+export const AhrScrubSkippedBand = z.object({
+  band: z.string().min(1),
+  reason: z.string().min(1),
+})
+export type AhrScrubSkippedBand = z.infer<typeof AhrScrubSkippedBand>
+
+/**
+ * Metadata (DUP) copies btrfs corrected from their mirror during one window
+ * (story selfheal.12, GT-20).
+ *
+ * The kernel logs one `read error corrected` line per metadata read it could
+ * not checksum and served from the mirror copy instead — and a RW mount or a
+ * read repairs the rotten copy as a side effect, so `btrfs scrub` reports
+ * nothing. The line is the only durable evidence that a member is returning
+ * bad metadata, so the scrub and the repair both count it in the journal
+ * window they already read. `devices` are the member paths the corrected reads
+ * were served from — the disks whose SMART data to check.
+ */
+export const AhrMetadataCorrected = z.object({
+  /** Corrected metadata reads seen in the window, one per kernel line. */
+  count: z.number().int().nonnegative(),
+  /** The member devices the corrected reads were served from, first-seen order. */
+  devices: z.array(z.string().min(1)),
+})
+export type AhrMetadataCorrected = z.infer<typeof AhrMetadataCorrected>
+
+/**
+ * The result of an AHR scrub job (POST /v1/ahr/:name/scrub).
+ *
+ * Everything past `checkedArrays` is story selfheal.3 and OPTIONAL: a result
+ * from an older daemon (or a clean scrub, which attributes nothing) parses
+ * unchanged, and the UI renders the verdict it always rendered.
+ *
+ * The honesty pair is `errorsReported` vs `errorsAttributed`. The kernel's
+ * scrub warnings are rate-limited, so under many errors the journal carries
+ * FEWER lines than the scrub's own `Error summary` counted. ANAS reports both
+ * numbers rather than presenting the attributed list as the whole story.
+ */
+export const AhrScrubResult = z.object({
+  scrubbed: PoolName,
+  /** btrfs `Error summary:` line when errors were found, else null (raw, verbatim). */
+  btrfsErrors: z.string().nullable(),
+  /**
+   * How many bands the scrub ACTUALLY checked (design review 2026-09-14, D8)
+   * — never the pool's array count, which a band md never started, took
+   * another sync op on, or froze under makes a lie. What was skipped is said
+   * in `bandsSkipped`; `checkedArrays + bandsSkipped.length` is the pool's
+   * array count.
+   */
+  checkedArrays: z.number().int().nonnegative(),
+  /**
+   * The bands whose phase-1 check ran and delivered a verdict (D8). Present
+   * on every result from a daemon that records it; absent from an older one.
+   */
+  bandsChecked: z.array(z.string()).optional(),
+  /**
+   * The bands NOT checked, each with its why (D8) — md never started the
+   * check, took a resync/recover/reshape instead, froze, hit the wait
+   * ceiling, or its device would not resolve. A non-empty list rides the
+   * scrub notification and the Scrubs row: a check that silently skipped a
+   * band reads as coverage it does not have.
+   */
+  bandsSkipped: z.array(AhrScrubSkippedBand).optional(),
+  /**
+   * The phase-1 parity verdicts that counted mismatches (D1). When phase 2
+   * attributes NO corrupt file against these, the rot is PARITY-ONLY: data
+   * passed every checksum, the parity (or Q) member is what disagrees, and
+   * nothing in ANAS repairs it — the second notification and the Scrubs
+   * indicator say so. Absent from an older daemon.
+   */
+  parityMismatches: z.array(AhrScrubParityMismatch).optional(),
+  /** The corrupt files, grouped per file, capped at the first 200 (see `truncated`). */
+  findings: z.array(AhrScrubFinding).optional(),
+  /** Total errors the btrfs scrub summary counted (the sum of its `key=N` counters). */
+  errorsReported: z.number().int().nonnegative().optional(),
+  /** Kernel warnings that named a path — what the findings above are built from. */
+  errorsAttributed: z.number().int().nonnegative().optional(),
+  /**
+   * Kernel scrub errors with NO path: read/IO errors, super-block errors, and
+   * metadata whose owner the kernel could not name. Counted, never attributed;
+   * the raw evidence stays in `btrfsErrors`.
+   */
+  unattributed: z.number().int().nonnegative().optional(),
+  /** True when more files were attributed than the 200 the list carries. */
+  truncated: z.boolean().optional(),
+  /**
+   * Metadata (DUP) copies btrfs corrected from their mirror during this
+   * scrub's journal window (selfheal.12, GT-20). Optional and additive — a
+   * result from an older daemon omits it, and a window that read nothing
+   * simply leaves it off.
+   */
+  metadataCorrected: AhrMetadataCorrected.optional(),
+})
+export type AhrScrubResult = z.infer<typeof AhrScrubResult>

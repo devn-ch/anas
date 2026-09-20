@@ -1,0 +1,7 @@
+btrfs-progs v6.14
+leaf 31309824 items 1 free space 11382 generation 9 owner CSUM_TREE
+leaf 31309824 flags 0x1(WRITTEN) backref revision 1
+fs uuid 64495fe4-d0e6-40ce-8385-1ac57923599d
+chunk uuid f256dcd4-b239-4186-95e1-95056b1da87e
+	item 0 key (EXTENT_CSUM EXTENT_CSUM 568758272) itemoff 11407 itemsize 4876
+		range start 568758272 end 573751296 length 4993024

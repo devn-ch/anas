@@ -157,9 +157,64 @@ New resource `/v1/ahr` (parallel to `/v1/pools`; md/AHR is a distinct backend pe
 | `POST` | `/v1/ahr/:name/disk/:id/readd` | Guided re-add of a returned disk (11.9): per-slice superblock-UUID identity check, `--re-add` differential catch-up via the §2.6 bitmap, stated fallback to full rebuild; refused while reshaping or mid-expansion | 202 job / **409 confirm** |
 | `PUT` | `/v1/ahr/:name/mountpoint` | Change the pool's mountpoint — the ONE mutable pool identity (name/tier/arrays are fixed at creation; rename would require offline md superblock rewrites and is deliberately not offered). Same constraints as the create-time override; brief unmount during the move | 202 job / **409 confirm** |
 | `POST` | `/v1/ahr/:name/scrub` | btrfs scrub, then md `check` — sequenced, never concurrent | 202 job |
+| `POST` | `/v1/ahr/:name/repair` | **Repair from parity** (selfheal.6): body `{ files: [{ path, blocks: [] }] }` — the exact files and 4 KiB blocks the operator picked out of a scrub's findings. Refused while the pool is anything but healthy and idle, while a scrub or another repair is in flight, while a backup holds the pool's top-level mount, and for any path that is not a live file under the mountpoint | 202 job / **409 confirm** |
+| `POST` | `/v1/ahr/:name/parity-rewrite` | **Rewrite parity** (selfheal.10): body `{ band }` — recompute ONE band's parity from the data it holds. Refused unless the pool's last COMPLETED scrub — or its last completed REPAIR, whichever is newer — counted a parity mismatch on that band AND left no data unrepaired anywhere (`reason` codes `no-parity-mismatch` / `data-findings-present`), the band is a parity band (`not-a-parity-band`), no member of it carries recorded md bad blocks (`bad-blocks-present`), the band is idle and complete with its sync window at the default (`array-busy`), and no scrub/repair/rewrite is in flight (`job-active`). A guest's LUN live on the pool is DISCLOSED in the confirm gate, never refused — this verb writes parity, never a file. The job runs a FRESH btrfs scrub first and aborts on any finding | 202 job / **409 confirm** |
+| `POST` | `/v1/ahr/:name/mirror-reconcile` | **Reconcile mirror** (selfheal.11): body `{ band }` — make ONE RAID1 band's two legs agree again. Refused unless the pool's last COMPLETED scrub — or its last completed REPAIR, whichever is newer — counted a mismatch on that band, recorded it as `raid1`, and left no data unrepaired anywhere (`reason` codes `no-mirror-mismatch` / `not-a-mirror-band` / `data-findings-present`), no leg of it carries recorded md bad blocks (`bad-blocks-present`), the band is idle and complete with its sync window at the default (`array-busy`), and no scrub/repair/rewrite/reconcile is in flight (`job-active`). A guest's LUN live on the pool is DISCLOSED in the confirm gate, never refused — every row this verb writes already matches its stored checksum. No leg is ever failed, removed or re-added, so there is no degraded window | 202 job / **409 confirm** |
 | `DELETE` | `/v1/ahr/:name` | Destroy pool | 202 job / **409 confirm** |
 
-**Confirm-gated (Principle 14, the 409 + X-Anas-Confirm-Code flow):** create (wipes disks — lists every disk that will be erased in the warnings), expand/replace (announces reshape duration estimate + the pending-capacity reality), abandon (leaves the pool at reachable-but-not-target layout — states exactly what that layout is), destroy. The confirm warnings carry the *concrete* consequence (which disks, how long, how much data at risk), not a generic "are you sure".
+**Confirm-gated (Principle 14, the 409 + X-Anas-Confirm-Code flow):** create (wipes disks — lists every disk that will be erased in the warnings), expand/replace (announces reshape duration estimate + the pending-capacity reality), abandon (leaves the pool at reachable-but-not-target layout — states exactly what that layout is), destroy, repair-from-parity (names the snapshot taken, the md knobs turned aside and restored, and what is written), parity-rewrite (names what parity is recomputed from, the fresh scrub that aborts the run, the files it cannot protect, and how long the band will be read), mirror-reconcile (names both arms and their cost, the rows it leaves exactly as they are, that the pool stays online and undegraded throughout, and that md's own repair is neither used nor to be run by hand). The confirm warnings carry the *concrete* consequence (which disks, how long, how much data at risk), not a generic "are you sure".
+
+**Repair from parity (selfheal.6).** The operator-triggered half of the self-heal epic: `services/selfheal-repair.ts` reconstructs one 4 KiB block from the other members of its stripe, the btrfs checksum arbitrates the candidate, and only a candidate that matches is written back through md. The job runs the picked blocks strictly one at a time — two runs at once would fight over the same `rmw_level`, `sync_min`/`sync_max` and `stripe_cache_size` — and reports every block in one of FIVE honest buckets: `repaired`, `unrepairable` (no source of truth left below the checksum tree — restore the file from backup), `aboveMd` (parity already agreed with the bad data, so nothing was written — the wording implicates something other than the disks, never certainly), `mappingAbort` (the bytes at the mapped location were READ and still pass their stored csum — nothing was written and nothing needs restoring), and `notExamined` (the block was never looked at: an inline extent, a hole, a truncated owner scan, a band whose geometry went unreadable, a read-back guard that says the mapping and the array disagree, or a path whose inode is not the one the scrub examined — its `reasonCode` says which, and the advice is "re-scrub after &lt;what would change&gt;", never a restore and never a clean bill). The five always sum to the blocks attempted. A block whose engine run throws is that block's verdict, never the job's. A block that is repaired and PROVEN while md still counts mismatching stripes on its band leaves a `parityResidual`, reported in `parityResiduals` in the same row shape a scrub's `parityMismatches` uses — the data is right and the parity is what disagrees, so the operator is pointed at Rewrite parity for that band rather than at a restore, and without waiting for a fresh two-phase scrub to rediscover a number this run already measured. A path backing an iSCSI LUN with a LIVE initiator session is refused at the route (`lun-session-active`, no confirm bypass): the block is proven and copy-on-write leaves the old extent alone, but the initiator holds its own cache and has no idea the bytes moved. A member carrying recorded md bad blocks over the target row counts as ABSENT for the reconstruction, exactly as a kicked one does. One PVE notification at the end carries the counts and the per-file outcomes: `warning` when anything is unrepairable or above md, `info` when everything was repaired. The two standing boundaries of the epic hold here: the repair is **never automatic** (an operator asks for it, on named files, with named blocks, through the confirm gate) and it is **never a read-path heal** (nothing repairs a block because someone read it). The UI surface is the Scrubs findings window and nowhere else.
+
+**Rewrite parity (selfheal.10).** The ONE case where ANAS runs `mdadm --action=repair`, and the
+only one it can prove safe. md counts mismatching stripes; it never says which member is wrong, and
+`repair` resolves that by recomputing parity from the data — so on a DATA-member rot it rewrites
+parity to match the junk, the array goes clean, and the rot becomes invisible to every later check
+while btrfs still refuses the file (GT-18's negative control). The two cases are indistinguishable
+to md and distinguishable to ANAS: a two-phase scrub that counted mismatches on a band AND came back
+clean on checksums says the data is right, so the parity is what is wrong. That proof is the verb's
+entire licence, which is why the job re-takes it immediately before the md write and runs a FRESH
+btrfs scrub of the pool first — the evidence scrub can be hours old, and a finding that arrived
+since would be blessed. The sequence is fresh scrub → `mdadm --action=repair` over the whole band →
+wait idle → `mdadm --action=check` over the whole band → `mismatch_cnt` must read 0, with one PVE
+notification carrying the before/after counts (`info` on `rewritten`, `warning` otherwise). Both md
+operations are whole-band with `sync_max` at its default, so nothing narrows a window and nothing
+writes `idle`; an operation md took of its own (a member failing mid-run) ends the job with every
+knob exactly as md left it. It is never automatic and never pool-wide: one band, through the confirm
+gate, with that band's own duration estimate in front of the operator.
+
+**Reconcile mirror (selfheal.11).** The mirror's counterpart, and the one place where md's own
+repair is blocked outright. On a RAID1 band `mismatch_cnt` counts legs that disagree with
+each other; md does not say which leg is right, and `mdadm --action=repair` resolves that by copying
+the first in-sync leg over the other — proven in both directions on the rig (GT-22(f)): with the rot
+on leg 0 the junk was propagated to leg 1, and the band then agreed on rotten data where no later
+check could see it. So the standing ruling is that **no ANAS code path issues `--action=repair` on a
+RAID1 band**, and in `services/ahr-mirror-reconcile.ts` that is a wrapper around the executor rather
+than a convention: the guard throws before the process is spawned, on all three of its doors.
+
+The verb has two arms, cheapest first. **Arm A, "scrub until clean":** GT-22's first UNEXPECTED is
+that an ordinary btrfs scrub which MEETS a mirror band's rot heals the whole band through md — btrfs
+re-reads on a checksum failure, md's read-balance serves the other leg, the good block is written
+back, and md propagates that write to BOTH legs. Whether it does is up to a read-balance that is not
+contractual anywhere, so the pass is repeated (bounded, three by default) with a whole-band md check
+after each; every pass's `corrected` count is progress, and a pass that corrects nothing while md
+still counts ends arm A at once — repeating the same coin flip proves nothing. **Arm B, "compare
+legs":** both legs are read in full at their OWN data offsets and compared row by row. Each differing
+4 KiB row's md byte is mapped BACK to a btrfs logical byte (the chunk-tree hop, inverted) and
+arbitrated by the authority the covering chunk names — the stored csum for DATA, the containing tree
+node's own header checksum for METADATA and SYSTEM — and the leg that matches is written THROUGH md,
+which writes both legs. A row in no chunk is free space, a DATA row with no stored csum is a NOCOW or
+prealloc range: both are counted and **left exactly as they are**. A row NEITHER leg can satisfy is
+`unresolvedRows` — never written, and reported as a residual with the file to restore.
+
+There is **no degraded window**: no leg is failed, removed or re-added at any point, which is the
+whole difference between this and the manual procedure GT-22(b)/(c) documents (a full leg copy at
+≈6–7.5 s/GiB with the array single-copy throughout — a day and a half on a 20 TB leg). The one gate
+this verb does NOT share with the parity rewrite is the fresh scrub's findings: that verb aborts on
+any finding because md repair would bless the rot, and this one writes no row it cannot prove, so a
+file neither leg can satisfy is NAMED and the rest of the band is still reconciled. One PVE
+notification carries the arm, the counts and the residuals (`info` only when the band came back clean
+AND nothing was lost), and it repeats what must not be done by hand.
 
 **Pre-checks:** `expand` REFUSES to start while any array is degraded (reshaping a degraded array voluntarily enters the double-failure window — replace/rebuild first). A replacement disk smaller than the reserved usable size is rejected before any destructive action (§2.5).
 
@@ -298,6 +353,8 @@ AHR is the feature that justifies actually wiring the deferred Proxmox notificat
 
 That rule is implemented twice on purpose — `isBuildingMembership` (TypeScript, from /proc/mdstat) and `initial_build_shape()` (POSIX sh, from sysfs) — because the monitor hook runs with no daemon, no socket and no node. They must be kept in step; each carries a comment pointing at the other.
 
+**Parity-only rot** (scrub, self-heal reporting): phase 1 (md parity check) counting `mismatch_cnt > 0` on a band while phase 2 (btrfs checksum scrub) attributes NO corrupt file is not a false alarm — with every data block passing its checksum, the parity (or Q) member is what disagrees with the data. Nothing in ANAS repairs parity (the repair-verb question is a deliberate operator decision, not a default), so the scrub reports it and says the standing consequence plainly: at the NEXT disk failure in that band, md would reconstruct from the wrong parity. The per-band verdicts ride the scrub result (`parityMismatches`), phase 1's warning promises only what phase 2 can deliver (it checks every file's checksum and names an affected file), and the parity-only case gets its own second notification so the promised attribution never dies in silence.
+
 Routed through PVE's own notification targets/matchers (email/Gotify/etc. the operator already configured) — ANAS emits, PVE delivers. Leverage, not a new alerting system. **Mechanism (GT-17, proven live):** `PVE::Notify::<severity>('anas-ahr', {title, message}, fields)` with ANAS-shipped handlebars templates in `/usr/share/pve-manager/templates/default/` (apt-hook reinstalls after pve-manager upgrades); `fields` carries `type=anas-ahr` for operator matcher rules. **Evaluate first (per 9.4):** does ZED/mdadm's own `MAILADDR`/monitor already cover the disk-failure cases? Wire only the genuinely-missing events; don't duplicate `mdadm --monitor` if PVE can consume it directly.
 
 ### 7.3 Dashboard
@@ -423,6 +480,12 @@ unmounted after each op — nothing new stays mounted):
 | `POST /v1/ahr/:name/snapshots/:snap/rollback` | **409 confirm**; brief unmount of the pool; current `@data` is PRESERVED as `@snapshots/pre-rollback-<ts>` (rename — instant), the chosen snapshot becomes the new writable `@data`, remount. Nothing is destroyed by a rollback, ever |
 | 202 job |
 
+- **Transient repair pins:** the self-heal engine takes its cold read through a
+  read-only snapshot named `anas-selfheal-<ts>` (under `@snapshots` on §12
+  pools; inside the served tree on a flat pool) and deletes it in its `finally`
+  — a leftover from a failed cleanup shows in the Snapshots manager labelled
+  "transient — ANAS repair pin; safe to delete if no repair is running", and is
+  never offered as a rollback target.
 - **Schema:** `AhrSnapshot { name, createdAt, readonly }`; `AhrPool` gains
   `subvolLayout: boolean`. Snapshot sizes need qgroups — OUT of v1 (never show
   an unlabeled or wrong number).

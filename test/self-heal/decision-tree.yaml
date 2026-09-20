@@ -1,0 +1,2019 @@
+# ---------------------------------------------------------------------------
+#  AHR self-heal — the fault-rooted decision tree
+#
+#  Rendered by docs/AHR-SELF-HEAL-DECISION-TREE.md; checked by
+#  test/self-heal/check-decision-tree.mjs (which rides `npm run test:unit`
+#  through packages/daemon/src/__tests__/selfheal-decision-tree.test.ts).
+#
+#  READING RULE — this is a fault tree, not a flowchart. A shared decision node
+#  carries only its CONTINUE edge; every branch that characterises a particular
+#  fault is linked from THAT fault's root. So "which roots reach this leaf" is a
+#  real question with a real answer, and `exclusive_actions` below can say which
+#  answers are allowed. Wiring an abort branch off a shared decision instead
+#  would make every root reach every leaf and the check would prove nothing.
+#
+#  Every node carries:
+#    code: <path>:<symbol>   the thing that implements it, or `none`
+#    test: <test file>:<name> | suite:<case id>   what proves it, or `none`
+#    gt:   GT-n | none       the ground-truth fact it rests on
+#
+#  YAML SUBSET: a top-level map of block sequences of flat maps. Inline lists
+#  `[a, b]`, double-quoted strings, `#` comments. Nothing else.
+# ---------------------------------------------------------------------------
+
+version: 1
+
+# --- Invariants the checker enforces over reachability ----------------------
+exclusive_actions:
+  - action: md-action-repair
+    allowed: [R1]
+    reason: 'GT-18: a stripe-bounded `mdadm --action=repair` rewrites parity correctly when the data is intact and BLESSES the rot when it is not, and on a mirror it copies the first in-sync leg over the others without looking at which is right (N1). The only root it may be reached from is parity-only rot with phase 2 proven clean.'
+  - action: md-block-write
+    allowed: [R2, R3, R5, R6, R9, R15, R16, R19, R23]
+    reason: 'GT-7/GT-8: a block goes through md only after a reconstruction matched the checksum btrfs stored for it. A root that cannot produce an arbitrated candidate must never reach the write.'
+  - action: restore-from-backup-advice
+    allowed: [R1, R3, R4, R6, R7, R9, R10, R11, R14, R16]
+    reason: "selfheal.7 F2 / D10: 'restore this file from backup' is advice to OVERWRITE the file, so it may only be reached from a fault where nothing below the checksum tree can prove the block right. The seventh pass took R22 OFF this list (a read-back-guard failure establishes NOTHING about the file — F9) and put four faults ON it, each because the block genuinely cannot be proven: R1 only through E12d, where the block was written AND fails its cold re-read; R4/R9 only through E04f2, where both mirror legs fail and disagree with each other; R11 through E07a, where md has recorded bad blocks over the row and can reconstruct nothing from that member."
+  - action: not-corrupt-here-advice
+    allowed: [R18]
+    reason: 'The mapping-abort sentence asserts a positive fact — the bytes at the mapped location still PASS their stored checksum, so nothing was written and nothing needs restoring. It may only be reached from the fault that actually establishes it.'
+
+# --- Files whose exported surface is scanned for orphan actions -------------
+orphan_scan:
+  - packages/daemon/src/services/ahr-scrub.ts
+  - packages/daemon/src/services/ahr-repair.ts
+  - packages/daemon/src/services/ahr-parity-rewrite.ts
+  - packages/daemon/src/services/ahr-mirror-reconcile.ts
+  - packages/daemon/src/services/selfheal-repair.ts
+  - packages/daemon/src/services/selfheal-map.ts
+  - packages/daemon/src/services/selfheal-csum.ts
+  - packages/daemon/src/services/selfheal-syncop.ts
+  - packages/daemon/src/services/selfheal-reconcile.ts
+  - packages/daemon/src/services/scrub-schedules.ts
+  - packages/daemon/src/services/scrub-schedule-units.ts
+  - packages/daemon/src/scrub-task.ts
+
+# --- The 24 faults ----------------------------------------------------------
+roots:
+  - id: R1
+    title: md mismatch with the data intact (parity / Q rot)
+    entry: X1
+  - id: R2
+    title: btrfs csum error — one data member rotted below md
+    entry: X2
+  - id: R3
+    title: two damaged members in one stripe (RAID5 unrepairable / RAID6 Q path)
+    entry: X3
+  - id: R4
+    title: rot that arrived THROUGH md (parity agrees with the bad data)
+    entry: X4
+  - id: R5
+    title: metadata rot (csum tree / fs tree) in a DUP copy
+    entry: X5
+  - id: R6
+    title: compressed-extent rot
+    entry: X6
+  - id: R7
+    title: rot in a file without checksums (NOCOW / prealloc / nodatasum)
+    entry: X7
+  - id: R8
+    title: rot in an extent referenced only by a snapshot (outsideMount)
+    entry: X8
+  - id: R9
+    title: mismatch on a RAID1 band (the legs disagree)
+    entry: X9
+  - id: R10
+    title: 'member failure / degraded array before, during or after a scrub or repair'
+    entry: X10
+  - id: R11
+    title: URE during a rebuild (md bad-block list)
+    entry: X11
+  - id: R12
+    title: daemon SIGKILL / OOM / upgrade-restart mid-repair or mid-scrub
+    entry: X12
+  - id: R13
+    title: power loss mid-repair
+    entry: X13
+  - id: R14
+    title: 'a foreign md op (mdcheck, recovery, reshape) concurrent with ours'
+    entry: X14
+  - id: R15
+    title: a block in band N of a multi-band pool
+    entry: X15
+  - id: R16
+    title: a block backing an iSCSI LUN image
+    entry: X16
+  - id: R17
+    title: check never started / state unknown / counter unreadable
+    entry: X17
+  - id: R18
+    title: 'file changed, truncated, deleted or inode reused between scrub and repair'
+    entry: X18
+  - id: R19
+    title: a crc32c collision on a candidate (accepted residual)
+    entry: X19
+  - id: R20
+    title: 'the periodic timer paths (missed occurrence, vanished job, restart, shared spindles)'
+    entry: X20
+  - id: R21
+    title: 'legacy and foreign states (mdcheck, marker-less units, masked timers, uninstall)'
+    entry: X21
+  - id: R22
+    title: 'mapping failure (unreadable band geometry, unresolvable extent, owner-scan cap)'
+    entry: X22
+  - id: R23
+    title: "the pool's top-level mount held by a backup during a repair"
+    entry: X23
+  - id: R24
+    title: 'the operator names a path outside the pool — a symlink, a bind mount'
+    entry: X24
+
+nodes:
+  # ===========================================================================
+  #  Root entries — the first observable of each fault
+  # ===========================================================================
+  - id: X1
+    kind: decision
+    label: md counts mismatching stripes on a parity band while every data block still passes its checksum
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:parity mismatch and errors that name NO file'
+    gt: GT-18
+    next: [S00, S22, S62, P00, E12a, E12e]
+  - id: X2
+    kind: decision
+    label: 'btrfs scrub reports csum errors: the kernel journal names the file, the 64 KiB stripe and the subvolume'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:parseScrubWarning'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:parses the drill's checksum-error line field for field"
+    gt: GT-3
+    next: [S43, S61, P01b, E05f]
+  - id: X3
+    kind: decision
+    label: 'two blocks of one stripe are damaged: no reconstruction can match the stored csum'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:reconstruct'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:is UNREPAIRABLE when no reconstruction matches the stored csum'
+    gt: GT-8
+    next: [E08a, E07r6]
+  - id: X4
+    kind: decision
+    label: "the block fails its stored csum while the parity group agrees with itself - read BOTH ways, md's own bounded check over the stripe and a direct read of every member's row"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data'
+    gt: GT-6
+    next: [E05b, E05e, E04f, S00]
+  - id: X5
+    kind: decision
+    label: a metadata node fails its own crc32c — the csum tree leaf that would arbitrate the data block is itself rotten
+    code: 'packages/daemon/src/services/selfheal-csum.ts:verifyNode'
+    test: 'packages/daemon/src/services/__tests__/selfheal-csum.test.ts:refuses one flipped byte anywhere past the header csum'
+    gt: GT-20
+    next: [E04b, E04c, S46, X5c, X5r]
+  - id: X5c
+    kind: action
+    label: "the kernel's `read error corrected` lines are counted in the two windows ANAS already reads (selfheal.12 — never a watcher): the scrub's journal window and a repair job's own window, both filtered to the pool's dm device, and the count plus the member devices ride the result as `metadataCorrected {count, devices}`"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:readCorrectedReads'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub that corrected metadata says so — result and notification'
+    gt: GT-20
+    next: [X5n]
+  - id: X5n
+    kind: notification
+    label: "ONE sentence on the notification the run already earns: \"btrfs corrected N metadata read(s) from the mirror copy during this run. A member is returning bad metadata. Check that disk's SMART data in Disks.\" — and a CLEAN scrub whose only signal is this count earns its own warning, because the summary says nothing (GT-20)"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:metadataCorrectedSentence'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the sentence rides the EXISTING notification when the scrub already found errors'
+    gt: GT-20
+    next: [X5u]
+  - id: X5u
+    kind: ui
+    label: 'the Scrubs row carries the count of the newest completed scrub — amber, labelled, with what happened / what it means / what to check as the tooltip — so a clean scrub never reads as a clean bill'
+    code: 'packages/pve-integration/src/69-scrubs.js:correctedFor'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: a corrected-metadata count shows on the row, labelled'
+    gt: none
+  - id: X5r
+    kind: residual
+    label: "a DUP metadata rot is repaired by the RW MOUNT's read path, not by the scrub: `btrfs scrub` reports 0 corrected, and the only durable evidence is a one-time kernel `read error corrected` line — which is exactly what ANAS now counts in the windows it already reads (selfheal.12), so the residual is the SENTENCE, not silence"
+    code: none
+    test: none
+    gt: GT-20
+  - id: X6
+    kind: decision
+    label: one corrupt on-disk sector of a zstd blob takes out the whole 128 KiB logical extent
+    code: 'packages/daemon/src/services/selfheal-map.ts:repairUnitFor'
+    test: 'packages/daemon/src/services/__tests__/selfheal-map.test.ts:the repair unit is the block when uncompressed and the whole blob when not'
+    gt: GT-9
+    next: [S54, E04e, E13b, E00]
+  - id: X7
+    kind: decision
+    label: 'btrfs stored no checksum for the logical byte — a NOCOW file, a prealloc extent, or nodatasum'
+    code: 'packages/daemon/src/services/selfheal-csum.ts:findStoredCsumEntry'
+    test: 'packages/daemon/src/services/__tests__/selfheal-csum.test.ts:reports NO stored csum rather than the nearest one (NOCOW / prealloc)'
+    gt: none
+    next: [E04a, X7r]
+  - id: X7r
+    kind: residual
+    label: "a file with no checksums is invisible to phase 2, so Rewrite parity's proof (\"phase 2 clean\") says nothing about it — the confirm gate states that ANAS creates no such file and cannot see into one it did not create"
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteWarnings'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:names what parity is recomputed from, the scrub that runs first, NOCOW, and the estimate'
+    gt: none
+  - id: X8
+    kind: decision
+    label: 'the corrupt extent is reachable only through `@snapshots/<snap>/…` — real, expected, and outside the mounted tree'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:findingPath'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a NESTED subvolume keeps its remainder, and a SNAPSHOT is reported outside the mount'
+    gt: none
+    next: [S49, RT06b, U06, X8r]
+  - id: X8r
+    kind: residual
+    label: 'repair works on the live @data tree only in this cut: an `outsideMount` finding has no verb at all, and the rollback confirm is the only place its consequence is stated'
+    code: 'packages/pve-integration/src/69-scrubs.js:repairBlockedReason'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:snaps8: the confirm warns of the unrepaired finding inside THIS snapshot'
+    gt: none
+  - id: X9
+    kind: decision
+    label: md counts disagreeing LEGS on a mirror band; the rot may be on the leg md does not serve reads from
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:every mismatching band warns; an unreadable counter warns about nothing'
+    gt: GT-16
+    next: [S22, S62, U07, P03a, E04g, E04f, X9r, E04f3, E04f4, M00]
+  - id: X9r
+    kind: ui
+    label: 'the mirror-mismatch wording names the verb that DOES apply and the one the operator must not reach for: "no parity to rewrite - the legs disagree with each other; do not run md repair on a mirror; click to reconcile the mirror". Rewrite parity stays dark on a RAID1 row and says why (story selfheal.11)'
+    code: 'packages/pve-integration/src/69-scrubs.js:MIRROR_BAND_REASON'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:it says there is no parity to rewrite, and points at the mirror verb'
+    gt: GT-16
+  - id: X10
+    kind: decision
+    label: 'a member fails — before the job (pool state), at the gates, between the precheck and the write, or under the running check'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES while the array is degraded'
+    gt: GT-17
+    next: [RT02, E01a, E01b, E07a, E10a, E12b, S41, S05, P03b, J31]
+  - id: X11
+    kind: decision
+    label: "a survivor returns a URE during a degraded rebuild: md records the range in the member's bad-block list and reconstructs nothing there"
+    code: 'packaging/anas-md-event.sh:count_bad_block_ranges'
+    test: 'packaging/test/md-event.test.sh:journald line has BADBLOCKS=3'
+    gt: none
+    next: [H0, H3, H5]
+  - id: X12
+    kind: decision
+    label: 'anasd is SIGKILLed, OOM-killed or restarted by an upgrade mid-sequence: no `finally` runs'
+    code: 'packages/daemon/src/services/selfheal-reconcile.ts:reconcileSelfhealState'
+    test: "packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:puts the sync window, rmw_level and stripe cache back to md's own values"
+    gt: GT-13
+    next: [RC0, T07, P01a, P03c, RT04a, X12r]
+  - id: X12r
+    kind: residual
+    label: "the job queue is in memory, so a restart takes the scrub's `parityMismatches` record with it and Rewrite parity has no proof until a fresh multi-hour two-phase scrub has run — the refusal says so in those words"
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteEvidence'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:no completed scrub is no proof'
+    gt: none
+  - id: X13
+    kind: decision
+    label: "the node loses power while the engine holds md's knobs aside and its 4 KiB write is in flight"
+    code: 'packages/daemon/src/services/selfheal-io.ts:writeDirect'
+    test: none
+    gt: GT-13
+    next: [X13a, X13b, RC0]
+  - id: X13a
+    kind: residual
+    label: "the md knobs do not survive the reboot: `rmw_level`, `sync_min`/`sync_max` and `stripe_cache_size` come back at md's own defaults on re-assembly, so the GT-13 trap is a daemon-restart problem and not a power-loss one"
+    code: 'packages/daemon/src/services/selfheal-io.ts:MD_DEFAULT_SYNC_MAX'
+    test: 'packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:writes nothing and says nothing'
+    gt: GT-1
+  - id: X13b
+    kind: residual
+    label: "a torn 4 KiB write is caught the next time the block is read or scrubbed — btrfs's own checksum is the only record that the write did not land, and ANAS keeps none of its own (stateless)"
+    code: none
+    test: none
+    gt: GT-8
+  - id: X14
+    kind: decision
+    label: "md is running an operation this daemon did not start — mdcheck's check, a recovery onto a spare, a resync, a reshape, or a frozen array"
+    code: 'packages/daemon/src/services/selfheal-syncop.ts:ownsSyncOp'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:stops the bounded check itself rather than narrowing a recovery's window"
+    gt: GT-19
+    next: [S15, E05c, P08a, RT04a, RC2, X14r]
+  - id: X14r
+    kind: residual
+    label: "md reports the action, never who asked for it: the parity rewrite's own `repair` has no ownership token in sysfs at all, so the honest reading — this run issued a repair onto an idle array, therefore the repair md is running is that one — is what the wait uses"
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:rewriteBandParity'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:an op that finished between two polls is proven by last_sync_action, not assumed'
+    gt: GT-19
+  - id: X15
+    kind: decision
+    label: "the LV is a linear concatenation of one md array per band; the block's band decides its geometry, its members and its sysfs knobs"
+    code: 'packages/daemon/src/services/selfheal-map.ts:bandForLvByte'
+    test: "packages/daemon/src/services/__tests__/selfheal-map.test.ts:places a byte in the SECOND band with the second band's geometry, array and members"
+    gt: GT-2
+    next: [X15a, X15b, E00]
+  - id: X15a
+    kind: action
+    label: 'each on-disk sector of the repair unit is placed INDEPENDENTLY: a compressed blob straddling a band boundary has its sectors on two arrays'
+    code: 'packages/daemon/src/services/selfheal-map.ts:locateLogical'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:re-verifies every sector through ITS OWN band's members"
+    gt: GT-2
+    next: [X15b]
+  - id: X15b
+    kind: action
+    label: 'knobs are saved and restored PER BAND, and only the bands this run touched are written to at all'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'suite:7-bandA-untouched'
+    gt: none
+  - id: X16
+    kind: decision
+    label: the corrupt block lies inside a fileio LUN image on the pool
+    code: 'packages/daemon/src/services/ahr-repair.ts:lunRestoreSentence'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:a LUN-backed unrepairable file is told to restore the LUN, not the file (D10)'
+    gt: none
+    next: [E00, J45, J46, E03a, RT10]
+  - id: X17
+    kind: decision
+    label: "md's check on a band cannot be shown to have run to the end: never started, state unknown, taken over, or its counter unreadable"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:lastSyncAction'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a check that aborted (idle + a persistent last_sync_action=check, counter unmoved) is UNKNOWN, not a verdict'
+    gt: none
+    next: [S11, S13, S16, S20n, S63, S03]
+  - id: X18
+    kind: decision
+    label: 'the file changed, was truncated, was deleted, or its inode was reused between the scrub and the repair'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:pathExists'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a file deleted since the scrub is reported as missing, not as a failure'
+    gt: none
+    next: [S51, RT06c, E04d, X18a, X18r]
+  - id: X18a
+    kind: decision
+    label: 'a file rewritten since the scrub holds none of its old items: the owner scan answers "no extent of this file covers the reported stripe" rather than refusing'
+    code: 'packages/daemon/src/services/selfheal-map.ts:extentsForStripe'
+    test: "packages/daemon/src/services/__tests__/selfheal-map.test.ts:a scan whose leaves hold none of the inode's items returns [] \u2014 it does not refuse"
+    gt: none
+  - id: X18r
+    kind: decision
+    label: 'identity is the INODE, not the path alone: `AhrRepairFile.inode` rides the finding, and the engine stats the path at the gates - before anything is pinned'
+    code: 'packages/shared/src/schemas/selfheal.ts:AhrRepairFile'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:repairs when the inode matches the file that is there'
+    gt: none
+    next: [E00b, U09]
+  - id: E00b
+    kind: refusal
+    label: '`inode-changed`: the file at this path is not the file the scrub examined - `not-examined`, nothing pinned, nothing written, and never a restore'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:refuses NOT-EXAMINED when it does not, and pins nothing'
+    gt: none
+    next: [J47]
+  - id: U09
+    kind: ui
+    label: 'the findings window sends the finding''s inode alongside the path and the blocks'
+    code: 'packages/pve-integration/src/69-scrubs.js:repairSelection'
+    test: "packages/pve-integration/test/dialog-contracts.harness.mjs:and the finding's INODE, so the daemon can check identity (F11)"
+    gt: none
+  - id: X19
+    kind: decision
+    label: a reconstructed candidate whose crc32c equals the stored csum is accepted as the original
+    code: 'packages/daemon/src/services/selfheal-csum.ts:crc32c'
+    test: "packages/daemon/src/services/__tests__/selfheal-csum.test.ts:a single flipped bit changes the csum \u2014 the whole basis of arbitration"
+    gt: GT-11
+    next: [E08b, E11]
+  - id: X20
+    kind: decision
+    label: 'the node-level `anas-scrub.timer` fires, or its occurrence was missed and `Persistent=true` fires it at boot'
+    code: 'packages/daemon/src/services/scrub-schedule-units.ts:renderScrubTimerUnit'
+    test: 'packages/daemon/src/services/__tests__/scrub-schedule-units.test.ts:the timer unit carries the OnCalendar, Persistent=true and the install target'
+    gt: none
+    next: [T00, T04, T05, T06, T08, T13, P02a]
+  - id: X21
+    kind: decision
+    label: "the node is in a state ANAS did not create: mdcheck on with no ANAS units, a marker-less unit on ANAS's names, masked timers, or an uninstall"
+    code: 'packages/daemon/src/services/scrub-schedules.ts:ahrScrubNote'
+    test: 'packages/daemon/src/services/__tests__/scrub-schedules.test.ts:the LEGACY state (no ANAS units, mdcheck on) reads as mdcheck-timer with the takeover note (review F1/F4)'
+    gt: GT-21
+    next: [T01, T01a, T02a, T02b, T09, T10, T11, T12, P01c]
+  - id: X22
+    kind: decision
+    label: 'the chain from file block to member offset cannot be followed: a band with no readable geometry, an unresolvable extent, an inline extent, a hole, or an owner scan that hit its bound'
+    code: 'packages/daemon/src/services/selfheal-map.ts:resolveContext'
+    test: 'packages/daemon/src/services/__tests__/selfheal-map.test.ts:refuses a truncated owner scan rather than returning the prefix it reached'
+    gt: GT-2
+    next: [E01c, E01d, E03a, E09a, S44, S55, X22a]
+  - id: X22a
+    kind: action
+    label: "attribution survives it: one unreadable band does not void the whole pool's findings, and the probe still reads the file at the kernel's own offset"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:buildFindings'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:one band with no readable geometry does not void the whole pool's findings"
+    gt: GT-3
+  - id: X23
+    kind: decision
+    label: "a backup or snapshot job holds the pool's on-demand top-level mount for hours"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:gateRefusal'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES when the pool's top-level mount is already held (a backup is in flight)"
+    gt: none
+    next: [RT05, E01e, E11, E13a]
+  - id: X24
+    kind: decision
+    label: "the request names a path that is not a live file on the pool's own device: outside the tree, a symlink out of it, or a bind mount laid over part of it"
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:repairRealPath'
+    test: "packages/daemon/src/routes/__tests__/ahr-repair.test.ts:400 for a symlink that resolves OUTSIDE the pool's tree, though the string is inside (D12)"
+    gt: none
+    next: [RT06a, RT06b, RT06d, E00a]
+
+  # ===========================================================================
+  #  The two-phase scrub (selfheal.3 / .4) — phase 1 md parity, per band
+  # ===========================================================================
+  - id: S00
+    kind: decision
+    label: 'scrub job starts: phase 1 md parity per band, strictly sequential, then phase 2 btrfs checksums'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially'
+    gt: GT-5
+    next: [S01, S02]
+  - id: S01
+    kind: refusal
+    label: 'the pool is not mounted: the job throws before md is touched'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:refuses an unmounted pool'
+    gt: none
+  - id: S02
+    kind: action
+    label: "resolve this band's md kernel name from the /dev/md/<pool>-r<n> pin symlink AT POINT OF USE — md numbers re-enumerate across a reassembly"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:ignores a STALE route-time array.kernelName'
+    gt: GT-2
+    next: [S04]
+  - id: S03
+    kind: refusal
+    label: 'the kernel name will not resolve: the check was already issued, so it is cancelled WITHOUT writing idle (an unprovable idle aborts a rebuild) and the band is a skip'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:cancelBandCheck'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a band whose kernel name will not resolve is LEFT ALONE'
+    gt: GT-19
+    next: [S30]
+  - id: S04
+    kind: decision
+    label: '`sync_action` re-read per band immediately before the check is issued'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:syncAction'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:does not ISSUE a check on a band md is already recovering'
+    gt: GT-19
+    next: [S06]
+  - id: S05
+    kind: refusal
+    label: 'md is running an operation of its own on this band: nothing is issued, the band is recorded "not checked (md is running <op>)"'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:syncAction'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:does not ISSUE a check on a band md is already recovering'
+    gt: GT-19
+    next: [S30]
+  - id: S06
+    kind: decision
+    label: "the sync window is read: bounded to one stripe means an interrupted repair left GT-13's trap on this band"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:restoreSyncWindow'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:restores a sync window an interrupted repair left bounded'
+    gt: GT-13
+    next: [S07, S08]
+  - id: S07
+    kind: action
+    label: "the band is idle (just proven), so the window is widened back to md's own 0..max before the check goes in"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:restoreSyncWindow'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:restores a sync window an interrupted repair left bounded'
+    gt: GT-13
+    next: [S08, S07a]
+  - id: S07a
+    kind: refusal
+    label: 'the widen did not take: the band is skipped rather than checked over a sliver of itself'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:restoreSyncWindow'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:restores a sync window an interrupted repair left bounded'
+    gt: GT-13
+    next: [S30]
+  - id: S08
+    kind: action
+    label: "`mdadm --action=check` on the band — issued without `run`, so one band's refusal is a line, never the job's failure"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:records a band whose check mdadm refuses'
+    gt: GT-5
+    next: [S09, S08a]
+  - id: S08a
+    kind: refusal
+    label: 'mdadm exited non-zero: the band is recorded with the exit and the scrub carries on'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:records a band whose check mdadm refuses'
+    gt: none
+    next: [S30]
+  - id: S09
+    kind: action
+    label: 'markCheckIssued: from here, and only from here, this run may write `idle` to this array'
+    code: 'packages/daemon/src/services/selfheal-syncop.ts:markCheckIssued'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:retires every band's issued-check token, so a later FOREIGN check is never ours (N3)"
+    gt: none
+    next: [S10]
+  - id: S10
+    kind: decision
+    label: 'start-wait: mdstat and sysfs polled until the check is observably running (md takes the sysfs write asynchronously)'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:waits for the check to START before waiting for it to finish'
+    gt: none
+    next: [S12, S14]
+  - id: S11
+    kind: decision
+    label: 'md never took the check (`last_sync_action` is not `check`): the band is a skip and its `mismatch_cnt` is read as NO verdict — it belongs to an earlier check'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:lastSyncAction'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:records a band whose check md NEVER started, and reads no stale counter for it'
+    gt: none
+    next: [S30]
+  - id: S12
+    kind: decision
+    label: 'the check finished before the first poll — proven ONLY by a `mismatch_cnt` that MOVED, because md zeroes it when a sync op starts'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:mismatchCount'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a check that finished before the first poll is not \"never started\" \u2014 its MOVED counter is the verdict"
+    gt: none
+    next: [S20]
+  - id: S13
+    kind: decision
+    label: 'state unknown: md is idle, `last_sync_action` reads `check` (it is persistent on any node that ever ran mdcheck) and the counter never moved — not a verdict, either way'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:lastSyncAction'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a check that aborted (idle + a persistent last_sync_action=check, counter unmoved) is UNKNOWN, not a verdict'
+    gt: none
+    next: [S30]
+  - id: S14
+    kind: decision
+    label: 'finish-wait: mdstat and sysfs consulted together — a `resync=PENDING` check is IN FLIGHT, not finished'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:treats a resync=PENDING md check as in-flight \u2014 waits it out before the next band"
+    gt: GT-5
+    next: [S17]
+  - id: S15
+    kind: decision
+    label: 'md replaced the check with an operation of its own: this band will not be checked in this run, and no counter is read'
+    code: 'packages/daemon/src/services/selfheal-syncop.ts:foreignOpNote'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:stops waiting on a band whose check became'
+    gt: GT-19
+    next: [S18]
+  - id: S16
+    kind: refusal
+    label: "the 7-day ceiling: stop waiting on the band rather than hold the pool's job exclusion open for ever"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:ceilingText'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the absolute ceiling is the last resort \u2014 a band that never goes idle stops being waited on"
+    gt: none
+    next: [S18]
+  - id: S17
+    kind: decision
+    label: 'the check went idle: `mismatch_cnt` read after the settle (the counter finalizes as the sync thread winds down)'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:mismatchCount'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the mismatch counter is read from the sysfs file the 11.17 hook reads'
+    gt: GT-18
+    next: [S20]
+  - id: S18
+    kind: action
+    label: 'cancelBandCheck: `idle` is written ONLY for a check this run owns — a foreign op, or a frozen array, is left exactly as it is and named'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:cancelBandCheck'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a frozen band that refuses idle is said so \u2014 the scrub carries on"
+    gt: GT-19
+    next: [S30]
+  - id: S20
+    kind: decision
+    label: '`mismatch_cnt` on this band'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:mismatchCount'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a genuine fast check whose counter was ZEROED is counted \u2014 and reported clean"
+    gt: GT-5
+    next: [S23]
+  - id: S20n
+    kind: refusal
+    label: 'the counter could not be READ: the band was checked but has no verdict — a skip, never coverage (N12)'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:mismatchCount'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a band whose mismatch_cnt cannot be READ is a skip, not coverage (N12)'
+    gt: none
+    next: [S30]
+  - id: S22
+    kind: action
+    label: 'mismatch_cnt > 0: a `parityMismatches` row {band, bandIndex, array, mismatchCnt, level} rides the result, and the band counts as CHECKED'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema \u2014 and stay optional"
+    gt: GT-18
+    next: [S24]
+  - id: S23
+    kind: action
+    label: 'mismatch_cnt = 0: the band counts as checked and reports clean'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a genuine fast check whose counter was ZEROED is counted \u2014 and reported clean"
+    gt: GT-5
+    next: [S31]
+  - id: S24
+    kind: notification
+    label: "phase-1 warning, per band: \"rot exists in <band> — phase 2 (running now) checks every file's checksum; if a file is affected, it will be named\""
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:phase 1 rot: a mismatch_cnt > 0 warns before phase 2 starts \u2014 and phase 2 still runs"
+    gt: GT-5
+    next: [S31]
+  - id: S30
+    kind: action
+    label: '`bandsSkipped[]` carries the band and the why; `checkedArrays` never counts it (D8)'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a band md never started is recorded, not coverage \u2014 checkedArrays stays honest"
+    gt: none
+    next: [S31]
+  - id: S31
+    kind: action
+    label: "retireCheckIssued in the band loop's `finally` — the token never outlives the iteration that took it (N3)"
+    code: 'packages/daemon/src/services/selfheal-syncop.ts:retireCheckIssued'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:retires the token on the SKIP paths too \u2014 md never started the check (N3)"
+    gt: none
+    next: [S40]
+
+  # --- phase 2 and attribution ------------------------------------------------
+  - id: S40
+    kind: action
+    label: 'phase 2/2: `btrfs scrub start` polled to finished — one pass, two callers (the scrub and the parity rewrite)'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:runs btrfs scrub to completion, THEN per-array checks sequentially'
+    gt: GT-3
+    next: [S42]
+  - id: S41
+    kind: refusal
+    label: 'the btrfs scrub was ABORTED: the job fails'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:aborted btrfs scrub fails the job'
+    gt: none
+  - id: S42
+    kind: decision
+    label: 'Error summary clean: no ATTRIBUTION is read and nothing is probed — the journal is read once more for the corrected-metadata count alone (selfheal.12), the one rot signal a clean scrub can hold'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:parseBtrfsScrubStatus'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a clean scrub probes nothing, and reads the journal only for the corrected-metadata window'
+    gt: GT-3
+    next: [S60]
+  - id: S43
+    kind: action
+    label: "attributeScrub: `journalctl -k -o json` bounded to THIS scrub's own window, line-capped"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:attributeScrub'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:asks the journal for this window's error lines only, and for a bounded number of them"
+    gt: GT-3
+    next: [S45]
+  - id: S44
+    kind: decision
+    label: 'journalctl without PCRE2: re-read the whole window without -g; an unreadable journal degrades to NO attribution, never to a failed scrub'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubJournalArgs'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:re-reads without -g when journalctl has no pattern matching, rather than losing the attribution'
+    gt: GT-3
+    next: [S60]
+  - id: S45
+    kind: action
+    label: "parse the kernel MESSAGE text for GT-3's shape, and keep only lines naming THIS pool's dm device"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:attributeScrubErrors'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:another pool scrubbing at the same time is not attributed to this one'
+    gt: GT-3
+    next: [S47]
+  - id: S46
+    kind: action
+    label: 'path-less errors (`unable to fixup`, read/super) counted as `unattributed`, deduped against the logicals already attributed'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:parseUnattributedScrubError'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:errors with no path are counted unattributed \u2014 and never counted twice"
+    gt: GT-3
+    next: [S50]
+  - id: S47
+    kind: action
+    label: 'group every stripe per root:inode, resolve each subvolume id once, cap the list at 200 FILES while the counts keep counting'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:AHR_SCRUB_FINDINGS_CAP'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:caps the list at'
+    gt: GT-3
+    next: [S48]
+  - id: S48
+    kind: action
+    label: "findingPath: the kernel's subvolume-relative path taken relative to the subvolume the pool actually MOUNTS (a §12 pool mounts @data AT the mountpoint)"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:findingPath'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:\u00a712 layout: a NESTED subvolume keeps its remainder under the mountpoint"
+    gt: GT-3
+    next: [S52]
+  - id: S49
+    kind: decision
+    label: '`outsideMount`: the finding is under `@snapshots` — reported filesystem-relative and NEVER probed at a path that is not it'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:findingPath'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:\u00a712 layout: a snapshot is OUTSIDE the mounted tree \u2014 filesystem-relative, flagged"
+    gt: none
+    next: [S50]
+  - id: S50
+    kind: action
+    label: 'the finding rides the result: findings[], errorsAttributed, unattributed, truncated'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:attributeScrub'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:round-trips a full finding through JSON unchanged'
+    gt: none
+    next: [S60]
+  - id: S51
+    kind: decision
+    label: 'the path is gone since the scrub: `missing: true`, no probe, never a failed job'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:pathExists'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a file deleted since the scrub is reported as missing, not as a failure'
+    gt: none
+    next: [S50]
+  - id: S52
+    kind: decision
+    label: "the extents owning the named 64 KiB stripe, resolved through the engine's own mapping (extent tree backrefs, then one fs-tree hop per owner)"
+    code: 'packages/daemon/src/services/selfheal-map.ts:extentsForStripe'
+    test: 'packages/daemon/src/services/__tests__/selfheal-map.test.ts:resolves the extents owning the named stripe, with their real file ranges'
+    gt: GT-3
+    next: [S53]
+  - id: S53
+    kind: action
+    label: "every extent in the stripe is uncompressed: the kernel's offset IS the file offset — probe its 16 blocks with O_DIRECT, a non-zero exit is a bad block"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:probeStripe'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:names the corrupt file, its stripe, and the exact failing 4 KiB block'
+    gt: GT-3
+    next: [S50]
+  - id: S54
+    kind: action
+    label: "a COMPRESSED extent: drop the page cache first (btrfs falls back to buffered I/O on compressed data) and probe the extent's REAL file range whole"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:probeStripeExtents'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:drops the page cache BEFORE a compressed extent's probe reads (D9)"
+    gt: GT-9
+    next: [S50]
+  - id: S55
+    kind: decision
+    label: 'mapping unavailable, no extent covers the stripe, or nothing failed on re-read: `probedUnverified` / `unidentified` with the reason — never an empty badBlocks that reads as nothing found'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:buildFindings'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:unresolvable AND nothing failing \u2192 unidentified, with the mapping error as the reason"
+    gt: none
+    next: [S50]
+
+  # --- result and notifications -----------------------------------------------
+  - id: S60
+    kind: action
+    label: AhrScrubResultSchema.parse — validated at the daemon boundary before it leaves as a job result
+    code: 'packages/daemon/src/services/ahr-scrub.ts:scrubAhrPool'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:the new record fields round-trip the shared schema \u2014 and stay optional"
+    gt: none
+    next: [S64]
+  - id: S61
+    kind: notification
+    label: 'warning "AHR scrub found errors": the summary, then up to 20 paths with their bad-block counts, then "…and N more"'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:findingsBody'
+    test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:carries the paths in the SAME warning notification \u2014 never a second one"
+    gt: GT-3
+    next: [U01]
+  - id: S62
+    kind: notification
+    label: 'the PARITY-ONLY warning: mismatches stand and phase 2 named NO file, so the parity (or Q) member is what disagrees and md would reconstruct from it at the next disk failure'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:parityBody'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:parity mismatch and errors that name NO file'
+    gt: GT-18
+    next: [U02]
+  - id: S63
+    kind: notification
+    label: 'warning "AHR scrub did not check every band": a clean-but-incomplete scrub is never silent'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:skippedBody'
+    test: 'packages/daemon/src/services/__tests__/ahr-scrub.test.ts:a band whose mismatch_cnt cannot be READ is a skip, not coverage (N12)'
+    gt: none
+    next: [U03]
+  - id: S64
+    kind: ui
+    label: 'the Scrubs row: the findings link, the amber parity indicator and the muted skipped-band count share ONE cell, each with its own tooltip'
+    code: 'packages/pve-integration/src/69-scrubs.js:renderLastScrub'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the row says how many files, labelled'
+    gt: none
+
+  # ===========================================================================
+  #  UI doors
+  # ===========================================================================
+  - id: U01
+    kind: ui
+    label: 'the findings window: one row per finding, paths never truncated, the exact 4 KiB blocks, and the reported-vs-attributed line above'
+    code: 'packages/pve-integration/src/69-scrubs.js:showScrubFindings'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: the window states reported vs attributed'
+    gt: none
+    next: [U04, U05, RT00]
+  - id: U02
+    kind: ui
+    label: 'the parity indicator IS the door: `anas-win-scrub-parity` lists the bands md counted mismatches on and takes ONE'
+    code: 'packages/pve-integration/src/69-scrubs.js:showParityMismatches'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the parity indicator opens the parity window'
+    gt: GT-18
+    next: [U07, U08]
+  - id: U03
+    kind: ui
+    label: '"N band(s) not checked", with the band and the why as the tooltip'
+    code: 'packages/pve-integration/src/69-scrubs.js:skippedFor'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:scrubs: a scrub that skipped a band says how many, labelled'
+    gt: none
+  - id: U04
+    kind: ui
+    label: 'ONE predicate lights every Repair door: not missing, not outsideMount, not unidentified, and at least one named block'
+    code: 'packages/pve-integration/src/69-scrubs.js:repairableFinding'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:scrubrepair: an AHR row with a repairable finding lights it'
+    gt: none
+    next: [RT00]
+  - id: U05
+    kind: ui
+    label: 'greyed with the reason ON the button, each blocked kind counted in its own words'
+    code: 'packages/pve-integration/src/69-scrubs.js:blockedFindingReasons'
+    test: "packages/pve-integration/test/dialog-contracts.harness.mjs:scrubrepair: \u2026and the tooltip says the findings cannot be repaired from here"
+    gt: none
+  - id: U06
+    kind: ui
+    label: 'a snapshot finding is untickable, with "in a snapshot, outside the mounted tree" in its own Repair column'
+    code: 'packages/pve-integration/src/69-scrubs.js:repairBlockedReason'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:repair: a finding inside a SNAPSHOT cannot be ticked'
+    gt: none
+  - id: U07
+    kind: ui
+    label: 'a mirror-only mismatch row does not offer "click to rewrite": it names Repair from parity as the verb that arbitrates instead'
+    code: 'packages/pve-integration/src/69-scrubs.js:renderLastScrub'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: a mirror-only mismatch row does NOT offer "click to rewrite"'
+    gt: GT-16
+  - id: U08
+    kind: ui
+    label: "with corrupt files on the same scrub the verb is dark carrying the daemon's own 409 sentence, and the handler refuses a click anyway"
+    code: 'packages/pve-integration/src/69-scrubs.js:parityRewriteBlocked'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the handler itself refuses, not just the disabled state'
+    gt: GT-18
+
+  # ===========================================================================
+  #  POST /v1/ahr/:name/repair — the route gates (selfheal.6)
+  # ===========================================================================
+  - id: RT00
+    kind: decision
+    label: 'POST /v1/ahr/:name/repair — the body names the EXACT files and 4 KiB blocks the operator ticked; nothing is inferred'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:400 on a body that names no file, no block, or a path that is not absolute'
+    gt: none
+    next: [RT01]
+  - id: RT01
+    kind: decision
+    label: 'the pool exists, and is mounted — a repair resolves the block through the live filesystem'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:401 without identity headers, 404 for a pool that is not there'
+    gt: none
+    next: [RT03]
+  - id: RT02
+    kind: refusal
+    label: 'pool state: degraded / building / rebuilding / expanding / scrubbing / offline / failed / readonly, each in its own words, BEFORE a confirm code exists'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes'
+    test: "packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409 while the pool is busy \u2014 no X-Anas-Confirm-Code to bypass it with"
+    gt: GT-17
+  - id: RT03
+    kind: decision
+    label: 'job-queue exclusion, mutual in all three directions: a scrub, another repair or a parity rewrite already in flight on this pool'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409 while a scrub job for this pool is in flight, naming the job'
+    gt: none
+    next: [RT04]
+  - id: RT04
+    kind: decision
+    label: "node-wide: an md `check` running on ANY AHR band of ANY pool, including one a previous daemon or mdcheck's timer started"
+    code: 'packages/daemon/src/services/ahr-scrub.ts:runningAhrCheck'
+    test: "packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409s a REPAIR while md holds a queued check on a band \u2014 the job queue cannot see that check"
+    gt: none
+    next: [RT06]
+  - id: RT04a
+    kind: refusal
+    label: '409: an md check is running on <band>, started outside this job or by a previous daemon — neither the pool state nor the job queue can see it'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:runningAhrCheck'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409s a PARITY REWRITE on the same check, with the same sentence'
+    gt: none
+  - id: RT05
+    kind: refusal
+    label: "the pool's top-level mount is already held: said at the door rather than blocked behind a backup for hours"
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes'
+    test: "packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409 while a backup holds the pool's top-level mount \u2014 said at the door, not by the engine"
+    gt: none
+  - id: RT06
+    kind: decision
+    label: "confinement is not lexical only: `realpath -e`, the containment check re-run on the canonical form, then `findmnt -T` must name the pool's OWN LV"
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:repairRealPath'
+    test: "packages/daemon/src/routes/__tests__/ahr-repair.test.ts:400 for a symlink that resolves OUTSIDE the pool's tree, though the string is inside (D12)"
+    gt: none
+    next: [RT07]
+  - id: RT06a
+    kind: refusal
+    label: "a bind mount inside the tree is not the pool's to write: 400 naming the device it actually sits on"
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:repairMountSource'
+    test: "packages/daemon/src/routes/__tests__/ahr-repair.test.ts:400 for a path whose filesystem is NOT the pool's own LV"
+    gt: none
+  - id: RT06b
+    kind: refusal
+    label: 'a path outside the mountpoint — a finding inside `@snapshots` — is refused by name, never quietly skipped'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes'
+    test: "packages/daemon/src/routes/__tests__/ahr-repair.test.ts:400 for a path outside the pool's mountpoint \u2014 repair is the live @data tree only"
+    gt: none
+  - id: RT06c
+    kind: refusal
+    label: 'deleted since the scrub named it: 409, with nothing to repair'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:pathExists'
+    test: "packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409 for a path that no longer exists \u2014 deleted since the scrub named it"
+    gt: none
+  - id: RT06d
+    kind: action
+    label: "a §12 pool's findmnt SOURCE carries the fs root in brackets: `--nofsroot`, with the bracket stripped as a second line of defence (N2)"
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:repairFindmntArgs'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:202 when findmnt reports the btrfs fs root in brackets'
+    gt: none
+  - id: RT07
+    kind: decision
+    label: 'confirm gate: 409 + X-Anas-Confirm-Code, the signature carrying the exact selection so a code cannot be replayed against another'
+    code: 'packages/daemon/src/safety/gate.ts:confirmGate'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:a confirm code minted for one selection does not authorize another'
+    gt: none
+    next: [RT08]
+  - id: RT08
+    kind: action
+    label: 'the per-block cost stated CONCRETELY: two node-wide drop_caches, two ~N MiB read sweeps, and the stripe cache at its floor for the duration'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:perBlockSweepMiB'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:the confirm warnings state the per-block cost CONCRETELY (D13)'
+    gt: none
+    next: [RT09]
+  - id: RT09
+    kind: action
+    label: '202: the `ahr.repair` job is submitted, and the engine is driven strictly one block at a time'
+    code: 'packages/daemon/src/services/ahr-repair.ts:repairAhrFiles'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:runs strictly one block at a time, in the order they were asked for'
+    gt: none
+    next: [E00]
+  - id: RT10
+    kind: refusal
+    label: '`lun-session-active`: a repair path backing a LUN with a LIVE initiator session is 409ed BEFORE a confirm code exists. The block is proven and btrfs''s copy-on-write leaves the old extent alone, but the initiator holds its own cache and has no idea the bytes moved - log it out first'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:lunSessionRefusal'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409 lun-session-active BEFORE a confirm code exists'
+    gt: none
+    next: [RT11]
+  - id: RT11
+    kind: ui
+    label: 'Rewrite parity DISCLOSES instead of refusing: it reads every member of the band twice and writes parity, never a file, so nothing it writes is visible to a guest - but the operator is agreeing to hours of that under a live disk'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:rewriteLunWarnings'
+    test: 'packages/daemon/src/routes/__tests__/ahr-mutate.test.ts:names the LUN and its live sessions, and says the guest sees nothing this run writes'
+    gt: none
+
+  # ===========================================================================
+  #  The repair engine — the converged sequence (selfheal.5)
+  # ===========================================================================
+  - id: E00
+    kind: decision
+    label: "repairBlock: the file must resolve under the mountpoint (the engine's own lexical check, on top of the route's realpath + findmnt)"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:refuses a file outside the mountpoint before doing anything at all'
+    gt: none
+    next: [E01]
+  - id: E00a
+    kind: refusal
+    label: 'outside the mountpoint: SelfhealRunError, with nothing touched at all'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:refuses a file outside the mountpoint before doing anything at all'
+    gt: none
+  - id: E01
+    kind: decision
+    label: 'gates: EVERY band of the pool, because which band the block is on is not known until it has been pinned and resolved'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES while md is busy, reshaping, or the array is not writable'
+    gt: GT-17
+    next: [E02]
+  - id: E01a
+    kind: refusal
+    label: 'degraded, or a member missing: a reconstruction needs every OTHER member of the stripe'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES while the array is degraded'
+    gt: GT-17
+  - id: E01b
+    kind: refusal
+    label: 'busy (`sync_action` not idle), mid-reshape, or an `array_state` that bars a write — `clean` and `active` are both healthy (GT-17)'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES while md is busy, reshaping, or the array is not writable'
+    gt: GT-17
+  - id: E01c
+    kind: refusal
+    label: "a pvmove is in flight, or the pool's dm target is not linear: every byte offset this chain computes would be stale"
+    code: 'packages/daemon/src/services/selfheal-map.ts:parseDmTable'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES while a pvmove is moving the extents under the pool'
+    gt: none
+  - id: E01d
+    kind: refusal
+    label: 'a band whose geometry cannot be read, or a segment that is not on an md array at all: the whole pool is refused rather than guessed at'
+    code: 'packages/daemon/src/services/selfheal-map.ts:resolveContext'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES a pool whose segment is not on an md array at all'
+    gt: none
+  - id: E01e
+    kind: refusal
+    label: "the pool's top-level mount is already held — the engine refuses rather than queueing behind a backup with md's knobs turned aside"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:gateRefusal'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES when the pool's top-level mount is already held (a backup is in flight)"
+    gt: none
+  - id: E02
+    kind: action
+    label: "pin: sweep this engine's OWN `anas-selfheal-*` prefix first, then take a read-only snapshot — the same AHR snapshot verbs a backup uses"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:sweepSelfhealPins'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps a crashed earlier run's snapshot before taking its own"
+    gt: none
+    next: [E02a, E02b, E02c]
+  - id: E02a
+    kind: action
+    label: '§12 pool: createAhrSnapshot into `@snapshots/anas-selfheal-<ts>`, read cold through withTopLevelMount'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:takePin'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:snapshots @data into @snapshots and cold-reads through the top-level mount'
+    gt: none
+    next: [E03]
+  - id: E02b
+    kind: action
+    label: a file inside a NESTED subvolume is pinned by snapshotting THAT subvolume — a read-only snapshot does not recurse
+    code: 'packages/daemon/src/services/selfheal-repair.ts:nestedSubvolumeOf'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:pins the NESTED subvolume a file lives in, not @data (a ro snapshot does not recurse)'
+    gt: none
+    next: [E03]
+  - id: E02c
+    kind: action
+    label: "a flat pool (and the suite's loop rigs) has no `@snapshots`: the pin is an in-place read-only snapshot inside the mountpoint"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:takePin'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:falls back to an in-place snapshot for a FLAT pool \u2014 which the suite's rigs are"
+    gt: none
+    next: [E03]
+  - id: E03
+    kind: decision
+    label: "resolve, AFTER the pin: file block → EXTENT_DATA → the COVERING chunk's own delta → the dm linear segment → member and offset from md geometry read live"
+    code: 'packages/daemon/src/services/selfheal-map.ts:resolveBlock'
+    test: "packages/daemon/src/services/__tests__/selfheal-map.test.ts:derives the block's repair unit and its logical byte from the tree, not from filefrag"
+    gt: GT-2
+    next: [E04]
+  - id: E03a
+    kind: decision
+    label: 'a SelfhealMapError anywhere in the chain carries the REASON the chain stopped (`inline-extent`, `hole`, `owner-scan-truncated`, `band-unreadable`, `unresolvable`): the block was NOT examined, and the mapping-abort sentence asserts the opposite'
+    code: 'packages/daemon/src/services/selfheal-map.ts:SelfhealMapError'
+    test: 'packages/daemon/src/services/__tests__/selfheal-map.test.ts:every map failure carries its reason (F3)'
+    gt: none
+    next: [E03b, E03c]
+  - id: E03b
+    kind: refusal
+    label: 'an INLINE extent or a HOLE: there is no on-disk location at all. A hole is reachable on any ANAS-created LUN, every image of which is created sparse with ftruncate, and says nothing whatever about the LUN''s data'
+    code: 'packages/daemon/src/services/selfheal-map.ts:resolveBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:a HOLE: not-examined / hole'
+    gt: none
+    next: [J47]
+  - id: E03c
+    kind: refusal
+    label: 'a truncated owner scan, a band whose geometry went unreadable between the gates and the resolve, or any other chain that cannot be followed'
+    code: 'packages/daemon/src/services/selfheal-map.ts:locateLogicalIn'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:a band whose geometry goes unreadable after the gates: not-examined / band-unreadable'
+    gt: none
+    next: [J47]
+  - id: E04
+    kind: decision
+    label: 'reverify: re-read the bytes AT the computed member location and require they FAIL the currently stored csum'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:reverify'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:ABORTS when the bytes at the computed location still pass their csum'
+    gt: GT-11
+    next: [E05a]
+  - id: E04a
+    kind: refusal
+    label: 'no stored csum for this logical byte: there is nothing to arbitrate a reconstruction against'
+    code: 'packages/daemon/src/services/selfheal-csum.ts:findStoredCsumEntry'
+    test: 'packages/daemon/src/services/__tests__/selfheal-csum.test.ts:reports NO stored csum rather than the nearest one (NOCOW / prealloc)'
+    gt: none
+    next: [J40]
+  - id: E04b
+    kind: decision
+    label: "the csum leaf must pass its OWN node checksum (crc32c of bytes 32…nodesize, and its own bytenr): a failed copy 0 falls back to the DUP chunk's second copy"
+    code: 'packages/daemon/src/services/selfheal-csum.ts:readStoredCsum'
+    test: "packages/daemon/src/services/__tests__/selfheal-csum.test.ts:falls back to the DUP chunk's SECOND copy when the first has rotted"
+    gt: GT-20
+    next: [E05a]
+  - id: E04c
+    kind: refusal
+    label: 'both DUP copies fail: CsumUnreadableError with reason code `csum-unreadable` — nothing is known about the data block, and the words "restore from backup" are deliberately absent'
+    code: 'packages/daemon/src/services/selfheal-csum.ts:CsumUnreadableError'
+    test: 'packages/daemon/src/services/__tests__/selfheal-csum.test.ts:REFUSES a csum leaf that fails its own node checksum, on both DUP copies'
+    gt: GT-20
+    next: [J42]
+  - id: E04d
+    kind: decision
+    label: 'the bytes at the mapped location still PASS their stored csum: `mapping-abort`, "not corrupt here", nothing written — this is what makes a wrong mapping harmless'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:reverify'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:ABORTS when the bytes at the computed location still pass their csum'
+    gt: GT-11
+    next: [J41]
+  - id: E04e
+    kind: refusal
+    label: 'more than one on-disk sector of one repair unit fails its csum: this cut reconstructs one sector at a time'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:reverify'
+    test: none
+    gt: GT-9
+    next: [J40]
+  - id: E04f
+    kind: decision
+    label: 'RAID1 with EVERY leg failing the stored csum: the bounded check is run BEFORE the verdict, because a mirror check compares the legs with each other - md''s own answer to "do these legs agree?"'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:every mirror leg fails the csum (F4)'
+    gt: GT-16
+    next: [E04f1, E04f2]
+  - id: E04f1
+    kind: decision
+    label: 'mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD'
+    gt: GT-16
+    next: [J43]
+  - id: E04f2
+    kind: refusal
+    label: 'mismatch_cnt > 0 AND the direct read of the legs shows they differ: the legs disagree with each other and neither matches the stored csum - `unrepairable`, and here a restore IS the only action left'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 — the legs disagree and neither matches: UNREPAIRABLE'
+    gt: GT-16
+    next: [J40]
+  - id: E04f3
+    kind: refusal
+    label: "mismatch_cnt = 0 while a DIRECT read of the legs shows they DIFFER: md's cached view of this stripe was stale (GT-23), so this is not the mirror's `above-md` at all - `unrepairable` with staleCache recorded, and the restore stands"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:directParityConsistent'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 over legs that DIFFER: md's cached view was stale, never above-md (GT-23)"
+    gt: GT-23
+    next: [J40]
+  - id: E04f4
+    kind: refusal
+    label: "mismatch_cnt > 0 while the legs hold the SAME bytes: md and the direct read disagree about this stripe - `unrepairable`, nothing written, and NEVER `above-md` (which md's own count denies). No restore advice: nothing here proves the file unrecoverable"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:parityAgreement'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 over legs that hold the SAME bytes: md and the direct read disagree (GT-23)'
+    gt: GT-23
+  - id: E04g
+    kind: action
+    label: 'RAID1: each leg read at ITS OWN data offset, a torn read retried 3×; the failing leg is named as the member and the passing legs become the candidates'
+    code: 'packages/daemon/src/services/selfheal-map.ts:memberOffsetOn'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reports the FAILING leg as the member, at that leg's own offset"
+    gt: GT-16
+    next: [E05a]
+  - id: E05a
+    kind: action
+    label: 'evictStripeCache: shrink `stripe_cache_size` to its floor of 17, sweep ±200 stripes while it is small, restore — without it a check over a recently touched stripe reads the CACHE and reports 0 over junk. On kernel 7.0.14-17 it no longer reaches a stripe written MOMENTS ago (GT-23), which is why the verdict no longer rests on its number alone'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:memberDataSectors'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sweeps the stripes around a target near the END of the array'
+    gt: GT-14
+    next: [E05a2]
+  - id: E05a2
+    kind: action
+    label: "directParityConsistent: every member's row read O_DIRECT off the MEMBER devices at its own data offset and the parity group recomputed - XOR of the data rows against P, the Q syndrome against Q on RAID6, the legs against each other on RAID1. md's cache takes no part in it, which is the whole point (GT-23)"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:directParityConsistent'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when P and Q both agree with the bad data'
+    gt: GT-23
+    next: [E05]
+  - id: E05
+    kind: decision
+    label: 'precheck: a bounded md `check` over the TARGET stripe and its `mismatch_cnt`, weighed against the direct member-row computation - parityAgreement names the pair, and the verdict needs both'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:parityAgreement'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:names each of the four combinations'
+    gt: GT-5
+    next: [E06]
+  - id: E05b
+    kind: decision
+    label: 'mismatch_cnt = 0 AND the direct member read says the parity group agrees with itself, while the block fails its stored csum: `above-md` — parity agrees with the bad data, which implicates something other than the disks. Nothing written.'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data'
+    gt: GT-6
+    next: [J43]
+  - id: E05e
+    kind: refusal
+    label: "md counts the stripe while the direct member read says the row agrees with itself: `unrepairable`, \"md and the direct read disagree about this stripe; nothing written\" - and NEVER `above-md`, which md's own count denies. No restore advice: nothing here proves the file unrecoverable"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:parityAgreement'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES when md counts the stripe and the member rows agree — never above-md'
+    gt: GT-23
+  - id: E05f
+    kind: action
+    label: "mismatch_cnt = 0 while the direct member read faults the row: md answered from its stripe cache (GT-23). The rot is BELOW md after all - `staleCache: true` is recorded, the step says so in the operator's words, and the repair goes on to the reconstruction"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:directParityConsistent'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REPAIRS it anyway, and records that md's cached view was stale"
+    gt: GT-23
+    next: [E06]
+  - id: E05c
+    kind: refusal
+    label: 'md took an operation of its own BEFORE the write: ForeignSyncOpError is raised INSTEAD of writing anything, and every knob is left as md set it'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:ForeignSyncOpError'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:stops the bounded check itself rather than narrowing a recovery's window"
+    gt: GT-19
+    next: [J44]
+  - id: E06
+    kind: action
+    label: "`rmw_level = 0` on the TARGET's band for the write window — at the default, a correct block written through md updates parity against the JUNK (GT-7)"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:sets rmw_level to 0 BEFORE the write \u2014 the GT-7 poison is the default"
+    gt: GT-7
+    next: [E07]
+  - id: E07
+    kind: decision
+    label: "reconstructionPlan: `degraded` re-read and each role's `rd<n>/state` consulted, so a member md KICKED since the gates is never read for its stale bytes"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:keeps the syndrome that does not need the kicked member, and only that one'
+    gt: none
+    next: [E07r5]
+  - id: E07a
+    kind: refusal
+    label: 'RAID5 with a sibling gone, RAID6 with two gone or a second data member gone, RAID1 with no leg left: nothing can be reconstructed, nothing was written'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:reconstructionPlan'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES a RAID5 reconstruction once a sibling is gone'
+    gt: none
+    next: [J40]
+  - id: E07r5
+    kind: action
+    label: 'RAID5: the one candidate is the XOR of the same stripe row on every other member'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:reconstruct'
+    test: 'suite:2-neg'
+    gt: GT-8
+    next: [E08]
+  - id: E07r6
+    kind: action
+    label: "RAID6: the P-based XOR first, then the Q syndrome solve (GF(2^8), poly 0x11D, g^d over md's stripe order) which never consults P"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:reconstructFromQ'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:solves the Q syndrome for the one missing data block'
+    gt: GT-15
+    next: [E08]
+  - id: E08
+    kind: decision
+    label: 'arbitrate: crc32c of each candidate against the stored csum, best first — the btrfs checksum is what decides, never md'
+    code: 'packages/daemon/src/services/selfheal-csum.ts:crc32c'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reconstructs it, arbitrates against the stored csum and writes it back'
+    gt: GT-11
+    next: [E09]
+  - id: E08a
+    kind: refusal
+    label: 'no reconstruction matches: more than one block of this stripe is damaged, which is the point of arbitrating. Restore from backup.'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:is UNREPAIRABLE when no reconstruction matches the stored csum'
+    gt: GT-8
+    next: [J40]
+  - id: E08b
+    kind: residual
+    label: 'STATED RESIDUAL — arbitration is a 32-bit equality: a crc32c COLLISION on a reconstructed candidate is accepted as the original and written through md, and nothing downstream can tell the difference'
+    code: none
+    test: none
+    gt: GT-11
+  - id: E09
+    kind: decision
+    label: 'read-back guard: the md offset about to be written must hold the bytes read from the member (on RAID1, the bytes of SOME leg — md serves a mirror read from either)'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:readBackGuard'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:passes when md served the HEALTHY leg (R5: not a failed mapping)'
+    gt: none
+    next: [E10]
+  - id: E09a
+    kind: refusal
+    label: 'guard failed: the mapping and the array disagree, so NOTHING about this file has been established - `not-examined` with reason code `unresolvable`, never the bucket that advises a restore'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:readBackGuard'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES: the md offset is not where these member bytes live'
+    gt: none
+    next: [J47]
+  - id: E10
+    kind: decision
+    label: 'pre-write re-check at the LAST instant: `degraded`, `sync_action` and `reshape_position` re-read, because a bounded check over a 20 TB band takes minutes'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write'
+    gt: GT-19
+    next: [E11]
+  - id: E10a
+    kind: refusal
+    label: '"array state changed mid-repair: <condition>, nothing written"'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:writes NOTHING when a recovery starts between the precheck and the write'
+    gt: GT-19
+    next: [J40]
+  - id: E11
+    kind: action
+    label: 'write: ONE 4 KiB block, O_DIRECT + fsync, THROUGH md — and only after the reconstruction matched the checksum btrfs stored for it'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'suite:7-member'
+    gt: GT-8
+    action: md-block-write
+    next: [E12]
+  - id: E12
+    kind: decision
+    label: 'postcheck: the same evicted bounded check must now read `mismatch_cnt = 0` AND the same direct member-row computation must agree - the stripe was written through md moments ago, which is exactly the state its check answers from the cache in (GT-23)'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:boundedWindowCheck'
+    test: 'suite:7-bcheck'
+    gt: GT-8
+    next: [E13]
+  - id: E12e
+    kind: decision
+    label: "the post-check reads `mismatch_cnt = 0` over a row the DIRECT member read still faults: md's stale view of our OWN write, never a clean parity group. `staleCache: true` is recorded and the block takes the same cold proof a counted residual takes; the advice is the re-scrub that produces a count Rewrite parity's evidence gate will accept"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:directParityConsistent'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:is not a clean pass: the block is proven cold and the residual is reported'
+    gt: GT-23
+    next: [E12a]
+  - id: E12a
+    kind: decision
+    label: 'postcheck still counts mismatches over a block that was WRITTEN: the block is re-read COLD and arbitrated against its stored csum again, because a non-zero post-check AFTER a write is a different verdict from one before it'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:coldVerify'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:RAID6 with the target block AND Q rotten (F2)'
+    gt: GT-12
+    next: [E12c, E12d]
+  - id: E12c
+    kind: action
+    label: 'the block PASSES cold: outcome `repaired`, carrying a `parityResidual` {array, band, bandIndex, mismatchCnt} and the sentence "the block is repaired; the band still has a parity/Q mismatch - run Rewrite parity". Never restore advice over a block just proven correct'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:parityResidualOf'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:reports REPAIRED with a parity residual, never a restore'
+    gt: GT-12
+    next: [J54]
+  - id: E12d
+    kind: refusal
+    label: 'the block FAILS cold too: `unrepairable` - the parity group is not consistent AND the block cannot be proven. The one shape here where a restore is the right action'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:still fails UNREPAIRABLE when the written block does not read back clean either'
+    gt: GT-12
+    next: [J40]
+  - id: E12b
+    kind: decision
+    label: 'a ForeignSyncOpError raised from the POST-check is a different fact from one raised before the write: a `written` flag set at the write step decides which sentence the outcome carries'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:ForeignSyncOpError'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:a foreign md op AFTER the write (F5)'
+    gt: GT-19
+    next: [J53]
+  - id: J53
+    kind: action
+    label: '"the block was written and matches its checksum; the post-check could not run (md started <op>) - re-scrub to confirm parity", reported `repaired` with a `postcheckSkipped` note. Never "nothing written" after a write'
+    code: 'packages/shared/src/schemas/selfheal.ts:postcheckSkipped'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:says the block WAS written and the post-check could not run'
+    gt: GT-19
+    next: [J50]
+  - id: E13
+    kind: decision
+    label: cold read through the FRESH pin snapshot (drop_caches first; the whole logical extent when compressed) — a warm page of the live file answers from memory and hides everything
+    code: 'packages/daemon/src/services/selfheal-repair.ts:coldRead'
+    test: 'suite:3-cold'
+    gt: GT-9
+    next: [E14]
+  - id: E13a
+    kind: decision
+    label: 'the top-level mount is held: the read is SKIPPED after a bounded 60 s wait and says so — the block is still `repaired`, because the write and the post-check already happened'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:coldRead'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:does not block behind a backup for the final cold read \u2014 it says the read was skipped"
+    gt: none
+    next: [E14]
+  - id: E13b
+    kind: refusal
+    label: the repaired region still reads back with an error through the snapshot
+    code: 'packages/daemon/src/services/selfheal-repair.ts:coldRead'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:still fails UNREPAIRABLE when the written block does not read back clean either'
+    gt: GT-9
+    next: [J40]
+  - id: E14
+    kind: action
+    label: 'cleanup in `finally`, PER BAND and only the bands this run touched: rmw_level, then the sync window under the ownership rule, then stripe_cache_size, then destroy the pin'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:restoreSyncKnobs'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:restores rmw_level on the band it turned it down on \u2014 and leaves the other band alone"
+    gt: GT-13
+    next: [E15]
+  - id: E15
+    kind: decision
+    label: 'outcome `repaired`, with the mapping, the steps and the stored csum as its audit trail'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:produces an outcome the shared schema accepts'
+    gt: GT-8
+    next: [J50]
+
+  # ===========================================================================
+  #  The repair JOB — buckets, advice, one notification
+  # ===========================================================================
+  - id: J31
+    kind: decision
+    label: 'the engine THREW rather than reaching a verdict: that block is `unrepairable` with the error as its reason, and the remaining blocks still get their attempt'
+    code: 'packages/daemon/src/services/ahr-repair.ts:repairAhrFiles'
+    test: "packages/daemon/src/services/__tests__/ahr-repair.test.ts:a block the engine THROWS on is unrepairable with the error text \u2014 the job carries on"
+    gt: none
+    next: [J40]
+  - id: J40
+    kind: refusal
+    label: 'the `unrepairable` bucket, advised per file: "restore this file from backup"'
+    code: 'packages/daemon/src/services/ahr-repair.ts:RESTORE_FILE_SENTENCE'
+    test: "packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words"
+    gt: none
+    action: restore-from-backup-advice
+    next: [J50]
+  - id: J41
+    kind: refusal
+    label: 'the `mapping-abort` bucket: "nothing was written and nothing needs a restore — the bytes there still pass their stored checksum"'
+    code: 'packages/daemon/src/services/ahr-repair.ts:MAPPING_ABORT_SENTENCE'
+    test: "packages/daemon/src/services/__tests__/ahr-repair.test.ts:a mapping-abort is never told to restore from backup \u2014 it means the block is FINE (selfheal.7 F2, R9)"
+    gt: none
+    action: not-corrupt-here-advice
+    next: [J50]
+  - id: J42
+    kind: refusal
+    label: '`csum-unreadable`: re-scrub after the metadata is repaired (a btrfs scrub repairs metadata copies), and explicitly do NOT restore'
+    code: 'packages/daemon/src/services/ahr-repair.ts:CSUM_UNREADABLE_SENTENCE'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:a csum-unreadable unrepairable block is told to re-scrub, not restore (D10)'
+    gt: GT-20
+    next: [J50]
+  - id: J43
+    kind: decision
+    label: 'the `above-md` bucket: "parity already agreed with the bad data — this implicates something other than the disks (memory, controller, software)", which stays an implication'
+    code: 'packages/daemon/src/services/ahr-repair.ts:ABOVE_MD_SENTENCE'
+    test: "packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words"
+    gt: GT-6
+    next: [J50]
+  - id: J44
+    kind: refusal
+    label: 'ForeignSyncOpError at the job level: `unrepairable`, "array state changed mid-repair", with the operation named'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:ForeignSyncOpError'
+    test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:stops the bounded check itself rather than narrowing a recovery's window"
+    gt: GT-19
+    next: [J40]
+  - id: J45
+    kind: refusal
+    label: "a LUN-backed file: restore the LUN image from a PBS backup or the guest's own, never \"restore this file\""
+    code: 'packages/daemon/src/services/ahr-repair.ts:lunRestoreSentence'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:a LUN-backed unrepairable file is told to restore the LUN, not the file (D10)'
+    gt: none
+    action: restore-from-backup-advice
+    next: [J50]
+  - id: J46
+    kind: refusal
+    label: 'a LUN image whose unrepairable blocks are ALL `csum-unreadable` gets NO restore verb at all: the LUN identity rides the csum-unreadable sentence (N5)'
+    code: 'packages/daemon/src/services/ahr-repair.ts:csumUnreadableLunSentence'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:a LUN image whose unrepairable blocks are ALL csum-unreadable is NOT told to restore (N5)'
+    gt: GT-20
+    next: [J50]
+  - id: J50
+    kind: action
+    label: 'AhrRepairResultSchema.parse: repaired / unrepairable / aboveMd / mappingAbort / notExamined, always summing to the blocks attempted'
+    code: 'packages/daemon/src/services/ahr-repair.ts:repairAhrFiles'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:the notification names all five counts, and they add up (review R9, seventh pass F3)'
+    gt: none
+    next: [J51]
+  - id: J47
+    kind: refusal
+    label: 'the `not-examined` bucket: "this block could not be examined: <reason>; nothing was written; re-scrub after <what would change>". Its own count, its own paragraph, and never the mapping-abort sentence, which asserts the bytes passed their checksum'
+    code: 'packages/daemon/src/services/ahr-repair.ts:notExaminedSentence'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:a not-examined block never carries restore advice, and keeps the run a warning'
+    gt: none
+    next: [J50]
+  - id: J54
+    kind: action
+    label: 'AhrRepairResult.parityResiduals: one `parityMismatches`-shaped row per band, carrying the highest count seen - the shape the Scrubs indicator and Rewrite parity already read, so a residual this run measured is actionable without a fresh multi-hour scrub'
+    code: 'packages/daemon/src/services/ahr-repair.ts:repairAhrFiles'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:rolls the residual up into a parityMismatches-shaped row, with the band level'
+    gt: none
+    next: [J50, U02r]
+  - id: U02r
+    kind: ui
+    label: 'the Scrubs parity indicator reads the NEWER of the pool''s last completed scrub and its last completed repair, so the residual opens the same door a scrub''s row does'
+    code: 'packages/pve-integration/src/69-scrubs.js:latestParityByPool'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:the Scrubs row shows the parity indicator from the REPAIR job (F2)'
+    gt: none
+  - id: J51
+    kind: notification
+    label: 'ONE PVE notification: `info` when every block repaired, `warning` otherwise, with the per-file advice and the file list capped at 20'
+    code: 'packages/daemon/src/services/ahr-repair.ts:repairBody'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:everything repaired notifies at info and says so'
+    gt: none
+    next: [J52]
+  - id: J52
+    kind: ui
+    label: 'the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts'
+    code: 'packages/pve-integration/src/69-scrubs.js:showRepairResult'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from'
+    gt: none
+
+  # ===========================================================================
+  #  Rewrite parity (selfheal.10) — the ONE place ANAS runs `mdadm --action=repair`
+  # ===========================================================================
+  - id: P00
+    kind: decision
+    label: 'POST /v1/ahr/:name/parity-rewrite — the body names ONE band, because md repairs a whole array at a time'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteArray'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the body names ONE band, as a number'
+    gt: GT-18
+    next: [P01]
+  - id: P01
+    kind: decision
+    label: "the proof, from the pool's LAST COMPLETED scrub: mismatches counted on THIS band (matched on `bandIndex`, never a regex over the label) AND no data finding anywhere on the pool"
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteEvidence'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a clean scrub with a mismatch on THIS band is the proof'
+    gt: GT-18
+    next: [P02, P01r]
+  - id: P01r
+    kind: decision
+    label: 'the proof may also come from the pool''s last completed REPAIR, whichever of the two is newer: a repair that wrote a block, proved it cold and saw md still counting the stripe has MEASURED the residual. A run that left blocks unrepaired, above md or unexamined is `data-findings-present` instead'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:repairParityResiduals'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a repair job as the proof (F2)'
+    gt: none
+    next: [P02]
+  - id: P01a
+    kind: refusal
+    label: 'no completed scrub on record — the record is in memory, so a daemon restart clears it'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteEvidence'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:no completed scrub is no proof'
+    gt: none
+  - id: P01b
+    kind: refusal
+    label: '`data-findings-present`: repair those files first, because rewriting parity now would recompute it from the corrupt data and make the rot permanent'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteEvidence'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a scrub that found data corruption refuses with its own code'
+    gt: GT-18
+  - id: P01c
+    kind: refusal
+    label: 'a result with no per-band counts at all (an older daemon): refuse rather than guess'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:scrubParityMismatches'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a scrub result with no per-band counts at all refuses rather than guessing'
+    gt: none
+  - id: P02
+    kind: decision
+    label: 'pool state, the mutual job exclusion, and the node-wide md check — all three before a confirm code is minted'
+    code: 'packages/daemon/src/routes/ahr-mutate.ts:ahrMutationRoutes'
+    test: 'packages/daemon/src/routes/__tests__/ahr-repair.test.ts:409s a PARITY REWRITE on the same check, with the same sentence'
+    gt: none
+    next: [P03]
+  - id: P02a
+    kind: refusal
+    label: '`job-active`: a parity rewrite reads every member of a band twice and needs the array to itself'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:rewriteBandParity'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:refuses while another job is in flight on the pool'
+    gt: none
+  - id: P03
+    kind: decision
+    label: "the BAND's own state, read from md rather than the pool rollup — a pool can read healthy while THIS array is mid-check"
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteArrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:refuses a band that is not idle, and one whose sync window is still bounded'
+    gt: GT-17
+    next: [P04]
+  - id: P03a
+    kind: refusal
+    label: "`not-a-parity-band`: a RAID1 mirror has no parity to recompute, and md's repair copies the first in-sync leg over the others without looking at which is right — refused FIRST, and for good"
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:mirrorBandRefusal'
+    test: "packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:REFUSES a RAID1 mirror band outright \u2014 md repair there is a coin flip on the good copy (N1)"
+    gt: GT-16
+  - id: P03b
+    kind: refusal
+    label: '`array-busy`: degraded, busy, mid-reshape, or an unwritable array_state — the same sentence the block repair refuses with'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:refuses a degraded band'
+    gt: GT-17
+  - id: P03c
+    kind: refusal
+    label: 'the sync window is still bounded from an interrupted repair: a whole-band repair under it would cover that sliver and report a count that means nothing (GT-13)'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteArrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:refuses a band that is not idle, and one whose sync window is still bounded'
+    gt: GT-13
+  - id: P04
+    kind: action
+    label: "confirm gate: what parity is recomputed FROM, the fresh scrub that aborts the run, the NOCOW blind spot, and a duration that INCLUDES phase 1's whole-pool scrub"
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:parityRewriteWarnings'
+    test: "packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:the estimate INCLUDES phase 1's full-pool checksum scrub (N8)"
+    gt: none
+    next: [P05]
+  - id: P05
+    kind: action
+    label: 'phase 1/3: a FRESH btrfs checksum scrub of the WHOLE pool — the evidence scrub can be hours old, and this is what makes "the data is intact" a statement about now'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:the fresh btrfs scrub finding anything aborts before md is touched'
+    gt: GT-18
+    next: [P05a, P06]
+  - id: P05a
+    kind: refusal
+    label: "`data-corruption-found`: any finding aborts before md is touched, with the scrub's summary and its attributed files in the result"
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:rewriteBandParity'
+    test: 'suite:8-neg'
+    gt: GT-18
+    next: [P12]
+  - id: P06
+    kind: decision
+    label: "every precondition RE-TAKEN immediately before the md write — the evidence, the job exclusion, the band's state and the pre-write re-check"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:preWriteRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:re-checks the proof AFTER the scrub: evidence that went stale stops the write'
+    gt: GT-19
+    next: [P07]
+  - id: P07
+    kind: action
+    label: 'phase 2/3: `mdadm --action=repair` over the WHOLE band, with `sync_max` at its default so no window is narrowed and no `idle` is ever written'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:rewriteBandParity'
+    test: 'suite:8-rewrite'
+    gt: GT-18
+    action: md-action-repair
+    next: [P08]
+  - id: P08
+    kind: decision
+    label: 'waitForOwnSyncOp: md running anything but the op this run issued ends the run with every knob as md left it'
+    code: 'packages/daemon/src/services/selfheal-syncop.ts:ownsSyncOp'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a foreign md operation replacing the repair aborts the run with every knob untouched'
+    gt: GT-19
+    next: [P09]
+  - id: P08a
+    kind: refusal
+    label: "`foreign-sync-op`: md replaced this run's operation, so the rewrite is not proven and no knob was touched"
+    code: 'packages/daemon/src/services/selfheal-syncop.ts:foreignOpNote'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a foreign operation replacing the VERIFYING CHECK leaves the rewrite unproven'
+    gt: GT-19
+    next: [P12]
+  - id: P09
+    kind: action
+    label: 'phase 3/3: `mdadm --action=check` over the whole band — a repair that RAN is not a repair that WORKED, and this is the only evidence md offers'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:rewriteBandParity'
+    test: 'suite:8-clean'
+    gt: GT-14
+    next: [P10]
+  - id: P10
+    kind: decision
+    label: '`mismatch_cnt` after the verifying check'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:mismatchCount'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a check that still counts mismatches is reported as still-mismatched, never as done'
+    gt: GT-18
+    next: [P11, P11a, P11b]
+  - id: P11
+    kind: decision
+    label: '0 → `rewritten`: the parity row is the XOR of the data rows again'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:rewriteBandParity'
+    test: 'suite:8-xor'
+    gt: GT-18
+    next: [P12]
+  - id: P11a
+    kind: refusal
+    label: '> 0 → `still-mismatched`: parity was rewritten and the band did not come back clean — scrub the pool and look at its disks before rewriting again'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:rewriteBandParity'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:a check that still counts mismatches is reported as still-mismatched, never as done'
+    gt: GT-18
+    next: [P12]
+  - id: P11b
+    kind: refusal
+    label: 'unreadable → `still-mismatched`, said as unknown and never as 0'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:mismatchCount'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: an unknown after-count is said as unknown, never as 0'
+    gt: none
+    next: [P12]
+  - id: P12
+    kind: notification
+    label: 'ONE notification with the before/after counts: `info` on rewritten, `warning` on anything else'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:rewriteBandParity'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: the before and after counts are both said'
+    gt: none
+    next: [P13]
+  - id: P13
+    kind: ui
+    label: "the run's own numbers land in the same window; `still-mismatched` is rendered \"not proven good\", never as a finish"
+    code: 'packages/pve-integration/src/69-scrubs.js:showParityResult'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:rewrite: a still-mismatched run refuses to read as healthy'
+    gt: none
+
+  # ===========================================================================
+  #  Schedules, the timer and the runner (selfheal.4)
+  # ===========================================================================
+  - id: T00
+    kind: decision
+    label: "PUT /v1/scrub/ahr/:pool {enabled, cadence} — a surgical edit of the ONE node-level timer's embedded schedule"
+    code: 'packages/daemon/src/routes/scrub.ts:scrubRoutes'
+    test: 'packages/daemon/src/routes/__tests__/scrub.test.ts:PUT /scrub/ahr/ahr0 {enabled:true} writes the units and takes mdcheck over (202 job)'
+    gt: none
+    next: [T02]
+  - id: T01
+    kind: decision
+    label: "a unit on ANAS's fixed names WITHOUT the `X-ANAS-Schedule=` marker is someone else's: never rewritten, never deleted"
+    code: 'packages/daemon/src/services/scrub-schedule-units.ts:scrubUnitsAreForeign'
+    test: 'packages/daemon/src/services/__tests__/scrub-schedule-units.test.ts:a SERVICE-only foreign unit is refused even with no timer present (review F13)'
+    gt: none
+    next: [T01a]
+  - id: T01a
+    kind: refusal
+    label: '409 `foreign-unit`, nothing changed — and a marker-less TIMER beside a marked service is the legacy pair, adopted rather than refused for ever'
+    code: 'packages/daemon/src/services/scrub-schedule-units.ts:ForeignUnitError'
+    test: "packages/daemon/src/routes/__tests__/scrub.test.ts:PUT /scrub/ahr/:pool on a FOREIGN anas-scrub unit \u2192 409 reason foreign-unit, no job (review R10)"
+    gt: none
+  - id: T02
+    kind: action
+    label: "enable: add the pool, render both units, enable the timer, and DISABLE mdadm's mdcheck timers — ANAS owns md checks on this node, never double-scheduled"
+    code: 'packages/daemon/src/services/scrub-schedules.ts:setAhrScrubEnabled'
+    test: 'packages/daemon/src/services/__tests__/scrub-schedules.test.ts:enabling the FIRST pool creates the units (monthly default) and DISABLES mdcheck'
+    gt: GT-21
+    next: [T03]
+  - id: T02a
+    kind: action
+    label: 'disabling a pool that was never enabled is a NO-OP: mdcheck is handed back only when ANAS actually took it (N4)'
+    code: 'packages/daemon/src/services/scrub-schedules.ts:setAhrScrubEnabled'
+    test: "packages/daemon/src/services/__tests__/scrub-schedules.test.ts:disabling a pool that was never enabled changes NOTHING \u2014 and never turns mdcheck on (N4)"
+    gt: none
+  - id: T02b
+    kind: action
+    label: 'the LAST pool off: both units removed, the Persistent stamp cleared, and mdcheck restored — the node returns to stock'
+    code: 'packages/daemon/src/services/scrub-schedule-units.ts:removeScrubUnits'
+    test: 'packages/daemon/src/services/__tests__/scrub-schedules.test.ts:disabling the LAST pool removes the units and RESTORES mdcheck (ruling 2026-09-14)'
+    gt: GT-21
+    next: [T13]
+  - id: T03
+    kind: action
+    label: 'the node-level timer: `OnCalendar` first Sunday (monthly) or first Sunday of the quarter, `Persistent=true`, the schedule JSON in the marker comment'
+    code: 'packages/daemon/src/services/scrub-schedule-units.ts:renderScrubTimerUnit'
+    test: 'packages/daemon/src/services/__tests__/scrub-schedule-units.test.ts:the timer unit carries the OnCalendar, Persistent=true and the install target'
+    gt: none
+    next: [T05]
+  - id: T04
+    kind: decision
+    label: 'a MISSED occurrence plus a leftover Persistent stamp fires the whole two-phase scrub the moment the timer is re-enabled — so removal clears the stamp, and the enable confirm warns anyway'
+    code: 'packages/daemon/src/services/scrub-schedule-units.ts:scrubStampPath'
+    test: "packages/daemon/src/services/__tests__/scrub-schedule-units.test.ts:removeScrubUnits clears the timer's Persistent stamp (review R10)"
+    gt: none
+    next: [T05]
+  - id: T05
+    kind: action
+    label: 'the runner POSTs /v1/ahr/<pool>/scrub per pool IN SEQUENCE, each job polled to a terminal state before the next — pools on one node share spindles'
+    code: 'packages/daemon/src/scrub-task.ts:runScrubSchedule'
+    test: "packages/daemon/src/__tests__/scrub-task.test.ts:scrubs pools IN SEQUENCE \u2014 the second POST only after the first job is terminal"
+    gt: none
+    next: [T13]
+  - id: T06
+    kind: decision
+    label: a pool the daemon 404s on (destroyed since the list was written) is skipped with a journald line; the sequence continues
+    code: 'packages/daemon/src/scrub-task.ts:scrubPool'
+    test: 'packages/daemon/src/__tests__/scrub-task.test.ts:a pool that no longer exists (404) is skipped with a journald line, sequence continues'
+    gt: none
+    next: [T13]
+  - id: T07
+    kind: decision
+    label: 'the job VANISHES (the daemon restarted and its in-memory list went with it): three CONSECUTIVE 404s end the wait, rather than blocking pools 2..n for a day'
+    code: 'packages/daemon/src/scrub-task.ts:pollScrubJob'
+    test: 'packages/daemon/src/__tests__/scrub-task.test.ts:a VANISHED job (404) ends the wait after 3 confirmations, with a journald line (review F9)'
+    gt: none
+    next: [T13]
+  - id: T08
+    kind: decision
+    label: 'a daemon OUTAGE keeps its own bounded retry: a refused connection is not evidence the job is gone, and a live job is polled with no cap at all'
+    code: 'packages/daemon/src/scrub-task.ts:pollScrubJob'
+    test: "packages/daemon/src/__tests__/scrub-task.test.ts:a job still running past the old 24h backstop keeps being polled \u2014 no cap on a live job"
+    gt: none
+    next: [T13]
+  - id: T09
+    kind: action
+    label: 'uninstall.sh: disable and remove both units, clear the stamp, and re-enable mdcheck — restoring the DISTRO DEFAULT, not guessing at prior state'
+    code: 'packaging/uninstall.sh:remove_schedule_units'
+    test: 'packaging/test/uninstall-schedules.test.sh:both mdcheck timers re-enabled, --now'
+    gt: GT-21
+    next: [T09a]
+  - id: T09a
+    kind: refusal
+    label: 'the mdcheck units are masked or not installed: the uninstaller says what it could not do, what that leaves, and how to put it right by hand (N7)'
+    code: 'packaging/uninstall.sh:warn'
+    test: 'packaging/test/uninstall-schedules.test.sh:it says what it could not do, and what that leaves'
+    gt: GT-21
+  - id: T10
+    kind: decision
+    label: "state read: `enabled` is the pool being IN the timer's list AND the timer enabled — a pool left in a list whose units were removed by other means is not reported as on"
+    code: 'packages/daemon/src/services/scrub-schedules.ts:readAhrScrubState'
+    test: "packages/daemon/src/services/__tests__/scrub-schedules.test.ts:enabled = in the timer's pool list AND the timer enabled; cadence + nextRun + phases ride along"
+    gt: none
+    next: [T13]
+  - id: T11
+    kind: residual
+    label: 'LEGACY: mdcheck on with no ANAS units is REPORTED as the mechanism it is (`mdcheck-timer`) and never adopted — mdcheck is on by default on a stock node, so its being on is no evidence anyone opted in'
+    code: 'packages/daemon/src/services/scrub-schedules.ts:ahrScrubNote'
+    test: 'packages/daemon/src/services/__tests__/scrub-schedules.test.ts:the LEGACY state (no ANAS units, mdcheck on) reads as mdcheck-timer with the takeover note (review F1/F4)'
+    gt: GT-21
+  - id: T12
+    kind: residual
+    label: 'MISSING LEAF — `systemctl preset` / `preset-all` RE-ENABLES both mdcheck timers (GT-21 PROVEN: they carry no preset exemption and default to enable). ANAS ships no preset file and takes no action; the node then runs two parity checks, and every ANAS scrub, repair and rewrite 409s on the node-wide check for the duration'
+    code: none
+    test: none
+    gt: GT-21
+  - id: T13
+    kind: notification
+    label: "the state's `note` names a still-enabled mdcheck (\"double parity check — mdcheck is on\") and every md array that is no AHR band"
+    code: 'packages/daemon/src/services/scrub-schedules.ts:foreignMdArrays'
+    test: "packages/daemon/src/services/__tests__/scrub-schedules.test.ts:the note is honest: mdcheck on \u21d2 \"double parity check\"; foreign md arrays are named"
+    gt: none
+
+  # ===========================================================================
+  #  Daemon-start reconciliation (D4)
+  # ===========================================================================
+  - id: RC0
+    kind: decision
+    label: 'daemon start, after the AHR boot scan: walk every band and put back any self-heal knob a killed run left turned aside'
+    code: 'packages/daemon/src/services/selfheal-reconcile.ts:reconcileSelfhealState'
+    test: "packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:puts the sync window, rmw_level and stripe cache back to md's own values"
+    gt: GT-1
+    next: [RC1]
+  - id: RC1
+    kind: decision
+    label: 'a self-heal job already in flight on the pool: the knobs and the pin are in USE, not leftovers — the pool is skipped entirely and the job is named'
+    code: 'packages/daemon/src/services/selfheal-reconcile.ts:reconcileSelfhealState'
+    test: 'packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:leaves every knob and the transient snapshot alone, and says which job'
+    gt: none
+    next: [RC2]
+  - id: RC2
+    kind: decision
+    label: 'the sync window is narrowed while md is running something: left exactly as it is and REPORTED — widening it under a recovery resumes and re-bounds an operation that is not ours'
+    code: 'packages/daemon/src/services/selfheal-reconcile.ts:reconcileBand'
+    test: 'packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:leaves the sync window alone and reports the band instead'
+    gt: GT-19
+    next: [RC3]
+  - id: RC3
+    kind: action
+    label: "`rmw_level` and `stripe_cache_size` put back to md's own values whatever md is doing — they change how md writes, never what it is doing"
+    code: 'packages/daemon/src/services/selfheal-io.ts:MD_DEFAULT_RMW_LEVEL'
+    test: "packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:puts the sync window, rmw_level and stripe cache back to md's own values"
+    gt: GT-1
+    next: [RC4, RC6]
+  - id: RC4
+    kind: action
+    label: "sweep the engine's own `anas-selfheal-*` transients — both pin shapes, and nothing an operator or a backup made"
+    code: 'packages/daemon/src/services/selfheal-repair.ts:sweepSelfhealPins'
+    test: "packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:sweeps the engine's own prefix out of @snapshots, and nothing else"
+    gt: none
+    next: [RC5]
+  - id: RC5
+    kind: notification
+    label: one journald line per band; a pass with nothing to say says nothing at all
+    code: 'packages/daemon/src/services/selfheal-reconcile.ts:reconcileWasQuiet'
+    test: 'packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:writes nothing and says nothing'
+    gt: none
+  - id: RC6
+    kind: residual
+    label: 'a RAID1 band has neither `rmw_level` nor `stripe_cache_size` at all (GT-16 — absent, not zero): reconcile leaves it alone'
+    code: 'packages/daemon/src/services/selfheal-reconcile.ts:reconcileBand'
+    test: "packages/daemon/src/services/__tests__/selfheal-reconcile.test.ts:leaves a RAID1 band alone \u2014 it has neither knob at all (GT-16)"
+    gt: GT-16
+
+  # ===========================================================================
+  #  The mdadm --monitor hook (11.17)
+  # ===========================================================================
+  - id: H0
+    kind: decision
+    label: 'anas-md-event <event> <md> [<member>]: one structured journald record, severity mapped from the event'
+    code: 'packaging/anas-md-event.sh:last_sync_action'
+    test: 'packaging/test/md-event.test.sh:journald has ACTION=check'
+    gt: none
+    next: [H1, H4]
+  - id: H1
+    kind: decision
+    label: 'RebuildFinished: `last_sync_action` says whether a CHECK or a real rebuild finished — mdadm names every sync op "Rebuild"'
+    code: 'packaging/anas-md-event.sh:last_sync_action'
+    test: 'packaging/test/md-event.test.sh:title says check finished'
+    gt: none
+    next: [H2]
+  - id: H2
+    kind: notification
+    label: "after a check: the mismatch counter, and \"the periodic scrub's phase 2 checks every file's checksum and will name any affected file\""
+    code: 'packaging/anas-md-event.sh:mismatch_count'
+    test: 'packaging/test/md-event.test.sh:recommends an ANAS Scrub'
+    gt: GT-18
+    next: [S00]
+  - id: H3
+    kind: notification
+    label: 'after a real rebuild: the recorded bad-block RANGES — "data in those ranges could not be reconstructed during the rebuild" — and the same advice to scrub'
+    code: 'packaging/anas-md-event.sh:count_bad_block_ranges'
+    test: 'packaging/test/md-event.test.sh:note counts the ranges'
+    gt: none
+    next: [S00]
+  - id: H4
+    kind: decision
+    label: 'DegradedArray with a sync running, no faulty member and every slot accounted for: journald only, never an alert — md BUILDS RAID5/6 degraded-plus-recovering'
+    code: 'packaging/anas-md-event.sh:initial_build_shape'
+    test: 'packaging/test/md-event.test.sh:notify severity stays info'
+    gt: none
+  - id: H5
+    kind: action
+    label: 'the md geometry reads each member''s bad-block list (`md/rd<n>/bad_blocks` - the kernel''s own symlink to `dev-<name>`), one range per line, matched in that member''s own data coordinates. An UNREADABLE list is null and is not the same as an empty one'
+    code: 'packages/daemon/src/services/selfheal-map.ts:parseBadBlocks'
+    test: 'packages/daemon/src/services/__tests__/selfheal-map.test.ts:parses one range per line, ignoring anything that is not two numbers'
+    gt: none
+    next: [H6, H7]
+  - id: H6
+    kind: refusal
+    label: '`bad-blocks-present`: Rewrite parity refuses a band with ANY non-empty bad-block list - md cannot reconstruct from a member with recorded bad blocks, and a whole-band repair would recompute parity from rows md cannot read. Replace the member first'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:badBlocksRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-parity-rewrite.test.ts:REFUSES the band, names the member, and hands md nothing'
+    gt: none
+  - id: H7
+    kind: decision
+    label: 'the repair engine treats a member with a range over the TARGET ROW as ABSENT, exactly as it treats one md has kicked: RAID5 then has nothing left, RAID6 still has the other syndrome'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:memberHasBadBlock'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:RAID5: a sibling with a recorded range ends the reconstruction, by name'
+    gt: none
+    next: [E07a]
+
+  # ===========================================================================
+  #  Reconcile mirror (story selfheal.11) - the R9 root's verb
+  # ===========================================================================
+  - id: M00
+    kind: decision
+    label: 'the verb''s licence, taken from the newest COMPLETED scrub or repair: md counted mismatches on THIS band, the band is `raid1`, and the checksum pass was clean across the pool. A row with no recorded level is refused rather than guessed at - the two mismatch verbs are not interchangeable'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileEvidence'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:accepts a RAID1 band the last scrub counted mismatches on, with no findings'
+    gt: GT-22
+    next: [M00b, M01, M10, M12, M13, M15, M17]
+  - id: M00b
+    kind: decision
+    label: 'the band the request names, taken from the pool''s own topology (`<pool>-r<n>`, its md device and its per-leg height). A band the pool does not have is a 400 that lists the bands it does, before any confirm code is minted'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileArray'
+    test: 'packages/daemon/src/routes/__tests__/ahr-mutate.test.ts:400 on a body that names no band, and on a band the pool does not have'
+    gt: none
+  - id: M01b
+    kind: decision
+    label: 'a pass''s progress is read from the breakdown `btrfs scrub status` prints under its error summary: `Corrected` is how many blocks the scrub healed through md this time round, and `Uncorrectable` is the count that means no copy can satisfy a checksum. A clean pass prints no breakdown and both read zero'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:parseScrubErrorCounts'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:reads the breakdown btrfs prints under its error summary'
+    gt: GT-22
+    next: [M02, M03, M11]
+  - id: M01
+    kind: decision
+    label: 'ARM A, "scrub until clean" (GT-22 UNEXPECTED(1)): an ordinary btrfs scrub that MEETS the rot heals the whole band through md - btrfs re-reads on a csum failure, md serves the other leg, and md propagates the write-back to BOTH legs. The pass is repeated up to three times because md''s read-balance is not contractual, with a whole-band md check after each'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:stops at the first pass whose check reads 0 — the scrub healed the band through md'
+    gt: GT-22
+    next: [M01b, M14]
+  - id: M02
+    kind: action
+    label: 'a pass''s whole-band check reads `mismatch_cnt = 0`: the legs agree again and the run stops there. `arm: scrub`, one row per pass with its `corrected` count - the cheapest arm, and the one that costs no leg read at all'
+    code: 'packages/daemon/src/services/ahr-scrub.ts:btrfsScrubPass'
+    test: 'suite:9a-reconcile'
+    gt: GT-22
+  - id: M03
+    kind: decision
+    label: 'a pass corrects NOTHING while md still counts: md is not serving the rotten leg to btrfs, so repeating the same coin flip proves nothing. Arm A stops at once and arm B takes over - this is the residual case the story names'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a pass that corrects NOTHING while md still counts stops arm A at once'
+    gt: GT-22
+    next: [M04]
+  - id: M04
+    kind: action
+    label: 'ARM B, "compare legs": both legs are read IN FULL with O_DIRECT at each leg''s OWN data offset (`rd<n>/offset` may differ) and compared in 4 KiB rows. Same IO as a check, and NO degraded window - no leg is failed, removed or re-added at any point'
+    code: 'packages/daemon/src/services/selfheal-map.ts:memberOffsetOn'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:reads both legs in windows and still decides every row — the result parses as the shared schema'
+    gt: GT-16
+    next: [M04b]
+  - id: M04b
+    kind: action
+    label: 'the WHOLE chunk tree is read once, in one dump. The forward chain walks it by key because it starts from a logical byte; arm B starts from an md byte and nothing in the tree is keyed by device offset, so there is no walk to make. Affordable where the csum tree is not: a chunk covers a gigabyte'
+    code: 'packages/daemon/src/services/selfheal-map.ts:readAllChunkItems'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:arbitrates a rotten DATA row by its stored checksum and writes the winner through md'
+    gt: GT-2
+    next: [M05]
+  - id: M05
+    kind: decision
+    label: 'each DIFFERING row is mapped BACK up the chain - md byte to LV byte through the dm segment, LV byte to btrfs logical through the covering chunk''s own delta (the GT-2 hop, inverted; a DUP metadata chunk''s second copy answers too, and says which copy it is). The chunk''s TYPE then says which authority arbitrates the row'
+    code: 'packages/daemon/src/services/selfheal-map.ts:logicalForMdByte'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:is the exact inverse of the forward hop, dm offset and chunk delta included'
+    gt: GT-2
+    next: [M06, M07, M08, M09, M16]
+  - id: M06
+    kind: action
+    label: 'DATA chunk: the csum btrfs stored for that logical byte arbitrates. crc32c each leg''s row, and the leg that matches WINS - its bytes are written THROUGH md, which writes both legs. The same write the repair engine makes, for the same reason'
+    action: md-block-write
+    code: 'packages/daemon/src/services/selfheal-csum.ts:readStoredCsum'
+    test: 'suite:9b-compare'
+    gt: GT-7
+  - id: M07
+    kind: action
+    label: 'METADATA or SYSTEM chunk: btrfs stores no EXTENT_CSUM for a tree block - the checksum is in the node''s own header, over its own bytes. The containing 16 KiB node is read off each leg and checked the way btrfs checks it; the leg whose copy vouches for itself wins. The verdict is cached per node (a node is four rows)'
+    action: md-block-write
+    code: 'packages/daemon/src/services/selfheal-csum.ts:verifyNode'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a METADATA row is decided by the node''s own header checksum'
+    gt: GT-20
+  - id: M08
+    kind: refusal
+    label: 'nothing can arbitrate the row, and it is LEFT EXACTLY AS IT IS: a row in no chunk at all is free space (btrfs has never written there, and legs may disagree about it), and a DATA row with no stored csum is a NOCOW file, a prealloc range or `nodatasum`. Counted as `freeSpaceRows` / `uncheckedRows` and reported, never guessed at'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:counts rows in no chunk as free space and leaves them exactly as they are'
+    gt: none
+  - id: M09
+    kind: refusal
+    label: 'BOTH legs fail the row''s checksum (or both pass while holding different bytes): `unresolvedRows`, nothing written, outcome `residual`. Neither copy is the file, so the file needs restoring from backup - and the band''s leftover mismatch is reported rather than hidden'
+    action: restore-from-backup-advice
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'suite:9-neg'
+    gt: GT-22
+  - id: M16
+    kind: residual
+    label: 'arm B decided every row it could and the verifying whole-band check STILL counts: `residual`, never `reconciled`. The rows with no checksum are named as the likely remainder, because they are the ones this verb deliberately did not touch'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:a band that comes back still mismatched is a residual, never a success'
+    gt: GT-22
+  - id: M10
+    kind: refusal
+    label: '`not-a-mirror-band`: a parity band''s mismatch is parity disagreeing with the data, and it has a verb of its own (Rewrite parity). Not a state that passes - it never becomes true for that band. The pair with `not-a-parity-band` is what carries the epic''s invariant at both doors'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:parityBandRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a PARITY band outright — it never becomes a mirror'
+    gt: GT-18
+  - id: M11
+    kind: notification
+    label: 'a scrub pass reported UNCORRECTABLE errors: the files are NAMED and the run CARRIES ON. This is the one place the mirror verb''s gates differ from Rewrite parity''s - that verb aborts on any finding because md repair would bless the rot, and this one writes no row it cannot prove. A file no copy can satisfy is a fact to report (and its rows come back as `unresolvedRows`), not a reason to leave the rest of the band mismatched. The notification is a `warning` even when the band itself comes out clean'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:reconcileMirrorBand'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:NAMES an uncorrectable file and carries on — it is a fact to report, not a refusal'
+    gt: GT-22
+    next: [M04]
+  - id: M12
+    kind: refusal
+    label: '`array-busy` / `job-active`: degraded, mid-sync, sync window still bounded (GT-13''s trap - the whole-band check is this run''s only proof), or another scrub/repair/rewrite/reconcile in flight. Every one of them re-taken immediately before arm B writes anything'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileArrayRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a degraded band, a busy one, and one whose sync window is still bounded'
+    gt: GT-17
+    next: [M12b]
+  - id: M12b
+    kind: refusal
+    label: '`bad-blocks-present`: a leg with recorded md bad-block ranges serves EIO for them and holds no correct copy, so a row inside one cannot be read off that leg at all - and arm B''s whole method is reading both legs. Replace the member first; not a wait-and-retry state'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorBadBlocksRefusal'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:refuses a band with recorded md bad blocks — md holds no correct copy there'
+    gt: none
+  - id: M13
+    kind: refusal
+    label: 'md''s own `repair` is refused BEFORE the process is spawned, on every door of the executor this verb uses - `exec`, `pipeline` and `execToStream` alike (GT-22(f): on a mirror it copies leg 0 blindly, and junk on leg 0 was propagated to leg 1 on the rig). The ruling is absolute, so this is a wrapper and not a convention: there is no way past it'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorGuardedExecutor'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:the guarded executor never lets one through, on any of its three doors'
+    gt: GT-22
+    next: [M13b]
+  - id: M13b
+    kind: refusal
+    label: 'the guard itself THROWS rather than warning: a run that reached this point has a bug in ANAS, and the correct outcome of that bug is a failed job - never a blessed rot. The suite asserts the same invariant on the RUN instead of on the source: md announces `md: repair of RAID array mdN` when it takes one, and no case-9 row may find that line'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:assertNoMdRepair'
+    test: 'suite:9-neg-no-md-repair'
+    gt: GT-22
+  - id: M14
+    kind: refusal
+    label: 'md took an operation of its own while a whole-band check was running (a leg failing puts it into `recover`): the run walks away with every knob exactly as md left it, and reports `residual` with `foreign-sync-op`. Same waiter, same ownership rule as the parity rewrite - one place decides'
+    code: 'packages/daemon/src/services/ahr-parity-rewrite.ts:waitForOwnSyncOp'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:walks away when md takes an operation of its own mid-check'
+    gt: GT-13
+  - id: M17
+    kind: ui
+    label: 'the confirm gate states both arms and their cost, that a row with no checksum is LEFT EXACTLY AS IT IS, that a row neither leg satisfies is never written, that the pool stays ONLINE and undegraded throughout (the whole difference from doing it by hand with mdadm), and that md''s own repair is not used and must not be run by hand either'
+    code: 'packages/daemon/src/services/ahr-mirror-reconcile.ts:mirrorReconcileWarnings'
+    test: 'packages/daemon/src/services/__tests__/ahr-mirror-reconcile.test.ts:names both arms, what is left alone, and the absence of a degraded window'
+    gt: GT-22
+  - id: M15
+    kind: ui
+    label: 'the result, in the window the request was made from: which ARM answered, the counts before and after, the rows nothing could arbitrate, and - on anything but `reconciled` - that the band is NOT clean and md repair is still the wrong thing to reach for. The notification says the same, once'
+    code: 'packages/pve-integration/src/69-scrubs.js:showMirrorResult'
+    test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:the ARM that answered is named — arm A is the ordinary scrub healing it'
+    gt: none

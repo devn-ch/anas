@@ -2,6 +2,9 @@ import type { Job, PeriodicScrubState } from '@anas/shared'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
@@ -229,12 +232,19 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
   })
 })
 
-describe('periodic scrub routes — AHR mdcheck timers (Epic 17.5)', () => {
+describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)', () => {
   let server: ReturnType<typeof createServer>
+  let unitDir: string
+  let prevEnv: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    // The toggle WRITES unit files — point the route at a temp dir through the
+    // same env override the schedules routes use (tests never touch /etc).
+    unitDir = await mkdtemp(join(tmpdir(), 'anas-scrub-routes-'))
+    prevEnv = process.env.ANAS_SYSTEMD_DIR
+    process.env.ANAS_SYSTEMD_DIR = unitDir
     // Default mock fixtures replay AHR pool `ahr0`; add a command-only systemctl
-    // success so the mdcheck enable/disable + is-enabled resolve (exact fixtures
+    // success so the unit writes + is-enabled reads resolve (exact fixtures
     // still win). is-enabled command-only returns empty → read = off.
     server = createServer({ mock: true, logger: false })
     mockOf(server).addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -242,27 +252,109 @@ describe('periodic scrub routes — AHR mdcheck timers (Epic 17.5)', () => {
 
   afterEach(async () => {
     await server.close()
+    if (prevEnv === undefined)
+      delete process.env.ANAS_SYSTEMD_DIR
+    else
+      process.env.ANAS_SYSTEMD_DIR = prevEnv
+    await rm(unitDir, { recursive: true, force: true })
   })
 
-  it('GET /scrub includes the AHR pool with the node-global mdcheck note', async () => {
+  it('GET /scrub reports the AHR state off the node timer (mechanism, phases, honest note)', async () => {
     const res = await server.inject({ method: 'GET', url: '/v1/scrub' })
     assert.equal(res.statusCode, 200)
     const ahr = (res.json() as { data: PeriodicScrubState[] }).data.find(s => s.target.kind === 'ahr')
     assert.ok(ahr, 'expected an AHR scrub state')
-    assert.equal(ahr!.mechanism, 'mdcheck-timer')
-    assert.match(ahr!.note ?? '', /node-global/)
+    assert.equal(ahr!.mechanism, 'anas-scrub-timer')
+    assert.equal(ahr!.enabled, false, 'no units written yet — nothing enabled')
+    assert.equal(ahr!.cadence, 'monthly', 'the default cadence stands before any toggle')
+    assert.deepEqual(ahr!.phases, ['md-parity', 'btrfs-checksums'])
+    assert.equal(ahr!.nextRun, null, 'an off pool claims no next run')
+    assert.match(ahr!.note ?? '', /node-level timer/)
     // md keeps no completion record — always null, never mined from journald
     // and never a state file we wrote (the sanctioned divergence).
     assert.equal(ahr!.lastScrub, null)
   })
 
-  it('PUT /scrub/ahr/ahr0 toggles the node mdcheck timers (202 job)', async () => {
+  it('PUT /scrub/ahr/ahr0 {enabled:true} writes the units and takes mdcheck over (202 job)', async () => {
     const res = await server.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
     assert.equal(res.statusCode, 202)
     const done = await waitForJob(server, res.json().job.id)
     assert.equal(done.status, 'completed', JSON.stringify(done.error))
-    const call = mockOf(server).calls.find(c => c.args[0] === 'enable' && c.args.includes('mdcheck_start.timer'))
-    assert.ok(call && call.args.includes('mdcheck_continue.timer'))
+    // The node timer's units now exist, listing this pool.
+    const schedule = JSON.parse(
+      (await readFile(join(unitDir, 'anas-scrub.service'), 'utf-8')).match(/X-ANAS-Schedule=(.*)/)![1],
+    )
+    assert.deepEqual(schedule, { kind: 'ahr-scrub', cadence: 'monthly', pools: ['ahr0'] })
+    const call = mockOf(server).calls.find(c => c.args[0] === 'disable' && c.args.includes('mdcheck_start.timer'))
+    assert.ok(call && call.args.includes('mdcheck_continue.timer'), 'mdcheck is disabled on enable')
+  })
+
+  it('PUT /scrub/ahr/ahr0 {enabled:true, cadence:"quarterly"} writes the quarterly calendar', async () => {
+    const res = await server.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true, cadence: 'quarterly' }) })
+    assert.equal(res.statusCode, 202)
+    const done = await waitForJob(server, res.json().job.id)
+    assert.equal(done.status, 'completed', JSON.stringify(done.error))
+    assert.match(await readFile(join(unitDir, 'anas-scrub.timer'), 'utf-8'), /OnCalendar=Sun \*-01,04,07,10-01\.\.07 03:00:00/)
+  })
+
+  it('PUT /scrub/ahr/ahr0 with a bad cadence → 400', async () => {
+    const res = await server.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true, cadence: 'weekly' }) })
+    assert.equal(res.statusCode, 400)
+  })
+
+  it('PUT /scrub/ahr/:pool on a FOREIGN anas-scrub unit → 409 reason foreign-unit, no job (review R10)', async () => {
+    // Someone else's unit on ANAS's fixed name — neither rewritten on enable
+    // nor deleted on disable.
+    await writeFile(join(unitDir, 'anas-scrub.service'), '[Unit]\nDescription=not ours\n')
+    for (const enabled of [true, false]) {
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/scrub/ahr/ahr0',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ enabled }),
+      })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.json()))
+      const body = res.json() as { error: { code: string, reason: string, message: string } }
+      assert.equal(body.error.code, 'CONFLICT')
+      assert.equal(body.error.reason, 'foreign-unit')
+      assert.match(body.error.message, /X-ANAS-Schedule/)
+    }
+    // The foreign file is untouched and no job was created.
+    assert.equal(await readFile(join(unitDir, 'anas-scrub.service'), 'utf-8'), '[Unit]\nDescription=not ours\n')
+    assert.equal((await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })).json().data.length, 0)
+  })
+
+  it('a FAILED unit write is reported as the failure it is, never as foreign-unit (review F14)', async () => {
+    // The door check passes (nothing in the temp dir); the write's ENABLE step
+    // fails (the mock server pre-registers a daemon-reload success, so the
+    // failure goes on the one systemctl call no other test pins).
+    mockOf(server).addFixture({ command: SYSTEMCTL, args: ['enable', '--now', 'anas-scrub.timer'], result: { stdout: '', stderr: 'enable bus borked', exitCode: 1 } })
+    const res = await server.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
+    assert.equal(res.statusCode, 202)
+    const done = await waitForJob(server, res.json().job.id)
+    assert.equal(done.status, 'failed')
+    assert.match(done.error?.message ?? '', /periodic scrub enable failed for 'ahr0': enable bus borked/)
+    assert.doesNotMatch(done.error?.message ?? '', /foreign/i, 'a write failure is never misreported as a foreign unit')
+    // And the rollback left no half-written pair for the next attempt.
+    assert.equal(await readFile(join(unitDir, 'anas-scrub.service'), 'utf-8').then(() => 'present', () => 'absent'), 'absent')
+    assert.equal(await readFile(join(unitDir, 'anas-scrub.timer'), 'utf-8').then(() => 'present', () => 'absent'), 'absent')
+  })
+
+  it('GET /scrub reports the LEGACY state as mechanism mdcheck-timer, honestly off (review F1/F4)', async () => {
+    // mdcheck enabled (a stock node's default), no ANAS units: nothing armed,
+    // nothing adopted — the state says what is running.
+    mockOf(server).addFixture({ command: SYSTEMCTL, args: ['is-enabled', 'mdcheck_start.timer'], result: { stdout: 'enabled\n', stderr: '', exitCode: 0 } })
+    const res = await server.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200)
+    const ahr = (res.json() as { data: PeriodicScrubState[] }).data.find(s => s.target.kind === 'ahr')
+    assert.ok(ahr)
+    assert.equal(ahr!.enabled, false, 'ANAS never enabled itself — the legacy state is reported, not adopted')
+    assert.equal(ahr!.mechanism, 'mdcheck-timer')
+    assert.match(ahr!.note ?? '', /the OS's monthly md parity check \(mdcheck\) is on/)
+    assert.match(ahr!.note ?? '', /takes it over/)
+    // And the start path armed nothing: no units were written by anyone.
+    const { readdir } = await import('node:fs/promises')
+    assert.deepEqual(await readdir(unitDir), [], 'no anas-scrub units exist')
   })
 
   it('GET /scrub reports a RUNNING md check on the AHR pool (stage 6)', async () => {

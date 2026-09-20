@@ -1,0 +1,10 @@
+MD_LEVEL=raid1
+MD_DEVICES=2
+MD_METADATA=1.2
+MD_UUID=60fec2ae:59833a55:f8d57dd8:9891856c
+MD_DEVNAME=anasr1
+MD_NAME=anas-pve:anasr1
+MD_DEVICE_dev_loop0_ROLE=0
+MD_DEVICE_dev_loop0_DEV=/dev/loop0
+MD_DEVICE_dev_loop1_ROLE=1
+MD_DEVICE_dev_loop1_DEV=/dev/loop1

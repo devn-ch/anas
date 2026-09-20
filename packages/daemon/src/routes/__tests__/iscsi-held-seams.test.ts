@@ -136,6 +136,13 @@ describe('iscsi.6 — the backing-file-removal seam (no such path exists)', () =
     'backup-units.ts',
     'replication-units.ts',
     'snapshot-schedule-units.ts',
+    // selfheal.4: removes the anas-scrub units it rendered itself when the
+    // pool list empties — same unit-store teardown as snapshot-schedule-units.
+    'scrub-schedule-units.ts',
+    // The shared unit-store plumbing the stores above now delegate their
+    // unlinkQuiet to (review remediation 2026-09-13): same systemd unit files,
+    // same ownership rule — only files ANAS wrote.
+    'systemd-unit-store.ts',
     'iscsi-mutate.ts',
     'iscsi-quarantine.ts',
     'backup-restore.ts',

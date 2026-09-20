@@ -61,19 +61,29 @@ export const ShareGroup = z.object({
   gid: z.number().int().nonnegative(),
   members: z.array(z.string()),
   local: z.boolean(),
+  /**
+   * Present only when the group is a USER-PRIVATE group (identity.1c): a user
+   * with the same name has this group as its PRIMARY group (gid match). ANAS
+   * creates users WITHOUT one (`useradd -N`), so a private group here belongs
+   * to a pre-existing account the list merely explains — nothing is changed.
+   */
+  privateGroupOf: z.string().optional(),
 })
 export type ShareGroup = z.infer<typeof ShareGroup>
 
 // --- Write models ---
 
 /**
- * POSIX-ish name for a locally-created user or group. Lowercase start, then
- * lowercase/digits/underscore/hyphen; a trailing `$` allows machine accounts.
+ * Name for a locally-created user or group: exactly what `useradd`/`groupadd`
+ * accept on Debian (identity.1a) — a letter or underscore (upper OR lowercase)
+ * start, then letters/digits/underscore/hyphen; a trailing `$` allows machine
+ * accounts. Mixed case is legal (an operator may type `Alice`), so the UI
+ * validator mirrors this rule verbatim.
  */
 export const IdentityName = z.string()
   .min(1)
   .max(32)
-  .regex(/^[a-z_][a-z0-9_-]*\$?$/, 'must be a valid POSIX user/group name')
+  .regex(/^[A-Z_][\w-]*\$?$/i, 'must be a valid user/group name (letter or underscore, then letters, digits, _ and -; optional trailing $)')
 export type IdentityName = z.infer<typeof IdentityName>
 
 /**

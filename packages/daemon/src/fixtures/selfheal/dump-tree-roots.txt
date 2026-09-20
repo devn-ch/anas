@@ -1,0 +1,14 @@
+btrfs-progs v6.14
+root tree: 32636928 level 0
+chunk tree: 22052864 level 0
+extent tree key (EXTENT_TREE ROOT_ITEM 0) 32505856 level 0
+device tree key (DEV_TREE ROOT_ITEM 0) 32653312 level 0
+fs tree key (FS_TREE ROOT_ITEM 0) 30605312 level 0
+checksum tree key (CSUM_TREE ROOT_ITEM 0) 30670848 level 1
+uuid tree key (UUID_TREE ROOT_ITEM 0) 30588928 level 0
+free space tree key (FREE_SPACE_TREE ROOT_ITEM 0) 32522240 level 0
+file tree key (256 ROOT_ITEM 0) 32538624 level 1
+data reloc tree key (DATA_RELOC_TREE ROOT_ITEM 0) 30523392 level 0
+total bytes 1040187392
+bytes used 421412864
+uuid 64495fe4-d0e6-40ce-8385-1ac57923599d

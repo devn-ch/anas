@@ -85,3 +85,16 @@ In dev mock mode these fixtures replay the phase-a pool (`ahr0`: raid5×3 +
 raid1×2 → LVM → btrfs, healthy, mounted). The by-id listing in mock mode is the
 shared `../system/disk-by-id.txt`, so mock AHR disks resolve to the WD sample
 ids rather than the ANAS_HOT ids of the real capture.
+
+## Genuine captures — story selfheal.3 scrub attribution (added 2026-09-11)
+
+Kernel scrub warnings, verbatim from the `selfheal.1` ground-truth drill on the
+stunt node (kernel 7.0.14, btrfs-progs 6.14 — docs/AHR-SELF-HEAL-GROUND-TRUTH.md
+GT-3 and GT-6). The drill writes its raw captures to `test/self-heal/gt/out/`,
+which is produced on the node and never committed, so the two lines the parser
+is built on are kept here — the same bytes the GT document quotes.
+
+| File | Source | What it is |
+|------|--------|------------|
+| `scrub-dmesg-gt3.txt` | GT-3, `out/03-dmesg.txt` | Rot written BELOW md: the `scrub: checksum error at logical … root 256 inode 257 offset … (path: f1.bin)` warning, plus the `bdev … errs:` counter line that follows it (which is NOT an error event and must not be counted as one) |
+| `scrub-dmesg-gt6.txt` | GT-6, `out/04-gt6-dmesg.txt` | Rot written THROUGH md (parity agrees with the bad data): the same warning shape for a second inode, plus the `csum_errors: 2` line the capture script appends from the scrub summary |

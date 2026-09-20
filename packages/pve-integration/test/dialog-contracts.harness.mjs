@@ -285,7 +285,17 @@ function makeComponent(cfg, parent) {
       if (attr[2] === undefined) { return v !== undefined && v !== null }
       return String(v) === attr[2]
     }
-    return sel.charAt(0) === '#' ? cmp.itemId === sel.slice(1) : cmp.xtype === sel
+    // 'panel[anasUsersView]' — an xtype with a property-PRESENCE selector
+    // (the Share Users view looks itself up from its own toolbar buttons).
+    const xattr = sel.match(/^([A-Za-z_$][\w$]*)\[([A-Za-z_$][\w$]*)\]$/)
+    if (xattr) {
+      const v = cmp[xattr[2]]
+      return cmp.xtype === xattr[1] && v !== undefined && v !== null
+    }
+    // 'grid' is ExtJS's alias for gridpanel (the AHR toolbar's handlers walk
+    // up('grid') from a tbar button to a gridpanel) — model the alias.
+    if (sel.charAt(0) === '#') { return cmp.itemId === sel.slice(1) }
+    return cmp.xtype === sel || (sel === 'grid' && cmp.xtype === 'gridpanel')
   }
   c.down = function (sel) {
     for (const kid of c.childCmps()) {
@@ -390,15 +400,33 @@ function makeComponent(cfg, parent) {
     // FIRES selectionchange, which is exactly how a widget that writes a field
     // from its own selection can loop. The harness reproduces that.
     select(what, _keepExisting, suppressEvent) {
-      const rec = (what && typeof what === 'object') ? what : (c.store ? c.store.getAt(what) : null)
-      c._selection = rec ? [rec] : []
+      // Real ExtJS takes ONE record, an index, or an ARRAY of records
+      // (CheckboxModel preselect — selfheal.9); the stub models all three.
+      const recs = (Array.isArray(what)
+        ? what
+        : [(typeof what === 'object' && what) ? what : (c.store ? c.store.getAt(what) : null)])
+        .filter(r => r)
+      c._selection = recs
       if (!suppressEvent) { c.fireEvent('selectionchange', {}, c._selection) }
-      return rec
+      return recs[0] || null
     },
     getSelection: () => c._selection.slice(),
     deselectAll() { c._selection = [] },
   })
   c.ensureVisible = () => c
+  /**
+   * Tick SEVERAL rows (a checkboxmodel grid). Rows the grid's own `beforeselect`
+   * vetoes never enter the selection — exactly what the checkbox does in a
+   * browser, and the rule the repair action depends on (selfheal.6).
+   */
+  c.selectRows = function (idxs) {
+    const veto = cfg && cfg.listeners && cfg.listeners.beforeselect
+    c._selection = idxs
+      .map(i => (c.store ? c.store.getAt(i) : null))
+      .filter(rec => rec && (typeof veto !== 'function' || veto(c.getSelectionModel(), rec) !== false))
+    c.fireEvent('selectionchange', {}, c._selection)
+    return c._selection.slice()
+  }
   /** What a click on a row does: set the selection and fire the grid's listener. */
   c.selectRow = function (idx) {
     const rec = c.store.getAt(idx)
@@ -6965,6 +6993,1826 @@ async function taskDoorOnDoneCheck() {
   }
 }
 
+// ============================================================================
+//  Scrubs: the AHR scrub's FINDINGS reach the row (story selfheal.3)
+// ============================================================================
+//
+// A real scrub runs for hours — the Run now that started it stopped polling
+// long before it finished — so the findings have to be recoverable afterwards.
+// They are, from the daemon's own completed-job list, filtered in the view. The
+// checks below hold that contract: both reads happen, the newest job per pool
+// wins, everything that is not a completed AHR scrub WITH findings is ignored,
+// the indicator is the one door to the one window, and a jobs list that cannot
+// be read costs the indicator and nothing else.
+
+const SCRUB_STATES = {
+  data: [
+    { target: { kind: 'zfs', pool: 'tank' }, enabled: true, cadence: 'monthly', mechanism: 'zfs-property', lastScrub: null, running: null },
+    // selfheal.4 — the AHR periodic scrub is the node-level ANAS timer running
+    // the WHOLE two-phase scrub: phases in the state, nextRun when on.
+    { target: { kind: 'ahr', pool: 'ahr0' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'one node-level timer scrubs the enabled AHR pools sequentially (phase 1 md parity, then phase 2 btrfs checksums)', lastScrub: null, running: null },
+    { target: { kind: 'ahr', pool: 'ahr1' }, enabled: false, cadence: 'quarterly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'double parity check: mdcheck is on', lastScrub: null, running: null },
+    // review cut-but-verified — ahr2's newest scrub was CLEAN (a later clean
+    // pass displaces an older one's findings); its note is the LEGACY mdcheck
+    // wording (review R8).
+    { target: { kind: 'ahr', pool: 'ahr2' }, enabled: false, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'mdcheck is the only periodic parity check running (the pre-0.4 mdcheck timer) — it is adopted onto the anas-scrub timer at daemon start', lastScrub: null, running: null },
+    // Design review 2026-09-14, D1/D8: ahr3's newest scrub counted parity
+    // mismatches but named no file (parity-only rot); ahr4's newest scrub did
+    // not check a whole band. Both must read on the row.
+    { target: { kind: 'ahr', pool: 'ahr3' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'parity-only rot band', lastScrub: null, running: null },
+    { target: { kind: 'ahr', pool: 'ahr4' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'a band md never checked', lastScrub: null, running: null },
+    // selfheal.12 (GT-20): ahr5's newest scrub was CLEAN and its only signal
+    // is the corrected-metadata count — the row must not read as a clean bill.
+    { target: { kind: 'ahr', pool: 'ahr5' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'a clean scrub that corrected metadata', lastScrub: null, running: null },
+  ],
+}
+
+const FINDING_A = {
+  path: '/mnt/anas-ahr/ahr0/@data/movies/a very long name.mkv',
+  subvolume: '@data',
+  inode: 257,
+  stripes: [{ logical: 14811136, offset: 1179648, length: 4096 }],
+  badBlocks: [300],
+}
+const FINDING_B = {
+  path: '/mnt/anas-ahr/ahr0/gone.bin',
+  subvolume: '@data',
+  inode: 258,
+  stripes: [{ logical: 19005440, offset: 1179648, length: 4096 }],
+  badBlocks: [],
+  missing: true,
+}
+// A scrub covers the WHOLE filesystem, so a corrupt block inside a snapshot is
+// a real finding with no path under the mountpoint — said as such, never as
+// "deleted" and never as "0 bad blocks".
+const FINDING_C = {
+  path: '@snapshots/nightly/movies/a very long name.mkv',
+  subvolume: '@snapshots/nightly',
+  inode: 601,
+  stripes: [{ logical: 22000000, offset: 65536, length: 4096 }],
+  badBlocks: [],
+  outsideMount: true,
+}
+
+function scrubJob(over) {
+  return {
+    id: over.id,
+    status: 'completed',
+    operation: 'ahr.scrub',
+    progress: null,
+    createdAt: over.at,
+    createdBy: 'harness',
+    startedAt: over.at,
+    completedAt: over.at,
+    result: over.result,
+    error: null,
+    ...over.extra,
+  }
+}
+
+const SCRUB_JOBS = {
+  data: [
+    // The NEWEST job for ahr0 is not last in the list — the view must order by
+    // time, not by position.
+    scrubJob({
+      id: 'j2',
+      at: '2026-09-11T09:00:00.000Z',
+      result: { scrubbed: 'ahr0', btrfsErrors: 'csum=3', checkedArrays: 3, findings: [FINDING_A, FINDING_B, FINDING_C], errorsReported: 3, errorsAttributed: 3, unattributed: 0, truncated: false },
+    }),
+    scrubJob({
+      id: 'j1',
+      at: '2026-09-10T09:00:00.000Z',
+      result: { scrubbed: 'ahr0', btrfsErrors: 'csum=9', checkedArrays: 3, findings: [FINDING_A], errorsReported: 9, errorsAttributed: 1, unattributed: 0, truncated: false },
+    }),
+    // A FAILED scrub that still carries findings — never the row's answer.
+    scrubJob({
+      id: 'j3',
+      at: '2026-09-11T10:00:00.000Z',
+      result: { scrubbed: 'ahr0', btrfsErrors: 'csum=3', checkedArrays: 3, findings: [FINDING_A] },
+      extra: { status: 'failed' },
+    }),
+    // Another operation whose result happens to look similar.
+    scrubJob({
+      id: 'j4',
+      at: '2026-09-11T11:00:00.000Z',
+      result: { scrubbed: 'ahr0', findings: [FINDING_A] },
+      extra: { operation: 'ahr.create' },
+    }),
+    // ahr1's last scrub was CLEAN — an empty findings list is not a finding.
+    scrubJob({
+      id: 'j5',
+      at: '2026-09-11T09:30:00.000Z',
+      result: { scrubbed: 'ahr1', btrfsErrors: null, checkedArrays: 2, findings: [] },
+    }),
+    // ahr2: a scrub that FOUND something, then a LATER CLEAN one — the newest
+    // job wins findings-or-not, so the clean pass clears the indicator
+    // (review, cut-but-verified).
+    scrubJob({
+      id: 'j6',
+      at: '2026-09-11T08:00:00.000Z',
+      result: { scrubbed: 'ahr2', btrfsErrors: 'csum=2', checkedArrays: 2, findings: [FINDING_A], errorsReported: 2, errorsAttributed: 1, unattributed: 0, truncated: false },
+    }),
+    scrubJob({
+      id: 'j7',
+      at: '2026-09-11T12:00:00.000Z',
+      result: { scrubbed: 'ahr2', btrfsErrors: null, checkedArrays: 2, findings: [] },
+    }),
+    // D1 — parity-only rot: md counted mismatches, the checksum scrub named
+    // nothing. The result carries the record even with no findings.
+    scrubJob({
+      id: 'j8',
+      at: '2026-09-12T08:00:00.000Z',
+      result: {
+        scrubbed: 'ahr3',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr3-r1', 'ahr3-r2'],
+        parityMismatches: [{ band: 'ahr3-r1', bandIndex: 1, array: '/dev/md/ahr3-r1', mismatchCnt: 12 }],
+        findings: [],
+      },
+    }),
+    // D8 — a band md never checked is said, not counted as coverage.
+    scrubJob({
+      id: 'j9',
+      at: '2026-09-12T09:00:00.000Z',
+      result: {
+        scrubbed: 'ahr4',
+        btrfsErrors: null,
+        checkedArrays: 1,
+        bandsChecked: ['ahr4-r1'],
+        bandsSkipped: [{ band: 'ahr4-r2', reason: 'md never started the check' }],
+        findings: [],
+      },
+    }),
+    // selfheal.12 — the GT-20 shape: a CLEAN scrub whose journal window
+    // carried the kernel's corrected-metadata reads. No findings, no parity,
+    // no skips — the count is the only thing the row has to say.
+    scrubJob({
+      id: 'j10',
+      at: '2026-09-12T10:00:00.000Z',
+      result: {
+        scrubbed: 'ahr5',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr5-r1', 'ahr5-r2'],
+        findings: [],
+        metadataCorrected: { count: 2, devices: ['/dev/mapper/gtsh-data'] },
+      },
+    }),
+  ],
+}
+
+const SCRUB_ROUTES = {
+  'GET /scrub': SCRUB_STATES,
+  'GET /jobs': SCRUB_JOBS,
+}
+
+function scrubCell(grid, rec) {
+  const col = (grid.columns || []).find(c => c.dataIndex === 'lastScrub')
+  return col && col.renderer ? col.renderer(rec.get('lastScrub'), {}, rec) : ''
+}
+
+function rowFor(grid, pool) {
+  const idx = grid.getStore().findExact('pool', pool)
+  return idx >= 0 ? grid.getStore().getAt(idx) : null
+}
+
+/** A click that landed ON the findings link, and one that did not. */
+const onLink = { getTarget: sel => (sel === '.anas-scrub-findings-link' ? { dom: true } : null) }
+/** A click on the parity indicator — the OTHER door in the same cell (selfheal.10). */
+const onParityLink = { getTarget: sel => (sel === '.anas-scrub-parity-link' ? { dom: true } : null) }
+const offLink = { getTarget: () => null }
+
+async function scrubFindingsChecks() {
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], SCRUB_ROUTES)
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  ok('scrubs: the grid exists', !!grid)
+  if (!grid) { return }
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  // --- The two reads ---------------------------------------------------------
+  ok('scrubs: reads the uniform scrub state', apiGets.includes('/scrub'))
+  ok('scrubs: reads the daemon\'s COMPLETED jobs for the findings (no new endpoint)',
+    apiGets.includes('/jobs?status=completed'))
+
+  // --- The indicator ---------------------------------------------------------
+  const ahr0 = rowFor(grid, 'ahr0')
+  const ahr1 = rowFor(grid, 'ahr1')
+  const ahr2 = rowFor(grid, 'ahr2')
+  const ahr3 = rowFor(grid, 'ahr3')
+  const ahr4 = rowFor(grid, 'ahr4')
+  const ahr5 = rowFor(grid, 'ahr5')
+  const tank = rowFor(grid, 'tank')
+  ok('scrubs: every pool is a row', !!ahr0 && !!ahr1 && !!ahr2 && !!ahr3 && !!ahr4 && !!ahr5 && !!tank)
+  if (!ahr0 || !ahr1 || !ahr2 || !ahr3 || !ahr4 || !ahr5 || !tank) { return }
+
+  const found = ahr0.get('findings')
+  ok('scrubs: the AHR row carries its last scrub\'s findings', !!found)
+  eq('scrubs: the NEWEST completed scrub wins', found && found.result.btrfsErrors, 'csum=3')
+  eq('scrubs: …with all of its files', found && found.result.findings.length, 3)
+  eq('scrubs: a CLEAN last scrub is not a finding', ahr1.get('findings'), null)
+  eq('scrubs: a ZFS row never carries AHR findings', tank.get('findings'), null)
+  // review cut-but-verified — the NEWEST completed scrub wins, findings or
+  // not: a later clean pass displaces an older one's stale findings.
+  eq('scrubs: a LATER clean scrub clears an older one\'s findings', ahr2.get('findings'), null)
+  ok('scrubs: …and that row falls back to the honest md-keeps-no-record line',
+    /md keeps no completion record/.test(scrubCell(grid, ahr2)), scrubCell(grid, ahr2))
+
+  // D1 — parity-only rot reads on the row, amber, with the explanation as the
+  // tooltip; the checksum scrub named nothing, so there is no findings link.
+  const parityCell = scrubCell(grid, ahr3)
+  ok('scrubs: a parity-only rot row shows the amber parity indicator',
+    /parity mismatch on ahr3-r1 \(12\)/.test(parityCell), parityCell)
+  ok('scrubs: …the parity indicator carries the full explanation as its tooltip',
+    /PARITY \(or Q\) member/.test(parityCell) && /reconstruct from the wrong parity/.test(parityCell), parityCell)
+  // selfheal.10 — the indicator is also the DOOR to the Rewrite parity verb.
+  ok('scrubs: …and it is a link, not just a statement',
+    /anas-scrub-parity-link/.test(parityCell), parityCell)
+  ok('scrubs: …whose tooltip names the verb rather than sending the operator to the notification',
+    /Click to rewrite that band's parity/.test(parityCell), parityCell)
+  ok('scrubs: …and a parity-only scrub names no file, so there is no findings link',
+    !/anas-scrub-findings-link/.test(parityCell), parityCell)
+
+  // D8 — a band the scrub did not check is said on the row, muted, count first.
+  const skippedCell = scrubCell(grid, ahr4)
+  ok('scrubs: a scrub that skipped a band says how many, labelled',
+    /1 band not checked/.test(skippedCell), skippedCell)
+  ok('scrubs: …with the band and the why as the tooltip',
+    /ahr4-r2: md never started the check/.test(skippedCell), skippedCell)
+  ok('scrubs: …and no findings link when nothing was named',
+    !/anas-scrub-findings-link/.test(skippedCell), skippedCell)
+
+  // selfheal.12 — the corrected-metadata count rides the row too, amber, on
+  // the newest completed scrub — and a CLEAN scrub whose only signal is this
+  // count still reads here, never as "md keeps no record" (GT-20).
+  eq('scrubs: the corrected-metadata count rides the newest completed scrub',
+    ahr5.get('metadataCorrected') && ahr5.get('metadataCorrected').count, 2)
+  const correctedCell = scrubCell(grid, ahr5)
+  ok('scrubs: a corrected-metadata count shows on the row, labelled',
+    /2 metadata reads corrected/.test(correctedCell), correctedCell)
+  ok('scrubs: …with what happened, what it means and what to do as the tooltip',
+    /btrfs corrected 2 metadata read\(s\) from the mirror copy/.test(correctedCell)
+    && /Check that disk's SMART data in Disks/.test(correctedCell), correctedCell)
+  ok('scrubs: …and a count-only scrub names no file, so there is no findings link',
+    !/anas-scrub-findings-link/.test(correctedCell), correctedCell)
+  ok('scrubs: …and it still says the record is the last completed scrub since the daemon started',
+    /last completed scrub since the daemon started/.test(correctedCell), correctedCell)
+
+  const cell = scrubCell(grid, ahr0)
+  ok('scrubs: the row says how many files, labelled', /3 files with checksum errors/.test(cell), cell)
+  ok('scrubs: …and says the list is only what the daemon still holds',
+    /last completed scrub since the daemon started/.test(cell), cell)
+  ok('scrubs: the indicator is the door (carries the link class)',
+    /anas-scrub-findings-link/.test(cell), cell)
+  const cleanCell = scrubCell(grid, ahr1)
+  ok('scrubs: an AHR row with nothing found keeps the md-keeps-no-record line',
+    /md keeps no completion record/.test(cleanCell) && !/anas-scrub-findings-link/.test(cleanCell), cleanCell)
+
+  // A pass in flight still OUTRANKS the findings: it is what is true now.
+  ahr0.set('running', { percent: 12.5 })
+  ok('scrubs: a running pass outranks the findings cell',
+    !/anas-scrub-findings-link/.test(scrubCell(grid, ahr0)))
+  ahr0.set('running', null)
+
+  // --- The one window --------------------------------------------------------
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, ahr0, null, 0, offLink)
+  await settle()
+  eq('scrubs: a click OFF the indicator opens nothing', created.windows.length, 0)
+
+  grid.fireEvent('itemclick', grid, tank, null, 0, onLink)
+  await settle()
+  eq('scrubs: a row with no findings opens nothing', created.windows.length, 0)
+
+  grid.fireEvent('itemclick', grid, ahr0, null, 0, onLink)
+  await settle()
+  const win = openWindow()
+  ok('scrubs: the indicator opens the findings window', !!win && win.cls === 'anas-win-scrub-findings')
+  if (!win) { return }
+  const fGrid = findCmp(win, 'anas-grid-scrub-findings')
+  ok('scrubs: the window lists the files', !!fGrid)
+  if (!fGrid) { return }
+  eq('scrubs: one row per finding', fGrid.store.getCount(), 3)
+  eq('scrubs: the path is carried in FULL (never truncated)',
+    fGrid.store.getAt(0).get('path'), FINDING_A.path)
+  eq('scrubs: the bad-block count rides the row', fGrid.store.getAt(0).get('blocks'), 1)
+  ok('scrubs: a deleted file is marked missing, not 0 bad blocks',
+    fGrid.store.getAt(1).get('missing') === true)
+  // The three-way cell: a count, "deleted", and "in a snapshot" — never a 0
+  // that would read as "nothing wrong with it".
+  const blocksCol = (fGrid.columns || []).find(c => c.dataIndex === 'blocks')
+  const cellFor = i => blocksCol.renderer(null, {}, fGrid.store.getAt(i))
+  ok('scrubs: a probed file shows its bad-block count', /1/.test(cellFor(0)), cellFor(0))
+  ok('scrubs: a deleted file says so', /deleted since the scrub/.test(cellFor(1)), cellFor(1))
+  ok('scrubs: a snapshot finding says it is outside the mounted tree',
+    /in a snapshot, outside the mounted tree/.test(cellFor(2)), cellFor(2))
+  eq('scrubs: …and carries its filesystem-relative path in full',
+    fGrid.store.getAt(2).get('path'), FINDING_C.path)
+  const head = (win.items.getAt(0) || {}).html || ''
+  ok('scrubs: the window states reported vs attributed', /3 of 3 reported/.test(head), head)
+
+  // --- Fail-open -------------------------------------------------------------
+  const NO_JOBS = { 'GET /scrub': SCRUB_STATES }
+  const ANAS2 = loadSource(['69-schedules-common.js', '69-scrubs.js'], NO_JOBS)
+  const view2 = makeComponent(ANAS2.views.scrubs.factory('harness'), null)
+  const grid2 = view2.down('#scrubGrid')
+  view2.fireEvent('afterrender', view2)
+  await settle()
+  eq('scrubs: an unreadable job list still renders every row', grid2.getStore().getCount(), SCRUB_STATES.data.length)
+  eq('scrubs: …and simply has no findings to show', rowFor(grid2, 'ahr0').get('findings'), null)
+}
+
+// Fourth pass — T7's mark is RENDERED, not just carried: a finding whose probe
+// ran without the mapping searched an unverified window, and the bad-block cell
+// says so beside the count, muted, with the reason as tooltip. A finding with
+// blocks found used to read as a complete account of the file.
+const FINDING_UV = {
+  path: '/mnt/anas-ahr/ahr0/db/written.bin',
+  subvolume: '@data',
+  inode: 403,
+  stripes: [{ logical: 31000000, offset: 0, length: 4096 }],
+  badBlocks: [7],
+  probedUnverified: true,
+  reason: 'extent could not be resolved (btrfs dump-tree: no extent tree root)',
+}
+
+async function scrubUnverifiedWindowCheck() {
+  const UV_JOBS = {
+    data: [scrubJob({
+      id: 'juv',
+      at: '2026-09-12T09:00:00.000Z',
+      result: { scrubbed: 'ahr0', btrfsErrors: 'csum=1', checkedArrays: 2, findings: [FINDING_UV], errorsReported: 1, errorsAttributed: 1, unattributed: 0, truncated: false },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': UV_JOBS })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  const ahr0 = rowFor(grid, 'ahr0')
+  ok('scrubs: the unverified-window scrub is the row\'s last completed one', !!ahr0 && !!ahr0.get('findings'))
+  if (!ahr0) { return }
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, ahr0, null, 0, onLink)
+  await settle()
+  const win = openWindow()
+  ok('scrubs: the finding opens the findings window', !!win && win.cls === 'anas-win-scrub-findings')
+  if (!win) { return }
+  const fGrid = findCmp(win, 'anas-grid-scrub-findings')
+  ok('scrubs: the unverified-window finding reaches the row', !!fGrid && fGrid.store.getAt(0).get('probedUnverified') === true)
+  if (!fGrid) { return }
+  const blocksCol = (fGrid.columns || []).find(c => c.dataIndex === 'blocks')
+  const cell = blocksCol.renderer(null, {}, fGrid.store.getAt(0))
+  ok('scrubs: the bad-block count is still shown', />1</.test(cell), cell)
+  ok('scrubs: the unverified-window suffix rides the count, muted',
+    /\(search window unverified\)/.test(cell) && /var\(--anas-muted/.test(cell), cell)
+  ok('scrubs: the reason rides the suffix as the tooltip',
+    /title="[^"]*extent could not be resolved/.test(cell), cell)
+}
+
+// Design review 2026-09-14, D1 — the findings WINDOW says the parity story too:
+// when the newest scrub's result carries parityMismatches, the window's head
+// gains one line naming the bands and pointing at the PVE notification.
+async function scrubParityWindowCheck() {
+  const PARITY_JOBS = {
+    data: [scrubJob({
+      id: 'jpar',
+      at: '2026-09-12T10:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=2',
+        checkedArrays: 2,
+        bandsChecked: ['ahr0-r1', 'ahr0-r2'],
+        parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 4 }],
+        findings: [FINDING_A],
+        errorsReported: 2,
+        errorsAttributed: 1,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': PARITY_JOBS })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  const ahr0 = rowFor(grid, 'ahr0')
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, ahr0, null, 0, onLink)
+  await settle()
+  const win = openWindow()
+  if (!win) { ok('scrubs: the parity window opens', false); return }
+  const head = (win.items.getAt(0) || {}).html || ''
+  ok('scrubs: the findings window names the parity-mismatch bands',
+    /md counted parity mismatches on ahr0-r1/.test(head), head)
+  ok('scrubs: …and points at the notification for the explanation',
+    /PVE notification/.test(head), head)
+}
+
+// Story selfheal.10 — the Rewrite parity ACTION, behind the parity indicator.
+//
+// The narrow case is the whole feature: md counted mismatches on a band AND
+// the same scrub named no corrupt file. Anything else and `mdadm
+// --action=repair` would bless whatever the data says, so the verb is greyed
+// with the reason rather than hidden.
+async function rewriteParityChecks() {
+  // ahr3 is the parity-only row (j8): mismatches on r1, no findings.
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': SCRUB_JOBS })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  // --- the door: the parity indicator, not the findings one -----------------
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr3'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('rewrite: the parity indicator opens the parity window', !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+
+  const pGrid = win.down('#parityGrid')
+  const btn = win.down('#rewriteParity')
+  ok('rewrite: the window lists the bands md counted mismatches on', !!pGrid && pGrid.getStore().getCount() === 1)
+  ok('rewrite: …with the band label, its md array and the count',
+    !!pGrid && pGrid.getStore().getAt(0).get('band') === 'ahr3-r1'
+      && pGrid.getStore().getAt(0).get('array') === '/dev/md/ahr3-r1'
+      && pGrid.getStore().getAt(0).get('mismatchCnt') === 12)
+  ok('rewrite: …and the band NUMBER the request names, carried not parsed',
+    !!pGrid && pGrid.getStore().getAt(0).get('bandIndex') === 1)
+  ok('rewrite: the head says the data is right and the parity is what is wrong',
+    /the data is right, and the parity is what is wrong/.test((win.items.getAt(0) || {}).html || ''),
+    (win.items.getAt(0) || {}).html)
+
+  // --- enablement -----------------------------------------------------------
+  ok('rewrite: the verb is dark until a band is picked', !!btn && btn.disabled === true)
+  ok('rewrite: …and says so', /select the band to rewrite/.test(btn.tooltip || ''), btn.tooltip)
+  pGrid.selectRows([0])
+  await settle()
+  ok('rewrite: one band ticked lights the verb', btn.disabled === false)
+
+  // --- the confirm-gated request -------------------------------------------
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('rewrite: the verb goes through the confirm-code door', !!sent)
+  if (!sent) { return }
+  ok('rewrite: …to the pool\'s own parity-rewrite endpoint', sent.path === '/ahr/ahr3/parity-rewrite')
+  ok('rewrite: …as a POST', sent.method === 'post')
+  ok('rewrite: the body names ONE band, as a number', JSON.stringify(sent.body) === '{"band":1}')
+  ok('rewrite: the confirm names the band and md\'s own count',
+    /band r1/.test(sent.confirmIntro || '') && /12 mismatch\(es\) there/.test(sent.confirmIntro || ''), sent.confirmIntro)
+  ok('rewrite: the poll budget is raised past the default (three md passes over a band)',
+    Number(sent.maxMs) > 15000, sent.maxMs)
+  ok('rewrite: the poll rides the window, not a component that closes', sent.view === win)
+
+  // --- the result, in the same window --------------------------------------
+  const panel = win.down('#parityResult')
+  ok('rewrite: the result panel is hidden until there is a result', !!panel && panel.hidden === true)
+  sent.onComplete({
+    id: 'pj1',
+    status: 'completed',
+    operation: 'ahr.parity-rewrite',
+    result: {
+      pool: 'ahr3',
+      band: 1,
+      array: '/dev/md/ahr3-r1',
+      mismatchBefore: 12,
+      mismatchAfter: 0,
+      outcome: 'rewritten',
+      durations: { scrubMs: 1000, repairMs: 2000, checkMs: 3000, totalMs: 6000 },
+    },
+  })
+  await settle()
+  ok('rewrite: the result appears in the window the request was made from', panel.hidden === false)
+  ok('rewrite: the before and after counts are both said',
+    /mismatches before 12/.test(panel.html) && /after 0/.test(panel.html), panel.html)
+  ok('rewrite: …and the outcome by name', /outcome rewritten/.test(panel.html), panel.html)
+  ok('rewrite: a rewritten band says the check afterwards counted 0',
+    /counted 0/.test(panel.html), panel.html)
+
+  // still-mismatched is NOT a success — say it plainly.
+  sent.onComplete({
+    id: 'pj2',
+    status: 'completed',
+    operation: 'ahr.parity-rewrite',
+    result: {
+      pool: 'ahr3',
+      band: 1,
+      array: '/dev/md/ahr3-r1',
+      mismatchBefore: 12,
+      mismatchAfter: 4,
+      outcome: 'still-mismatched',
+      reason: 'the verifying check still counted 4 mismatch(es)',
+      durations: { scrubMs: 1, repairMs: 1, checkMs: 1, totalMs: 3 },
+    },
+  })
+  await settle()
+  ok('rewrite: a still-mismatched run refuses to read as healthy',
+    /is not proven good/.test(panel.html) && /Do not treat this band as healthy/.test(panel.html), panel.html)
+  ok('rewrite: …and carries the run\'s own sentence', /still counted 4 mismatch/.test(panel.html), panel.html)
+
+  // A refusal on the fresh scrub names what it found instead of writing.
+  sent.onComplete({
+    id: 'pj3',
+    status: 'completed',
+    operation: 'ahr.parity-rewrite',
+    result: {
+      pool: 'ahr3',
+      band: 1,
+      array: '/dev/md/ahr3-r1',
+      mismatchBefore: 12,
+      mismatchAfter: null,
+      outcome: 'refused',
+      reason: 'the fresh checksum scrub found data corruption — nothing was written',
+      reasonCode: 'data-corruption-found',
+      btrfsErrors: 'csum=3',
+      durations: { scrubMs: 1, repairMs: 0, checkMs: 0, totalMs: 1 },
+    },
+  })
+  await settle()
+  ok('rewrite: an unknown after-count is said as unknown, never as 0',
+    /after unknown/.test(panel.html), panel.html)
+  ok('rewrite: a refusal on the fresh scrub names the errors and says nothing was written',
+    /found errors and nothing was written to md/.test(panel.html) && /csum=3/.test(panel.html), panel.html)
+
+  // --- a job still running claims no result --------------------------------
+  sent.onComplete({ id: 'pj4', status: 'running' })
+  await settle()
+  ok('rewrite: a job still running claims no result', /still running/.test(panel.html), panel.html)
+  ok('rewrite: …and says where the answer will arrive', /notification/.test(panel.html), panel.html)
+}
+
+// Story selfheal.10 — the verb is REFUSED when the same scrub named corrupt
+// files: md repair would recompute parity from that rot and make it permanent.
+// The door still opens (the mismatch is a real fact the operator must see);
+// the button is dark with the reason on it.
+async function rewriteParityRefusedChecks() {
+  const MIXED = {
+    data: [scrubJob({
+      id: 'jmix',
+      at: '2026-09-12T11:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=2',
+        checkedArrays: 2,
+        bandsChecked: ['ahr0-r1', 'ahr0-r2'],
+        parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 4 }],
+        findings: [FINDING_A],
+        errorsReported: 2,
+        errorsAttributed: 1,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIXED })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('rewrite: the parity door opens even when files are also corrupt',
+    !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+  const pGrid = win.down('#parityGrid')
+  const btn = win.down('#rewriteParity')
+  pGrid.selectRows([0])
+  await settle()
+  ok('rewrite: …but the verb stays dark with a band ticked', btn.disabled === true)
+  ok('rewrite: …and the reason is the one the daemon would 409 with',
+    /Repair those from parity first/.test(btn.tooltip || '')
+      && /make the rot permanent/.test(btn.tooltip || ''), btn.tooltip)
+  ok('rewrite: the head says the same thing, before the operator reaches the button',
+    /Repair those from parity first/.test((win.items.getAt(0) || {}).html || ''),
+    (win.items.getAt(0) || {}).html)
+
+  // Clicking it anyway does nothing — the gate is not only cosmetic.
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('rewrite: the handler itself refuses, not just the disabled state', sent === null)
+}
+
+// Sixth pass, N1 — a RAID1 band has NO parity to rewrite. md's `repair` on a
+// mirror copies the first in-sync leg over the others without arbitrating, so
+// on a band whose legs disagree it overwrites the good copy half the time. The
+// daemon refuses it outright (409 `not-a-parity-band`); the UI says so first,
+// and never offers the verb.
+async function rewriteParityMirrorChecks() {
+  const MIRROR = {
+    data: [scrubJob({
+      id: 'jmir',
+      at: '2026-09-12T12:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr0-r1', 'ahr0-r2'],
+        parityMismatches: [{ band: 'ahr0-r2', bandIndex: 2, array: '/dev/md/ahr0-r2', mismatchCnt: 6, level: 'raid1' }],
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIRROR })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  // The row's indicator must not promise the PARITY verb here.
+  const cell = scrubCell(grid, rowFor(grid, 'ahr0'));
+  ok('rewrite: a mirror-only mismatch row does NOT offer "click to rewrite"',
+    !/Click to rewrite/.test(cell), cell)
+  // Story selfheal.11 — the tooltip still must NOT name Repair from parity
+  // (that verb needs a finding with named blocks, and phase 2 named none). What
+  // it names is the verb that DOES apply to a mirror band, and what the
+  // operator must not do instead.
+  ok('rewrite: …it says there is no parity to rewrite, and points at the mirror verb',
+    /no parity to rewrite/.test(cell)
+      && /Click to reconcile the mirror/.test(cell)
+      && /do not run md repair on a mirror/.test(cell)
+      && !/Repair from parity/.test(cell), cell)
+
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('rewrite: the mirror row still opens the detail window', !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+  ok('rewrite: the head does not claim the parity member is wrong on a mirror band',
+    !/the parity is what is wrong/.test((win.items.getAt(0) || {}).html || '')
+      && /RAID1 mirror bands/.test((win.items.getAt(0) || {}).html || ''),
+    (win.items.getAt(0) || {}).html)
+  // selfheal.11 — the head explains the two arms, in the order they run, and
+  // still names no verb the operator cannot reach.
+  ok('rewrite: …and the head explains the reconcile\'s two arms',
+    /re-runs the ordinary checksum scrub/.test((win.items.getAt(0) || {}).html || '')
+      && /reads BOTH legs in full/.test((win.items.getAt(0) || {}).html || '')
+      && /Rows with no checksum/.test((win.items.getAt(0) || {}).html || '')
+      && !/Repair from parity/.test((win.items.getAt(0) || {}).html || ''),
+    (win.items.getAt(0) || {}).html)
+
+  const pGrid = win.down('#parityGrid')
+  const btn = win.down('#rewriteParity')
+  ok('rewrite: the band\'s LEVEL rides the row', pGrid.getStore().getAt(0).get('level') === 'raid1')
+  pGrid.selectRows([0])
+  await settle()
+  ok('rewrite: a ticked mirror band leaves the PARITY verb dark', btn.disabled === true)
+  ok('rewrite: …with the reason the daemon would 409 with, and the verb that does apply',
+    /no parity to rewrite/.test(btn.tooltip || '')
+      && /Use Reconcile mirror for this band/.test(btn.tooltip || '')
+      && !/Repair from parity/.test(btn.tooltip || ''), btn.tooltip)
+
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('rewrite: and the handler refuses it too — nothing is submitted for a mirror band', sent === null)
+}
+
+// Story selfheal.11 — Reconcile mirror, the OTHER verb in the parity window.
+//
+// The R9 root's mismatch: md counted disagreeing LEGS and the checksum pass
+// named no file, so one leg holds something btrfs has never been asked to read.
+// The verb is need-gated the same way Rewrite parity is, in the same window, and
+// the two are mutually exclusive by the band's level.
+async function mirrorReconcileChecks() {
+  const MIRROR = {
+    data: [scrubJob({
+      id: 'jmir2',
+      at: '2026-09-12T12:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr0-r1', 'ahr0-r2'],
+        parityMismatches: [{ band: 'ahr0-r2', bandIndex: 2, array: '/dev/md/ahr0-r2', mismatchCnt: 128, level: 'raid1' }],
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIRROR })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('mirror: the parity indicator opens the window that holds both verbs',
+    !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+
+  const pGrid = win.down('#parityGrid')
+  const btn = win.down('#reconcileMirror')
+  ok('mirror: the window carries a Reconcile mirror button', !!btn && btn.cls === 'anas-btn-mirror-reconcile')
+  if (!btn) { return }
+  ok('mirror: the verb is dark until a band is picked', btn.disabled === true)
+  ok('mirror: …and says so', /select the band to reconcile/.test(btn.tooltip || ''), btn.tooltip)
+  pGrid.selectRows([0])
+  await settle()
+  ok('mirror: one ticked RAID1 band lights the verb', btn.disabled === false)
+
+  // --- the confirm-gated request -------------------------------------------
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('mirror: the verb goes through the confirm-code door', !!sent)
+  if (!sent) { return }
+  ok('mirror: …to the pool\'s own mirror-reconcile endpoint', sent.path === '/ahr/ahr0/mirror-reconcile')
+  ok('mirror: …as a POST', sent.method === 'post')
+  ok('mirror: the body names ONE band, as a number', JSON.stringify(sent.body) === '{"band":2}')
+  ok('mirror: the confirm names the band and md\'s own count',
+    /band r2/.test(sent.confirmIntro || '') && /128 disagreeing unit\(s\) there/.test(sent.confirmIntro || ''),
+    sent.confirmIntro)
+  ok('mirror: the poll budget is raised past the default (scrubs, checks, then both legs)',
+    Number(sent.maxMs) > 15000, sent.maxMs)
+  ok('mirror: the poll rides the window, not a component that closes', sent.view === win)
+
+  // --- arm A's result, in the same window ----------------------------------
+  const panel = win.down('#parityResult')
+  ok('mirror: the result panel is hidden until there is a result', !!panel && panel.hidden === true)
+  sent.onComplete({
+    id: 'mj1',
+    status: 'completed',
+    operation: 'ahr.mirror-reconcile',
+    result: {
+      pool: 'ahr0',
+      band: 2,
+      array: '/dev/md/ahr0-r2',
+      arm: 'scrub',
+      passes: [{ corrected: 1, mismatchAfter: 0 }],
+      rowsCompared: 0,
+      rowsDiffering: 0,
+      rowsWritten: { leg0: 0, leg1: 0 },
+      freeSpaceRows: 0,
+      uncheckedRows: 0,
+      unresolvedRows: 0,
+      mismatchBefore: 128,
+      mismatchAfter: 0,
+      outcome: 'reconciled',
+      durations: { scrubMs: 1000, compareMs: 0, checkMs: 500, totalMs: 1500 },
+    },
+  })
+  await settle()
+  ok('mirror: the result appears in the window the request was made from', panel.hidden === false)
+  ok('mirror: the before and after counts are both said',
+    /mismatches before 128/.test(panel.html) && /after 0/.test(panel.html), panel.html)
+  ok('mirror: the ARM that answered is named — arm A is the ordinary scrub healing it',
+    /Arm A \(scrub until clean\)/.test(panel.html) && /1 btrfs scrub pass/.test(panel.html), panel.html)
+  ok('mirror: a reconciled band says the verifying check counted 0',
+    /The legs agree again/.test(panel.html) && /counted 0/.test(panel.html), panel.html)
+
+  // --- arm B's result: rows arbitrated one by one --------------------------
+  sent.onComplete({
+    id: 'mj2',
+    status: 'completed',
+    operation: 'ahr.mirror-reconcile',
+    result: {
+      pool: 'ahr0',
+      band: 2,
+      array: '/dev/md/ahr0-r2',
+      arm: 'compare',
+      passes: [{ corrected: 0, mismatchAfter: 128 }],
+      rowsCompared: 51200,
+      rowsDiffering: 1,
+      rowsWritten: { leg0: 0, leg1: 1 },
+      freeSpaceRows: 0,
+      uncheckedRows: 0,
+      unresolvedRows: 0,
+      mismatchBefore: 128,
+      mismatchAfter: 0,
+      outcome: 'reconciled',
+      durations: { scrubMs: 1000, compareMs: 9000, checkMs: 500, totalMs: 10500 },
+    },
+  })
+  await settle()
+  ok('mirror: arm B is named as such, with the rows it compared and wrote',
+    /Arm B \(compare legs\)/.test(panel.html) && /1 differing row\(s\)/.test(panel.html)
+      && /1 written back through md/.test(panel.html), panel.html)
+
+  // --- a residual is NOT a success -----------------------------------------
+  sent.onComplete({
+    id: 'mj3',
+    status: 'completed',
+    operation: 'ahr.mirror-reconcile',
+    result: {
+      pool: 'ahr0',
+      band: 2,
+      array: '/dev/md/ahr0-r2',
+      arm: 'compare',
+      passes: [{ corrected: 0, mismatchAfter: 128 }],
+      rowsCompared: 51200,
+      rowsDiffering: 1,
+      rowsWritten: { leg0: 0, leg1: 0 },
+      freeSpaceRows: 0,
+      uncheckedRows: 0,
+      unresolvedRows: 1,
+      mismatchBefore: 128,
+      mismatchAfter: 128,
+      outcome: 'residual',
+      reason: '1 row(s) of ahr0-r2 could not be arbitrated: neither leg satisfies the checksum btrfs stored for them',
+      durations: { scrubMs: 1, compareMs: 1, checkMs: 1, totalMs: 3 },
+    },
+  })
+  await settle()
+  ok('mirror: a residual run refuses to read as healthy',
+    /The band is NOT clean/.test(panel.html) && /Do not treat it as healthy/.test(panel.html), panel.html)
+  ok('mirror: …and repeats the one thing the operator must not reach for',
+    /do not run md repair on it/.test(panel.html), panel.html)
+  ok('mirror: …and counts the rows NEITHER leg could satisfy, never written',
+    /1 row\(s\) where NEITHER leg matched — never written/.test(panel.html), panel.html)
+  ok('mirror: …and carries the run\'s own sentence',
+    /could not be arbitrated/.test(panel.html), panel.html)
+
+  // --- rows with no checksum are reported, not hidden ----------------------
+  sent.onComplete({
+    id: 'mj4',
+    status: 'completed',
+    operation: 'ahr.mirror-reconcile',
+    result: {
+      pool: 'ahr0',
+      band: 2,
+      array: '/dev/md/ahr0-r2',
+      arm: 'compare',
+      passes: [{ corrected: 0, mismatchAfter: 128 }],
+      rowsCompared: 51200,
+      rowsDiffering: 3,
+      rowsWritten: { leg0: 1, leg1: 0 },
+      freeSpaceRows: 1,
+      uncheckedRows: 1,
+      unresolvedRows: 0,
+      mismatchBefore: 128,
+      mismatchAfter: 0,
+      outcome: 'reconciled',
+      durations: { scrubMs: 1, compareMs: 1, checkMs: 1, totalMs: 3 },
+    },
+  })
+  await settle()
+  ok('mirror: rows with no stored checksum are counted and said to be left alone',
+    /1 row\(s\) with no stored checksum \(left as they are\)/.test(panel.html), panel.html)
+  ok('mirror: …and so are rows in free space',
+    /1 row\(s\) in free space/.test(panel.html), panel.html)
+
+  // --- a job still running claims no result --------------------------------
+  sent.onComplete({ id: 'mj5', status: 'running' })
+  await settle()
+  ok('mirror: a job still running claims no result', /still running/.test(panel.html), panel.html)
+  ok('mirror: …and says where the answer will arrive', /notification/.test(panel.html), panel.html)
+}
+
+// Story selfheal.11 — the mirror verb is need-gated the same way the parity one
+// is: a PARITY band cannot be reconciled (its mismatch is parity disagreeing
+// with data), and a pool whose same scrub named corrupt files cannot be either.
+async function mirrorReconcileRefusedChecks() {
+  const PARITY_BAND = {
+    data: [scrubJob({
+      id: 'jpar',
+      at: '2026-09-12T13:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: null,
+        checkedArrays: 1,
+        bandsChecked: ['ahr0-r1'],
+        parityMismatches: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+      },
+    })],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': PARITY_BAND })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  if (!win) { ok('mirror: the parity window opens on a parity band', false); return }
+  const pGrid = win.down('#parityGrid')
+  const mbtn = win.down('#reconcileMirror')
+  const rbtn = win.down('#rewriteParity')
+  pGrid.selectRows([0])
+  await settle()
+  ok('mirror: a parity band lights Rewrite parity and leaves Reconcile mirror dark',
+    rbtn.disabled === false && mbtn.disabled === true)
+  ok('mirror: …with the reason the daemon would 409 with (not-a-mirror-band)',
+    /is a parity band, not a mirror/.test(mbtn.tooltip || ''), mbtn.tooltip)
+
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  mbtn.handler(mbtn)
+  await settle()
+  ok('mirror: the handler itself refuses a parity band, not just the disabled state', sent === null)
+
+  // A row from a daemon too old to record the level cannot be reconciled
+  // either: the two mismatch verbs are not interchangeable, and guessing which
+  // one a band needs is exactly the guess this epic exists to avoid.
+  created.windows.length = 0
+  const ANAS2 = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': SCRUB_JOBS })
+  const view2 = makeComponent(ANAS2.views.scrubs.factory('harness'), null)
+  const grid2 = view2.down('#scrubGrid')
+  view2.fireEvent('afterrender', view2)
+  await settle()
+  created.windows.length = 0
+  grid2.fireEvent('itemclick', grid2, rowFor(grid2, 'ahr3'), null, 0, onParityLink)
+  await settle()
+  const win2 = openWindow()
+  if (!win2) { ok('mirror: the parity window opens on a level-less row', false); return }
+  win2.down('#parityGrid').selectRows([0])
+  await settle()
+  const mbtn2 = win2.down('#reconcileMirror')
+  ok('mirror: a row with no recorded level leaves the verb dark', mbtn2.disabled === true)
+  ok('mirror: …and says the two verbs are not interchangeable',
+    /did not record what level the band is/.test(mbtn2.tooltip || ''), mbtn2.tooltip)
+}
+
+// Seventh pass, F2 — the parity indicator can be fed by a completed REPAIR.
+//
+// A repair that wrote a block, proved it cold against its stored checksum and
+// then saw md still counting the stripe has MEASURED a parity residual on that
+// band. It rides the repair result in the SAME row shape a scrub's
+// `parityMismatches` uses, so the door on the Scrubs row opens without waiting
+// hours for a fresh two-phase scrub to rediscover the number.
+async function parityResidualFromRepairChecks() {
+  const REPAIR_RESIDUAL = {
+    data: [{
+      id: 'jrep',
+      operation: 'ahr.repair',
+      status: 'completed',
+      createdAt: '2026-09-12T14:00:00.000Z',
+      completedAt: '2026-09-12T14:30:00.000Z',
+      result: {
+        pool: 'ahr0',
+        files: [],
+        repaired: 1,
+        unrepairable: 0,
+        aboveMd: 0,
+        mappingAbort: 0,
+        notExamined: 0,
+        parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+        blocks: 1,
+      },
+    }],
+  }
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': REPAIR_RESIDUAL })
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+
+  const cell = scrubCell(grid, rowFor(grid, 'ahr0'))
+  ok('residual: the Scrubs row shows the parity indicator from the REPAIR job (F2)',
+    /parity mismatch on ahr0-r1 \(8\)/.test(cell), cell)
+  ok('residual: and it offers the rewrite, because the band is a parity band',
+    /Click to rewrite/.test(cell), cell)
+
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onParityLink)
+  await settle()
+  const win = openWindow()
+  ok('residual: the parity window opens on it', !!win && win.cls === 'anas-win-scrub-parity')
+  if (!win) { return }
+  const pGrid = win.down('#parityGrid')
+  eq('residual: the band is the row', pGrid.getStore().getAt(0).get('band'), 'ahr0-r1')
+  eq('residual: with the band number Rewrite parity is keyed on', pGrid.getStore().getAt(0).get('bandIndex'), 1)
+  pGrid.selectRows([0])
+  await settle()
+  eq('residual: the verb is reachable', win.down('#rewriteParity').disabled, false)
+}
+
+// Design review 2026-09-14, D15 + S8 — the AHR Snapshots manager meets the
+// repair engine's transient pin. A leftover `anas-selfheal-<ts>` snapshot (the
+// repair's finally failed to delete it) is labelled as what it is and is never
+// a rollback target; and rolling back to a snapshot whose contents the last
+// scrub found UNREPAIRED rot in says so before the operator confirms.
+async function ahrSnapshotPinChecks() {
+  const SNAPS = {
+    data: [
+      { name: 'nightly', createdAt: '2026-09-12T00:00:00Z', readonly: true },
+      { name: 'anas-selfheal-20260913T120000Z', createdAt: '2026-09-13T12:00:00Z', readonly: true },
+    ],
+  }
+  const S8_JOBS = {
+    data: [scrubJob({
+      id: 'js8',
+      at: '2026-09-12T09:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=1',
+        checkedArrays: 2,
+        findings: [{
+          path: '@snapshots/nightly/movies/x.mkv',
+          subvolume: '@snapshots/nightly',
+          inode: 601,
+          stripes: [],
+          badBlocks: [],
+          outsideMount: true,
+        }],
+        errorsReported: 1,
+        errorsAttributed: 1,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  }
+  const ANAS = loadSources(['15-gfx.js', '39-ahr.js'], {
+    'GET /ahr': { data: [ahrPoolRow('ahr0')] },
+    'GET /ahr/ahr0/snapshots': SNAPS,
+    'GET /jobs': S8_JOBS,
+  })
+  const view = makeComponent(ANAS.views.ahr.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.itemId === 'ahrGrid' ? view : view.down('#ahrGrid')
+  if (!grid) { ok('snappin: the AHR grid exists', false); return }
+  grid.selectRow(grid.getStore().findExact('name', 'ahr0'))
+  const snapBtn = grid.down('#snapshots')
+  ok('snappin: the Snapshots verb exists for a §12 pool', !!snapBtn && !snapBtn.disabled)
+  if (!snapBtn) { return }
+  created.windows.length = 0
+  snapBtn.handler(snapBtn)
+  await settle()
+  const win = openWindow()
+  ok('snappin: the manager window opens', !!win && win.cls === 'anas-win-ahr-snapshots')
+  if (!win) { return }
+  const snapGrid = win.down('#ahrSnapGrid')
+  ok('snappin: both snapshots list, pin included', !!snapGrid && snapGrid.getStore().getCount() === 2)
+  if (!snapGrid) { return }
+
+  // D15 — the pin is LABELLED in the row, never silently indistinguishable.
+  const nameCol = (snapGrid.columns || []).find(c => c.dataIndex === 'name')
+  const pinCell = nameCol.renderer(SNAPS.data[1].name)
+  ok('snappin: a leftover repair pin is labelled as what it is',
+    /transient ANAS repair pin; safe to delete if no repair is running/.test(pinCell), pinCell)
+  ok('snappin: an operator snapshot carries no pin label',
+    !/repair pin/.test(nameCol.renderer(SNAPS.data[0].name)))
+
+  // D15 — and it is never a rollback target; the reason rides the tooltip.
+  const rb = win.down('#ahrSnapRollback')
+  ok('snappin: the Rollback verb exists', !!rb)
+  if (!rb) { return }
+  snapGrid.selectRow(1)
+  await settle()
+  ok('snappin: Rollback DISABLED for the pin', rb.disabled === true)
+  ok('snappin: …and the tooltip says why (nothing to roll back to)',
+    /transient ANAS repair pin/.test(rb.tooltip || ''), rb.tooltip)
+  snapGrid.selectRow(0)
+  await settle()
+  ok('snappin: Rollback ENABLED for an operator snapshot', rb.disabled === false)
+  ok('snappin: …with no leftover reason', rb.tooltip === '', rb.tooltip)
+
+  // S8 — rolling back to a snapshot the last scrub found UNREPAIRED rot inside
+  // says so in the confirm, before the code is minted.
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  rb.handler(rb)
+  await settle()
+  ok('snaps8: the rollback goes through the confirm door', !!sent)
+  if (!sent) { return }
+  ok('snaps8: the confirm warns of the unrepaired finding inside THIS snapshot',
+    /the last scrub found an unrepaired corrupt block inside this snapshot \(@snapshots\/nightly\/movies\/x\.mkv\)/
+      .test(sent.confirmIntro || ''), sent.confirmIntro)
+  ok('snaps8: …and says what rollback does with it',
+    /rolling back restores it/.test(sent.confirmIntro || ''), sent.confirmIntro)
+
+  // The negative: the newest scrub found nothing inside THIS snapshot — the
+  // confirm carries no warning (and the fail-open path reads as the same).
+  const OTHER_JOBS = {
+    data: [scrubJob({
+      id: 'js8b',
+      at: '2026-09-12T09:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=1',
+        checkedArrays: 2,
+        findings: [{ path: '@snapshots/other/y.bin', subvolume: '@snapshots/other', inode: 7, stripes: [], badBlocks: [], outsideMount: true }],
+        errorsReported: 1,
+        errorsAttributed: 1,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  }
+  const ANAS2 = loadSources(['15-gfx.js', '39-ahr.js'], {
+    'GET /ahr': { data: [ahrPoolRow('ahr0')] },
+    'GET /ahr/ahr0/snapshots': SNAPS,
+    'GET /jobs': OTHER_JOBS,
+  })
+  const view2 = makeComponent(ANAS2.views.ahr.factory('harness'), null)
+  view2.fireEvent('afterrender', view2)
+  await settle()
+  const grid2 = view2.itemId === 'ahrGrid' ? view2 : view2.down('#ahrGrid')
+  if (!grid2) { ok('snaps8: (negative) the grid exists', false); return }
+  grid2.selectRow(grid2.getStore().findExact('name', 'ahr0'))
+  const snapBtn2 = grid2.down('#snapshots')
+  created.windows.length = 0
+  snapBtn2.handler(snapBtn2)
+  await settle()
+  const win2 = openWindow()
+  if (!win2) { ok('snaps8: (negative) the window opens', false); return }
+  const snapGrid2 = win2.down('#ahrSnapGrid')
+  sent = null
+  ANAS2.confirmAndRun = (cfg) => { sent = cfg }
+  snapGrid2.selectRow(0)
+  await settle()
+  win2.down('#ahrSnapRollback').handler(win2.down('#ahrSnapRollback'))
+  await settle()
+  ok('snaps8: rot in a DIFFERENT snapshot does not warn this rollback',
+    sent && !/unrepaired corrupt block/.test(sent.confirmIntro || ''), sent && sent.confirmIntro)
+}
+
+// ============================================================================
+//  Scrubs: Repair from parity, in the findings window (story selfheal.6)
+// ============================================================================
+//
+// The findings window is the ONE place a repair is asked for — the findings are
+// what it is selected from. The contract below is the whole surface: which rows
+// can be ticked (and why the others cannot), when the verb lights up, that it
+// goes out through the confirm-code door with the exact files and blocks the
+// operator picked, and that the job's three buckets come back into the same
+// window — including the honest "still running" when the poll budget ends
+// first.
+
+// A second repairable file, with TWO bad blocks — a repair request carries the
+// block indexes, not a count, and the result is counted per block.
+const FINDING_D = {
+  path: '/mnt/anas-ahr/ahr0/db/pg_data.bin',
+  subvolume: '@data',
+  inode: 402,
+  stripes: [{ logical: 30000000, offset: 0, length: 4096 }],
+  badBlocks: [12, 13],
+}
+// selfheal.8 — a COMPRESSED extent: the kernel's offset is extent-relative, so
+// the probe named the extent's whole file range and the finding carries it.
+// Repairable — the engine repairs the blob when handed any block of the
+// extent, and the request carries the extent's FIRST block.
+const FINDING_E = {
+  path: '/mnt/anas-ahr/ahr0/comp/text.bin',
+  subvolume: '@data',
+  inode: 259,
+  stripes: [{ logical: 953155584, offset: 0, length: 4096 }],
+  badBlocks: Array.from({ length: 32 }, (_, i) => 32 + i),
+  compressed: true,
+  extentBlocks: { first: 32, count: 32 },
+}
+// …and one whose corrupt block could not be named at all: said plainly, with
+// the reason, instead of an empty badBlocks that reads as "nothing found".
+const FINDING_F = {
+  path: '/mnt/anas-ahr/ahr0/comp/other.bin',
+  subvolume: '@data',
+  inode: 260,
+  stripes: [{ logical: 953283584, offset: 0, length: 4096 }],
+  badBlocks: [],
+  unidentified: true,
+  reason: 'no block failed on re-read: either the file changed since the scrub, or the read was served from cache',
+}
+
+const REPAIR_ROUTES = {
+  'GET /scrub': SCRUB_STATES,
+  'GET /jobs': {
+    data: [scrubJob({
+      id: 'r1',
+      at: '2026-09-11T09:00:00.000Z',
+      result: {
+        scrubbed: 'ahr0',
+        btrfsErrors: 'csum=6',
+        checkedArrays: 3,
+        findings: [FINDING_A, FINDING_B, FINDING_C, FINDING_D, FINDING_E, FINDING_F],
+        errorsReported: 6,
+        errorsAttributed: 6,
+        unattributed: 0,
+        truncated: false,
+      },
+    })],
+  },
+}
+
+/** A completed repair job, as the daemon's job route hands it back. */
+function repairJob(result) {
+  return { id: 'rj1', status: 'completed', operation: 'ahr.repair', result }
+}
+
+async function repairFromParityChecks() {
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], REPAIR_ROUTES)
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+  created.windows.length = 0
+  grid.fireEvent('itemclick', grid, rowFor(grid, 'ahr0'), null, 0, onLink)
+  await settle()
+  const win = openWindow()
+  ok('repair: the findings window opens', !!win && win.cls === 'anas-win-scrub-findings')
+  if (!win) { return }
+  const fGrid = win.down('#findingsGrid')
+  const btn = win.down('#repairFromParity')
+  ok('repair: the findings grid is addressable by itemId', !!fGrid)
+  ok('repair: the window carries the Repair from parity button', !!btn && btn.cls === 'anas-btn-repair-parity')
+  if (!fGrid || !btn) { return }
+  eq('repair: the findings are ticked one by one (checkbox selection)',
+    fGrid.selModel && fGrid.selModel.selType, 'checkboxmodel')
+
+  // --- Enablement ------------------------------------------------------------
+  eq('repair: the verb needs a selection', btn.disabled, true)
+  ok('repair: …and says so on the button', /tick the files/.test(btn.tooltip || ''), btn.tooltip)
+
+  // --- Selection rules -------------------------------------------------------
+  // Row order: A (repairable, 1 block), B (missing), C (outsideMount), D (2
+  // blocks), E (compressed extent), F (unidentified).
+  eq('repair: every finding is a row', fGrid.getStore().getCount(), 6)
+  eq('repair: a DELETED file cannot be ticked', fGrid.selectRows([1]).length, 0)
+  eq('repair: a finding inside a SNAPSHOT cannot be ticked', fGrid.selectRows([2]).length, 0)
+  eq('repair: …and the verb stays off', btn.disabled, true)
+  const repairCol = (fGrid.columns || []).find(c => c.dataIndex === 'outcome')
+  ok('repair: the window has a Repair column', !!repairCol)
+  const repairCell = (i) => {
+    const meta = {}
+    const html = repairCol.renderer(fGrid.getStore().getAt(i).get('outcome'), meta, fGrid.getStore().getAt(i))
+    return `${html} ${meta.tdAttr || ''}`
+  }
+  ok('repair: a deleted file says WHY it cannot be repaired',
+    /cannot be repaired/.test(repairCell(1)) && /deleted since the scrub/.test(repairCell(1)), repairCell(1))
+  ok('repair: a snapshot finding says it is outside the mounted tree',
+    /cannot be repaired/.test(repairCell(2)) && /live @data tree only/.test(repairCell(2)), repairCell(2))
+  ok('repair: a repairable file shows nothing yet, not a verdict', /—/.test(repairCell(0)), repairCell(0))
+
+  // selfheal.8 — the two new findings render what they are, never a bare 0.
+  const blocksCol = (fGrid.columns || []).find(c => c.dataIndex === 'blocks')
+  const blockCell = (i) => {
+    const meta = {}
+    const html = blocksCol.renderer(null, meta, fGrid.getStore().getAt(i))
+    return `${html} ${meta.tdAttr || ''}`
+  }
+  ok('repair: a COMPRESSED extent says what it is, with the extent\'s block count',
+    /compressed extent: 32 blocks/.test(blockCell(4)), blockCell(4))
+  ok('repair: …and its tooltip names the failing blocks', /failing 4 KiB file blocks: 32/.test(blockCell(4)), blockCell(4))
+  ok('repair: an UNIDENTIFIED corruption says so instead of showing 0',
+    /corrupt, block not identified/.test(blockCell(5)) && !/>0</.test(blockCell(5)), blockCell(5))
+  ok('repair: …and carries the reason as its tooltip, stating the AMBIGUITY (D9)',
+    /no block failed on re-read: either the file changed since the scrub, or the read was served from cache/.test(blockCell(5)), blockCell(5))
+  ok('repair: …and never claims the file was repaired',
+    !/was repaired/.test(blockCell(5)), blockCell(5))
+
+  eq('repair: a COMPRESSED extent ticks — the engine repairs the blob from any block of it',
+    fGrid.selectRows([4]).length, 1)
+  eq('repair: an UNIDENTIFIED finding cannot be ticked', fGrid.selectRows([5]).length, 0)
+  ok('repair: …and says why, with the reason', /no bad block could be named/.test(repairCell(5)) &&
+    /either the file changed since the scrub, or the read was served from cache/.test(repairCell(5)), repairCell(5))
+
+  eq('repair: two repairable files tick', fGrid.selectRows([0, 3]).length, 2)
+  eq('repair: …and the verb lights up', btn.disabled, false)
+  eq('repair: an unrepairable row ticked ALONGSIDE them is dropped, not carried',
+    fGrid.selectRows([0, 1, 3, 4]).length, 3)
+
+  // --- The confirm-gated request --------------------------------------------
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  btn.handler(btn)
+  await settle()
+  ok('repair: the verb goes through the confirm-code door', !!sent)
+  if (!sent) { return }
+  eq('repair: …to the pool\'s own repair endpoint', sent.path, '/ahr/ahr0/repair')
+  eq('repair: …as a POST', sent.method, 'post')
+  eq('repair: the request names the files IN FULL, never truncated',
+    sent.body.files.map(f => f.path), [FINDING_A.path, FINDING_D.path, FINDING_E.path])
+  eq('repair: …and the exact 4 KiB blocks the scrub probed',
+    sent.body.files.map(f => f.blocks), [[300], [12, 13], [32]])
+  // Seventh pass, F11 — a path is not an identity. The finding's inode rides
+  // along so the daemon can refuse a file that is not the one the scrub read.
+  eq('repair: …and the finding\'s INODE, so the daemon can check identity (F11)',
+    sent.body.files.map(f => f.inode), [FINDING_A.inode, FINDING_D.inode, FINDING_E.inode])
+  ok('repair: …the compressed extent rides as ONE block — its first, not 32 copies of the blob',
+    sent.body.files[2].blocks.length === 1 && sent.body.files[2].blocks[0] === FINDING_E.extentBlocks.first,
+    JSON.stringify(sent.body.files[2]))
+  ok('repair: the confirm dialog says how many blocks in how many files',
+    /4 block\(s\) in 3 file\(s\)/.test(sent.confirmIntro || ''), sent.confirmIntro)
+  ok('repair: the poll budget is raised past the 15 s default (a repair is minutes)',
+    Number(sent.maxMs) > 15000, sent.maxMs)
+  ok('repair: the poll rides the window, not a component that closes', sent.view === win)
+
+  // --- The result, in the same window ---------------------------------------
+  const panel = win.down('#repairResult')
+  ok('repair: the result panel is hidden until there is a result', !!panel && panel.hidden === true)
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'repaired', reason: 'reconstructed from parity' }] },
+      { path: FINDING_D.path, blocks: [
+        { block: 12, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' },
+        { block: 13, outcome: 'above-md', reason: 'parity agrees with the bad data' },
+      ] },
+    ],
+    repaired: 1,
+    unrepairable: 1,
+    aboveMd: 1,
+    blocks: 3,
+  }))
+  await settle()
+  eq('repair: the result appears in the window the request was made from', panel.hidden, false)
+  ok('repair: the three buckets are counted', /1 repaired · 1 unrepairable · 1 above md/.test(panel.html), panel.html)
+  ok('repair: unrepairable says restore from backup', /Restore this file from backup/.test(panel.html), panel.html)
+  ok('repair: above md implicates something other than the disks, as an implication',
+    /implicates something other than the disks/.test(panel.html) && !/proves/.test(panel.html), panel.html)
+  ok('repair: a repaired file carries its verdict on its own row', /repaired/.test(repairCell(0)), repairCell(0))
+  ok('repair: a mixed file says BOTH of its outcomes',
+    /1 unrepairable/.test(repairCell(3)) && /1 above-md/.test(repairCell(3)), repairCell(3))
+
+  // --- review R9 — the mapping-abort bucket reads its own number -------------
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'mapping-abort', reason: 'the bytes still pass their stored checksum' }] },
+    ],
+    repaired: 0,
+    unrepairable: 0,
+    aboveMd: 0,
+    mappingAbort: 1,
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: the mapping-abort count rides the headline, its OWN number',
+    /0 repaired · 0 unrepairable · 0 above md · 1 not corrupt at the mapped location/.test(panel.html), panel.html)
+  ok('repair: mapping-abort says nothing was written and nothing needs a restore',
+    /1 block\(s\) were not corrupt at the mapped location. Nothing was written, nothing to restore/.test(panel.html), panel.html)
+  ok('repair: …and the restore advice stays reserved for the TRUE unrepairable',
+    !/restore this file from backup/.test(panel.html), panel.html)
+
+  // --- Seventh pass, F3 — the NOT-EXAMINED bucket ---------------------------
+  // A block the mapping could not reach was never looked at. It used to borrow
+  // the mapping-abort sentence, which asserts the bytes still pass their stored
+  // checksum — a reassurance about blocks nobody read.
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'not-examined', reason: 'block 300 is a hole', reasonCode: 'hole' }] },
+    ],
+    repaired: 0,
+    unrepairable: 0,
+    aboveMd: 0,
+    mappingAbort: 0,
+    notExamined: 1,
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: the not-examined count rides the headline as its OWN number (F3)',
+    /0 repaired · 0 unrepairable · 0 above md · 0 not corrupt at the mapped location · 1 not examined/.test(panel.html), panel.html)
+  ok('repair: …with the reason code, and nothing is known about the bytes',
+    /could not be EXAMINED \(hole\)/.test(panel.html)
+      && /nothing is known about those bytes/.test(panel.html), panel.html)
+  ok('repair: …neither a clean bill of health nor a reason to restore',
+    /neither a clean bill of health nor a reason to restore/.test(panel.html)
+      && !/restore this file from backup/.test(panel.html)
+      && !/need no restore/.test(panel.html), panel.html)
+
+  // --- Seventh pass, F2 — a repaired block that left a PARITY residual ------
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'repaired', reason: 'repaired; the band still has a parity/Q mismatch' }] },
+    ],
+    repaired: 1,
+    unrepairable: 0,
+    aboveMd: 0,
+    mappingAbort: 0,
+    notExamined: 0,
+    parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: a parity residual is reported, naming the band and md\'s count (F2)',
+    /Repaired, and md still counts mismatching stripes on ahr0-r1 \(mismatch_cnt 8\)/.test(panel.html), panel.html)
+  ok('repair: …and points at Rewrite parity, never a restore',
+    /Rewrite parity on that band/.test(panel.html)
+      && /No fresh scrub is needed/.test(panel.html)
+      && !/restore/i.test(panel.html), panel.html)
+
+  // --- D3/D10 — the csum-unreadable verdict does NOT say restore -------------
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [
+        { block: 300, outcome: 'unrepairable', reason: 'the metadata copy holding the checksum is damaged', reasonCode: 'csum-unreadable' },
+      ] },
+    ],
+    repaired: 0,
+    unrepairable: 1,
+    aboveMd: 0,
+    mappingAbort: 0,
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: a csum-unreadable file says the checksum could not be read',
+    /checksum could not be read reliably/.test(panel.html), panel.html)
+  ok('repair: …and says re-scrub after the metadata is repaired',
+    /re-scrub after the metadata is repaired/.test(panel.html), panel.html)
+  ok('repair: …and NEVER tells the operator to restore data never proven bad',
+    !/restore this file from backup/.test(panel.html), panel.html)
+  ok('repair: …naming the file it applies to', panel.html.includes(FINDING_A.path), panel.html)
+
+  // A MIXED file keeps the ordinary restore advice: only one of its blocks
+  // carries the code, and nothing else can prove the other one.
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_D.path, blocks: [
+        { block: 12, outcome: 'unrepairable', reason: 'the metadata copy holding the checksum is damaged', reasonCode: 'csum-unreadable' },
+        { block: 13, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' },
+      ] },
+    ],
+    repaired: 0,
+    unrepairable: 2,
+    aboveMd: 0,
+    mappingAbort: 0,
+    blocks: 2,
+  }))
+  await settle()
+  ok('repair: a MIXED unrepairable file keeps the ordinary restore advice',
+    /Restore this file from backup/.test(panel.html), panel.html)
+  ok('repair: …and does not claim the checksum was unreadable for it',
+    !/checksum could not be read reliably/.test(panel.html), panel.html)
+
+  // --- The honest "not finished" --------------------------------------------
+  sent.onComplete({ id: 'rj2', status: 'running' })
+  await settle()
+  ok('repair: a job still running claims no result', /still running/.test(panel.html), panel.html)
+  ok('repair: …and says where the answer will arrive', /notification/.test(panel.html), panel.html)
+}
+
+// ============================================================================
+//  Scrubs: Repair on the TOOLBAR (story selfheal.9)
+// ============================================================================
+//
+// The verb's standing home: a Repair action beside Run now / Stop, lit by the
+// ONE enablement rule the window's button is lit by (repairableFindings over
+// the selected AHR pool's last completed scrub), greyed with the reason on the
+// button otherwise. Clicking it opens the SAME findings window, the repairable
+// rows already ticked — the toolbar establishes what is repairable, the
+// operator only confirms.
+
+async function scrubToolbarRepairChecks() {
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], REPAIR_ROUTES)
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  const btn = grid.down('#scrubRepair')
+  ok('scrubrepair: the toolbar carries the Repair verb', !!btn && btn.cls === 'anas-btn-scrub-repair')
+  if (!btn) { return }
+
+  // --- Enablement, with the reason ON the button -----------------------------
+  ok('scrubrepair: nothing selected keeps it off', btn.disabled === true)
+  ok('scrubrepair: …and says an AHR pool is wanted', /select an AHR pool/.test(btn.tooltip || ''), btn.tooltip)
+
+  grid.selectRow(grid.getStore().findExact('pool', 'tank'))
+  ok('scrubrepair: a ZFS row keeps it off', btn.disabled === true)
+  ok('scrubrepair: …still saying an AHR pool is wanted', /select an AHR pool/.test(btn.tooltip || ''), btn.tooltip)
+
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr1'))
+  ok('scrubrepair: an AHR row with no findings keeps it off', btn.disabled === true)
+  ok('scrubrepair: …saying the daemon holds nothing for this pool',
+    /no scrub findings for this pool since the daemon started/.test(btn.tooltip || ''), btn.tooltip)
+
+  // ahr0's recovered findings include repairable rows (A, D, E) — the verb lights.
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr0'))
+  ok('scrubrepair: an AHR row with a repairable finding lights it', btn.disabled === false)
+  ok('scrubrepair: …with no tooltip standing in the way', !btn.tooltip, btn.tooltip)
+
+  // Findings that are ALL blocked: off, and the tooltip counts each kind in the
+  // window's own per-row words — one rule, said twice at different zooms.
+  const ahr0 = rowFor(grid, 'ahr0')
+  const saved = ahr0.get('findings')
+  ahr0.set('findings', { at: saved.at, result: { findings: [FINDING_B, FINDING_C, FINDING_F] } })
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr0'))
+  const tip = btn.tooltip || ''
+  ok('scrubrepair: findings that are all deleted/snapshot/unnamed keep it off', btn.disabled === true)
+  ok('scrubrepair: …and the tooltip says the findings cannot be repaired from here',
+    /findings cannot be repaired from here/.test(tip), tip)
+  ok('scrubrepair: …counting each blocked kind the window states per row',
+    /1 file deleted since the scrub/.test(tip)
+    && /1 finding in a snapshot, outside the mounted tree/.test(tip)
+    && /1 corruption whose bad block could not be named/.test(tip), tip)
+  ahr0.set('findings', saved)
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr0'))
+
+  // --- The click: the SAME window, repairable rows preselected ---------------
+  created.windows.length = 0
+  btn.handler(btn)
+  await settle()
+  const win = openWindow()
+  ok('scrubrepair: the click opens the findings window', !!win && win.cls === 'anas-win-scrub-findings')
+  if (!win) { return }
+  const fGrid = win.down('#findingsGrid')
+  const wBtn = win.down('#repairFromParity')
+  ok('scrubrepair: the ONE findings window, its Repair button included',
+    !!fGrid && !!wBtn && wBtn.cls === 'anas-btn-repair-parity')
+  if (!fGrid || !wBtn) { return }
+  eq('scrubrepair: exactly the repairable rows arrive ticked, none of the blocked ones',
+    fGrid.getSelection().map(r => r.get('path')), [FINDING_A.path, FINDING_D.path, FINDING_E.path])
+  eq('scrubrepair: the window verb is lit without the operator ticking anything', wBtn.disabled, false)
+}
+
+// ============================================================================
+//  Scrubs: the two-phase AHR scrub surface (story selfheal.4)
+// ============================================================================
+//
+// The periodic AHR scrub is the WHOLE scrub now — phase 1 md parity, then
+// phase 2 btrfs checksums — on one node-level ANAS timer with a monthly or
+// quarterly cadence. The contract here: the AHR row names both phases (and the
+// next fire when the timer reports one), the cadence selector lives exactly
+// where the toggle lives (the toolbar, AHR-only, no new menu/window), the
+// toggle body carries the cadence, and the confirm dialog states the node-level
+// scope and the mdcheck takeover.
+
+async function scrubTwoPhaseChecks() {
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], SCRUB_ROUTES)
+  const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
+  const grid = view.down('#scrubGrid')
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  const ahr0 = rowFor(grid, 'ahr0')
+  const ahr1 = rowFor(grid, 'ahr1')
+  const tank = rowFor(grid, 'tank')
+  if (!ahr0 || !ahr1 || !tank) { ok('scrubs2: every pool is a row', false); return }
+
+  // --- The phases on the row -------------------------------------------------
+  // ahr1 is OFF with no findings: the idle AHR cell names both phases and says
+  // there is no next fire.
+  const offCell = scrubCell(grid, ahr1)
+  ok('scrubs2: the AHR row names both phases in order',
+    /phase 1 parity \(md\) → phase 2 checksums \(btrfs\)/.test(offCell), offCell)
+  ok('scrubs2: an OFF pool claims no next run', !/>?next/.test(offCell), offCell)
+  ok('scrubs2: the md-keeps-no-record honesty stays on the row',
+    /md keeps no completion record/.test(offCell), offCell)
+
+  // An ON pool shows the timer's next fire — but the findings cell outranks it,
+  // so the findings are set aside for the check and put back after.
+  const savedFindings = ahr0.get('findings')
+  ahr0.set('findings', null)
+  ahr0.set('nextRun', '2026-10-04T03:00:00.000Z')
+  const onCell = scrubCell(grid, ahr0)
+  ok('scrubs2: an ON pool shows the timer\'s next fire',
+    /; next /.test(onCell), onCell)
+  ahr0.set('nextRun', null)
+  ahr0.set('findings', savedFindings)
+
+  // A ZFS row never grew phase wording.
+  ok('scrubs2: a ZFS row says neither phase', !/phase 1 parity/.test(scrubCell(grid, tank)))
+
+  // --- The cadence selector + the toggle body --------------------------------
+  const cad = grid.down('#scrubCadence')
+  ok('scrubs2: the cadence selector exists beside the toggle (no new menu/window)', !!cad)
+  ok('scrubs2: it starts disabled with nothing selected', !!cad && cad.disabled === true)
+
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr1'))
+  ok('scrubs2: the selector enables for an AHR row', !!cad && cad.disabled === false)
+  ok('scrubs2: it shows the row\'s cadence', !!cad && cad.value === 'quarterly')
+
+  cad.value = 'quarterly'
+  jobs.length = 0
+  confirms.length = 0
+  grid.down('#scrubToggle').handler(grid.down('#scrubToggle'))
+  ok('scrubs2: the AHR toggle confirms the node-level scope',
+    confirms.some(c => /node-level timer/.test(c.title)), JSON.stringify(confirms))
+  ok('scrubs2: the enable confirm says mdcheck is turned off',
+    confirms.some(c => /mdcheck timers will be turned off/.test(c.msg)))
+  // review R10 — Persistent=true + a leftover stamp means the enable may start
+  // the whole scrub immediately when the month's occurrence was already missed.
+  ok('scrubs2: the enable confirm warns that a missed occurrence may start a scrub right away',
+    confirms.some(c => /missed/.test(c.msg) && /RIGHT AWAY/.test(c.msg)))
+
+  // review cut-but-verified — the 10 s poll must not yank the cadence value out
+  // from under the operator while they are choosing it.
+  grid.selectRow(grid.getStore().findExact('pool', 'ahr1'))
+  ok('scrubs2: the selector shows the row cadence before the guard', cad.value === 'quarterly')
+  cad.value = 'monthly'
+  cad.hasFocus = true // the operator is mid-choice
+  grid.fireEvent('selectionchange', grid)
+  ok('scrubs2: a FOCUSED cadence selector is left alone by the poll', cad.value === 'monthly')
+  cad.hasFocus = false
+  grid.fireEvent('selectionchange', grid)
+  ok('scrubs2: …and picks the row\'s cadence back up once the operator is done', cad.value === 'quarterly')
+  ok('scrubs2: the AHR toggle body carries the cadence',
+    jobs.some(j => j.method === 'put' && j.path === '/scrub/ahr/ahr1'
+      && j.body.enabled === true && j.body.cadence === 'quarterly'), JSON.stringify(jobs))
+
+  grid.selectRow(grid.getStore().findExact('pool', 'tank'))
+  ok('scrubs2: the selector is ZFS-disabled (PVE\'s cron owns ZFS cadence)', !!cad && cad.disabled === true)
+  jobs.length = 0
+  grid.down('#scrubToggle').handler(grid.down('#scrubToggle'))
+  ok('scrubs2: the ZFS toggle body carries no cadence',
+    jobs.some(j => j.method === 'put' && j.path === '/scrub/zfs/tank'
+      && j.body.enabled === false && !('cadence' in j.body)), JSON.stringify(jobs))
+}
+
+// ============================================================================
+//  Disks (story 3.18) — the stale/standby marker on the Health cell
+// ============================================================================
+//
+//  The daemon reports a disk's LAST KNOWN SMART state as `smartStale` +
+//  `smartStaleReason` ('standby' | 'probe-failed') — the value shown is the
+//  last measured one, not current. The Health cell must render that as a muted
+//  "(last known — …)" suffix + tooltip, and render NOTHING extra on a fresh
+//  reading or on an older daemon that omits the fields (version skew).
+
+async function disksStaleHealthChecks() {
+  const ANAS = loadSource('40-disks.js', { 'GET /disks': { data: [] } })
+  ok('disks: the disks view registered', !!ANAS.views['disks'])
+  const gridCfg = ANAS.views['disks'].factory('n1').items[0]
+  const healthCol = gridCfg.columns.find(c => c.dataIndex === 'healthStatus')
+  ok('disks: the Health column exists', !!healthCol)
+  const render = (v, data) => healthCol.renderer(v, {}, makeRecord(data))
+
+  // A fresh reading: the icon + label, no marker.
+  const fresh = render('healthy', { healthStatus: 'healthy' })
+  ok('disks: a fresh reading renders no stale marker', !/last known/.test(fresh), fresh)
+
+  // Stale — standby: the last measured value, with the muted suffix + tooltip.
+  const standby = render('healthy', { healthStatus: 'healthy', smartStale: true, smartStaleReason: 'standby' })
+  ok('disks: a standby disk reads "last known — disk in standby"', /last known — disk in standby/.test(standby), standby)
+  ok('disks: the standby marker is muted and carries a tooltip',
+    /anas-health-stale/.test(standby) && /title=/.test(standby), standby)
+
+  // Stale — probe failed.
+  const failed = render('healthy', { healthStatus: 'healthy', smartStale: true, smartStaleReason: 'probe-failed' })
+  ok('disks: a failed probe reads "last known — probe failed"', /last known — probe failed/.test(failed), failed)
+
+  // The marker belongs to the cell, not the level: an unknown cell keeps it too.
+  const unknown = render('unknown', { healthStatus: 'unknown', smartStale: true, smartStaleReason: 'probe-failed' })
+  ok('disks: the marker renders on an unknown cell too', /last known — probe failed/.test(unknown), unknown)
+
+  // Version skew: an old daemon omits both fields — the cell is byte-identical
+  // to what it was before the marker existed.
+  const old = render('healthy', { healthStatus: 'healthy', smartStale: undefined, smartStaleReason: undefined })
+  ok('disks: an absent marker (old daemon) renders the cell exactly as before', old === fresh, old)
+}
+
+// ============================================================================
+//  Share Users (identity.1) — mixed-case names, need-gated confirm-gated
+//  delete on both grids, and the private-group label
+// ============================================================================
+
+const USER_ROWS = [
+  { name: 'Alice', uid: 1000, fullName: 'Alice Example', primaryGroup: 'users', groups: ['users', 'smbusers'], smbEnabled: true, locked: false, local: true },
+  { name: 'aduser', uid: 6000, fullName: null, primaryGroup: null, groups: [], smbEnabled: false, locked: false, local: false },
+]
+const GROUP_ROWS = [
+  // A pre-existing user-private group (identity.1c): the same name as user
+  // `Alice`, whose primary gid is this group.
+  { name: 'alice', gid: 2000, members: ['Alice'], local: true, privateGroupOf: 'Alice' },
+  { name: 'smbusers', gid: 1001, members: ['Alice', 'backup-svc'], local: true },
+  { name: 'adgroup', gid: 6001, members: ['aduser'], local: false },
+]
+const USER_ROUTES = {
+  'GET /identity/users': { data: USER_ROWS },
+  'GET /identity/groups': { data: GROUP_ROWS },
+}
+
+async function openUsersView(routes = USER_ROUTES) {
+  const ANAS = loadSource('80-users.js', routes)
+  const view = makeComponent(ANAS.views.users.factory('harness'), null)
+  const usersGrid = view.down('#usersGrid')
+  const groupsGrid = view.down('#groupsGrid')
+  usersGrid.fireEvent('afterrender', usersGrid)
+  groupsGrid.fireEvent('afterrender', groupsGrid)
+  await settle()
+  return { view, usersGrid, groupsGrid }
+}
+
+async function shareUsersChecks() {
+  const { usersGrid, groupsGrid } = await openUsersView()
+  ok('users: both grids exist', !!usersGrid && !!groupsGrid)
+  eq('users: the user rows loaded', usersGrid.getStore().getCount(), USER_ROWS.length)
+  eq('groups: the group rows loaded', groupsGrid.getStore().getCount(), GROUP_ROWS.length)
+
+  // --- (a) the client-side name rule mirrors the schema: mixed case legal ---
+  jobs.length = 0
+  warnings.length = 0
+  findCmp(usersGrid, 'anas-btn-user-add').handler(null)
+  await settle()
+  let win = openWindow()
+  ok('create: the New User dialog opened', !!win && !!win.down('#name'))
+  if (win) {
+    const nameField = win.down('#name')
+    // The FIELD regex and the submit-handler regex are the same constant —
+    // assert the constant through the field config.
+    ok('create: the name rule accepts a mixed-case name', nameField.regex.test('Alice') === true)
+    ok('create: the name rule still rejects a leading digit', nameField.regex.test('9bad') === false)
+    ok('create: the name rule still rejects a leading dash', nameField.regex.test('-x') === false)
+    ok('create: the name rule accepts a trailing $', nameField.regex.test('machine$') === true)
+    ok('create: the field hint no longer says lowercase', !/lowercase/i.test(nameField.regexText), nameField.regexText)
+
+    // The submit gate: an invalid name alerts (the NEW wording) and sends nothing.
+    nameField.setValue('9bad')
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    ok('create: an invalid name sends nothing', jobs.length === 0, JSON.stringify(jobs))
+    ok('create: it alerts with the mixed-case wording',
+      warnings.some(w => /Enter a valid username \(letters, digits, _ and -\)/.test(w)),
+      JSON.stringify(warnings))
+
+    // …and a mixed-case name does send, verbatim.
+    nameField.setValue('Alice')
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create: a mixed-case name POSTs verbatim',
+      [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path, jobs[0] && jobs[0].body],
+      ['post', '/identity/users', { name: 'Alice' }])
+    if (!win.destroyed) { win.close() }
+  }
+
+  // The group dialog carries the same rule and its own message.
+  jobs.length = 0
+  warnings.length = 0
+  created.windows.length = 0
+  findCmp(groupsGrid, 'anas-btn-group-add').handler(null)
+  await settle()
+  win = openWindow()
+  ok('group create: the dialog opened', !!win && !!win.down('#name'))
+  if (win) {
+    const gname = win.down('#name')
+    ok('group create: the name rule accepts a mixed-case name', gname.regex.test('Media') === true)
+    ok('group create: the field hint no longer says lowercase', !/lowercase/i.test(gname.regexText), gname.regexText)
+    gname.setValue('9bad')
+    win.buttonCmps.find(b => b.cls === 'anas-btn-group-create-submit').handler(null)
+    await settle()
+    eq('group create: an invalid name sends nothing', jobs.length, 0)
+    ok('group create: it alerts with the mixed-case wording',
+      warnings.some(w => /Enter a valid group name \(letters, digits, _ and -\)/.test(w)),
+      JSON.stringify(warnings))
+    if (!win.destroyed) { win.close() }
+  }
+
+  // --- (c) the private-group label on the group Name cell -------------------
+  const nameCol = groupsGrid.columns.find(c => c.dataIndex === 'name')
+  ok('groups: the Name column has the private-group renderer', !!nameCol && typeof nameCol.renderer === 'function')
+  const privCell = nameCol.renderer('alice', {}, makeRecord(GROUP_ROWS[0]))
+  ok('groups: a private group is labelled as one', /private group of\s*Alice/.test(privCell), privCell)
+  const plainCell = nameCol.renderer('smbusers', {}, makeRecord(GROUP_ROWS[1]))
+  ok('groups: a plain group renders bare', plainCell === 'smbusers', plainCell)
+
+  // --- (d) delete: need-gated, confirm-code flow, refresh --------------------
+  // No selection: both Delete doors are dead.
+  let state = toolbarState(usersGrid, ['userDelete'])
+  ok('delete(user): no selection — Delete is disabled', state.userDelete.disabled === true)
+  // A directory user: read-only, still dead.
+  usersGrid.selectRow(1)
+  state = toolbarState(usersGrid, ['userDelete', 'userSmbpw', 'userToggle'])
+  ok('delete(user): a directory user — Delete is disabled', state.userDelete.disabled === true)
+  ok('delete(user): the other mutations stay disabled too', state.userSmbpw.disabled === true && state.userToggle.disabled === true)
+  // A LOCAL user: live.
+  usersGrid.selectRow(0)
+  state = toolbarState(usersGrid, ['userDelete'])
+  ok('delete(user): a local user — Delete is enabled', state.userDelete.disabled === false)
+
+  jobs.length = 0
+  apiGets.length = 0
+  usersGrid.down('#userDelete').handler(usersGrid.down('#userDelete'))
+  await settle()
+  eq('delete(user): exactly one request', jobs.length, 1)
+  eq('delete(user): it DELETEs the selected user',
+    [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path],
+    ['del', '/identity/users/Alice'])
+  ok('delete(user): it goes through the CONFIRM-CODE flow (confirmAndRun), not a plain job',
+    jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === false,
+    JSON.stringify(jobs[0] || {}))
+  ok('delete(user): the grids REFRESH after the job is accepted',
+    apiGets.includes('/identity/users') && apiGets.includes('/identity/groups'),
+    JSON.stringify(apiGets))
+
+  // The group door: local row live, directory row dead.
+  groupsGrid.selectRow(2)
+  state = toolbarState(groupsGrid, ['groupDelete'])
+  ok('delete(group): a directory group — Delete is disabled', state.groupDelete.disabled === true)
+  groupsGrid.selectRow(1)
+  state = toolbarState(groupsGrid, ['groupDelete'])
+  ok('delete(group): a local group — Delete is enabled', state.groupDelete.disabled === false)
+
+  jobs.length = 0
+  groupsGrid.down('#groupDelete').handler(groupsGrid.down('#groupDelete'))
+  await settle()
+  eq('delete(group): exactly one request', jobs.length, 1)
+  eq('delete(group): it DELETEs the selected group',
+    [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path],
+    ['del', '/identity/groups/smbusers'])
+  ok('delete(group): it goes through the confirm-code flow too',
+    jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === false,
+    JSON.stringify(jobs[0] || {}))
+}
+
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
@@ -7059,6 +8907,64 @@ await restoreRepoNamespacePrefillCheck()
 warnings.length = 0
 created.windows.length = 0
 await taskDoorOnDoneCheck()
+warnings.length = 0
+created.windows.length = 0
+// Story selfheal.3 — the AHR scrub's findings on the Scrubs row, and the one
+// window they open.
+await scrubFindingsChecks()
+warnings.length = 0
+created.windows.length = 0
+// Fourth pass — the unverified-window suffix is rendered in the bad-block cell.
+await scrubUnverifiedWindowCheck()
+// Design review 2026-09-14 — the parity line in the findings window (D1), and
+// the AHR Snapshots manager's pin labelling + rollback warning (D15, S8).
+warnings.length = 0
+created.windows.length = 0
+await scrubParityWindowCheck()
+// Story selfheal.10 — the Rewrite parity action behind that indicator.
+warnings.length = 0
+created.windows.length = 0
+await rewriteParityChecks()
+warnings.length = 0
+created.windows.length = 0
+await rewriteParityRefusedChecks()
+await rewriteParityMirrorChecks()
+// Story selfheal.11 — Reconcile mirror, in that same window.
+warnings.length = 0
+created.windows.length = 0
+await mirrorReconcileChecks()
+warnings.length = 0
+created.windows.length = 0
+await mirrorReconcileRefusedChecks()
+warnings.length = 0
+created.windows.length = 0
+await parityResidualFromRepairChecks()
+warnings.length = 0
+created.windows.length = 0
+await ahrSnapshotPinChecks()
+// Story selfheal.4 — the two-phase surface: phases + next run on the row, the
+// cadence selector beside the toggle, the toggle body and its confirm.
+warnings.length = 0
+created.windows.length = 0
+await scrubTwoPhaseChecks()
+warnings.length = 0
+created.windows.length = 0
+// Story selfheal.6 — Repair from parity, in that same window.
+await repairFromParityChecks()
+warnings.length = 0
+created.windows.length = 0
+// Story selfheal.9 — Repair from parity on the Scrubs toolbar too, need-gated,
+// one enablement rule for both doors.
+await scrubToolbarRepairChecks()
+// Disks (story 3.18) — the stale/standby marker on the Health cell.
+warnings.length = 0
+created.windows.length = 0
+await disksStaleHealthChecks()
+// Share Users (identity.1) — mixed-case name rule, need-gated confirm-gated
+// delete on both grids, and the private-group label.
+warnings.length = 0
+created.windows.length = 0
+await shareUsersChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

@@ -44,9 +44,19 @@ const TEMPLATE_RE = /^[a-z0-9-]+$/
  * Argument-safe Perl body: severity/title/message arrive via @ARGV (never
  * interpolated into code), so no quoting/injection surface exists. The template
  * name is validated against {@link TEMPLATE_RE} before it lands here.
+ *
+ * @ARGV is DECODED from UTF-8 first (selfheal.7 live proof, F1). Perl hands
+ * @ARGV over as bytes with no UTF8 flag, and PVE's mail renderer encodes the
+ * body to UTF-8 on its way out — so every byte of a multi-byte character got
+ * encoded a second time and an em dash arrived as `â€"`. ANAS's own notification
+ * bodies are full of them ("rot exists in sh7-r1 — phase 2 …"), so this hit
+ * every message the product sends, not an edge case. `FB_DEFAULT` keeps the
+ * call total: a byte sequence that is somehow not UTF-8 becomes U+FFFD rather
+ * than dying and costing the notification.
  */
 function perlNotifyBody(template: string): string {
-  return 'use PVE::Notify; my ($sev, $title, $msg) = @ARGV; '
+  return 'use PVE::Notify; use Encode qw(decode); '
+    + 'my ($sev, $title, $msg) = map { decode(\'UTF-8\', $_, Encode::FB_DEFAULT) } @ARGV; '
     + `PVE::Notify::notify($sev, '${template}', { title => $title, message => $msg }, { type => '${template}' });`
 }
 

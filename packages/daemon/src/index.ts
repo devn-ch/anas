@@ -6,6 +6,8 @@ import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
+import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
+import { DEFAULT_SYSTEMD_DIR } from './services/snapshot-schedule-units.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
 // no-env manual launch must NOT land the trust-boundary socket in world-writable
@@ -66,6 +68,34 @@ async function main() {
           server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
       }).catch((err) => {
         server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
+      }).then(() => reconcileSelfhealState(decorated.executor, {
+        // The socket is already listening (it has to be — the boot scan above
+        // takes minutes on a real node), so a Repair or a Rewrite parity can
+        // be in flight by the time this runs. Its md knobs and its transient
+        // snapshot are in USE; reconciling over them sweeps the pin and widens
+        // the window under a live run (sixth pass, N9).
+        activeJob: pool => decorated.jobQueue.findActive(
+          ['ahr.repair', 'ahr.parity-rewrite', 'ahr.mirror-reconcile', 'ahr.scrub'],
+          pool,
+        ) ?? null,
+        // The mdcheck-ownership note (the preset ruling, F7) reads the node's
+        // unit directory — the same one the scrub toggle writes.
+        systemdDir: DEFAULT_SYSTEMD_DIR,
+      })).then((report) => {
+        if (reconcileWasQuiet(report))
+          return
+        for (const line of report.notes)
+          server.log.warn(`selfheal reconcile: ${line}`)
+        for (const line of report.restored)
+          server.log.warn(`selfheal reconcile: ${line}`)
+        for (const line of report.snapshots)
+          server.log.warn(`selfheal reconcile: swept transient snapshot ${line}`)
+        for (const line of report.skipped)
+          server.log.info(`selfheal reconcile: ${line}`)
+        for (const line of report.errors)
+          server.log.warn(`selfheal reconcile: ${line}`)
+      }).catch((err) => {
+        server.log.warn(`selfheal reconcile failed: ${err instanceof Error ? err.message : String(err)}`)
       })
 
       // iSCSI stub quarantine (story `iscsi.8`, live-proof F2): `targetctl
@@ -84,6 +114,12 @@ async function main() {
         if (outcomes.length > 0)
           server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI menu once the filesystem is mounted`)
       })
+
+      // No periodic-scrub adoption here (review F1/F4, design reversal
+      // 2026-09-13): mdcheck's timers are enabled by default on a stock node, so
+      // their presence is not an opt-in. A node that has never enabled the ANAS
+      // scrub keeps its OS parity check exactly as it is; the legacy state is
+      // only REPORTED by GET /v1/scrub (mechanism 'mdcheck-timer' + note).
     }
   }
   catch (err) {

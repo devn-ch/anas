@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { parsePdbeditNames } from '../pdbedit.js'
+import { parsePdbeditNames, passdbHas, sameIdentityName } from '../pdbedit.js'
 
 describe('parsePdbeditNames', () => {
   it('collects usernames from `username:uid:gecos` lines', () => {
@@ -21,5 +21,35 @@ describe('parsePdbeditNames', () => {
   it('returns an empty set for empty output', () => {
     assert.equal(parsePdbeditNames('').size, 0)
     assert.equal(parsePdbeditNames('\n\n').size, 0)
+  })
+})
+
+describe('sameIdentityName (identity.1b)', () => {
+  it('folds case in both directions', () => {
+    assert.equal(sameIdentityName('Alice', 'alice'), true)
+    assert.equal(sameIdentityName('alice', 'ALICE'), true)
+    assert.equal(sameIdentityName('backup-svc', 'backup-svc'), true)
+  })
+
+  it('is false for different names and for names that differ only by case-insensitivity-irrelevant structure', () => {
+    assert.equal(sameIdentityName('alice', 'alice2'), false)
+    assert.equal(sameIdentityName('alice', 'alicex'), false)
+    assert.equal(sameIdentityName('', ''), true)
+    assert.equal(sameIdentityName('', 'a'), false)
+  })
+})
+
+describe('passdbHas (identity.1b)', () => {
+  const names = new Set(['ALICE', 'backup-svc'])
+
+  it('finds an account whose passdb entry holds a different case', () => {
+    assert.equal(passdbHas(names, 'Alice'), true)
+    assert.equal(passdbHas(names, 'alice'), true)
+    assert.equal(passdbHas(names, 'backup-svc'), true)
+  })
+
+  it('is false for absent accounts', () => {
+    assert.equal(passdbHas(names, 'bob'), false)
+    assert.equal(passdbHas(names, 'ALICEX'), false)
   })
 })

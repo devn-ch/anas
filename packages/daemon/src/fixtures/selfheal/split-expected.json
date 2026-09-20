@@ -1,0 +1,73 @@
+{
+ "inode": 257,
+ "subvolume": 256,
+ "block": 300,
+ "file_offset": 1228800,
+ "extent_file_offset": 1052672,
+ "extent_disk_byte": 13631488,
+ "extent_disk_nr": 8388608,
+ "extent_data_offset": 1052672,
+ "extent_nr": 7335936,
+ "extent_ram": 8388608,
+ "logical_byte": 14860288,
+ "logical_byte_without_extent_data_offset": 13807616,
+ "stored_csum": "0x8b9126a3",
+ "stored_csum_at_wrong_logical": "0xa36a7021",
+ "crc32c_of_block": "0x8b9126a3",
+ "csum_item": {
+  "start": 13631488,
+  "itemoff": 8091,
+  "itemsize": 8192,
+  "leaf": 30801920
+ },
+ "items": [
+  {
+   "inode": 257,
+   "file_offset": 0,
+   "disk_byte": 13631488,
+   "disk_nr": 8388608,
+   "extent_offset": 0,
+   "nr": 1048576,
+   "ram": 8388608,
+   "compression": "none"
+  },
+  {
+   "inode": 257,
+   "file_offset": 1048576,
+   "disk_byte": 84082688,
+   "disk_nr": 4096,
+   "extent_offset": 0,
+   "nr": 4096,
+   "ram": 4096,
+   "compression": "none"
+  },
+  {
+   "inode": 257,
+   "file_offset": 1052672,
+   "disk_byte": 13631488,
+   "disk_nr": 8388608,
+   "extent_offset": 1052672,
+   "nr": 7335936,
+   "ram": 8388608,
+   "compression": "none"
+  }
+ ],
+ "backrefs": [
+  {
+   "logical": 13631488,
+   "length": 8388608,
+   "root": 256,
+   "objectid": 257,
+   "offset": 0,
+   "count": 2
+  },
+  {
+   "logical": 84082688,
+   "length": 4096,
+   "root": 256,
+   "objectid": 257,
+   "offset": 1048576,
+   "count": 1
+  }
+ ]
+}

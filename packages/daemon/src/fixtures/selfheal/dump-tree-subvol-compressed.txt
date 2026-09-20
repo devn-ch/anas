@@ -1,0 +1,113 @@
+btrfs-progs v6.14
+leaf 30539776 items 22 free space 14468 generation 10 owner 256
+leaf 30539776 flags 0x1(WRITTEN) backref revision 1
+fs uuid 0b32357b-8d09-458c-b0b6-8496f44af1a7
+chunk uuid ab2acde9-38dd-4315-badc-68f6a5b81bdc
+	item 0 key (256 INODE_ITEM 0) itemoff 16123 itemsize 160
+		generation 9 transid 10 size 10 nbytes 0
+		block group 0 mode 40755 links 1 uid 0 gid 0 rdev 0
+		sequence 517 flags 0x0(none)
+		atime 1789165299.836473420 (2026-09-11 22:21:39)
+		ctime 1789165299.873474651 (2026-09-11 22:21:39)
+		mtime 1789165299.873474651 (2026-09-11 22:21:39)
+		otime 1789165299.836473420 (2026-09-11 22:21:39)
+	item 1 key (256 INODE_REF 256) itemoff 16111 itemsize 12
+		index 0 namelen 2 name: ..
+	item 2 key (256 DIR_ITEM 1912358436) itemoff 16076 itemsize 35
+		location key (257 INODE_ITEM 0) type FILE
+		transid 10 data_len 0 name_len 5
+		name: f.bin
+	item 3 key (256 DIR_INDEX 2) itemoff 16041 itemsize 35
+		location key (257 INODE_ITEM 0) type FILE
+		transid 10 data_len 0 name_len 5
+		name: f.bin
+	item 4 key (257 INODE_ITEM 0) itemoff 15881 itemsize 160
+		generation 10 transid 10 size 2097152 nbytes 2097152
+		block group 0 mode 100644 links 1 uid 0 gid 0 rdev 0
+		sequence 1035 flags 0x0(none)
+		atime 1789165299.873474651 (2026-09-11 22:21:39)
+		ctime 1789165299.882474950 (2026-09-11 22:21:39)
+		mtime 1789165299.882474950 (2026-09-11 22:21:39)
+		otime 1789165299.873474651 (2026-09-11 22:21:39)
+	item 5 key (257 INODE_REF 256) itemoff 15866 itemsize 15
+		index 2 namelen 5 name: f.bin
+	item 6 key (257 EXTENT_DATA 0) itemoff 15813 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13631488 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 7 key (257 EXTENT_DATA 131072) itemoff 15760 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13635584 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 8 key (257 EXTENT_DATA 262144) itemoff 15707 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13639680 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 9 key (257 EXTENT_DATA 393216) itemoff 15654 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13643776 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 10 key (257 EXTENT_DATA 524288) itemoff 15601 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13647872 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 11 key (257 EXTENT_DATA 655360) itemoff 15548 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13651968 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 12 key (257 EXTENT_DATA 786432) itemoff 15495 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13656064 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 13 key (257 EXTENT_DATA 917504) itemoff 15442 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13660160 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 14 key (257 EXTENT_DATA 1048576) itemoff 15389 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13664256 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 15 key (257 EXTENT_DATA 1179648) itemoff 15336 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13668352 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 16 key (257 EXTENT_DATA 1310720) itemoff 15283 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13672448 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 17 key (257 EXTENT_DATA 1441792) itemoff 15230 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13676544 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 18 key (257 EXTENT_DATA 1572864) itemoff 15177 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13680640 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 19 key (257 EXTENT_DATA 1703936) itemoff 15124 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13684736 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 20 key (257 EXTENT_DATA 1835008) itemoff 15071 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13688832 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)
+	item 21 key (257 EXTENT_DATA 1966080) itemoff 15018 itemsize 53
+		generation 10 type 1 (regular)
+		extent data disk byte 13692928 nr 4096
+		extent data offset 0 nr 131072 ram 131072
+		extent compression 3 (zstd)

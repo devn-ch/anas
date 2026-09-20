@@ -24,7 +24,10 @@ import {
   toSystemGroup,
   userGroups,
 } from '../parsers/getent.js'
-import { parsePdbeditNames } from '../parsers/pdbedit.js'
+import { parsePdbeditNames, passdbHas, sameIdentityName } from '../parsers/pdbedit.js'
+import { parseSmbConf } from '../parsers/smb-conf.js'
+import { confirmGate } from '../safety/gate.js'
+import { readConfig } from '../services/config-writer.js'
 import { requireIdentity } from './identity.js'
 
 // Command whitelist (Principle 5). Debian/PVE paths: user/group admin tools
@@ -32,7 +35,9 @@ import { requireIdentity } from './identity.js'
 const GETENT = '/usr/bin/getent'
 const USERADD = '/usr/sbin/useradd'
 const USERMOD = '/usr/sbin/usermod'
+const USERDEL = '/usr/sbin/userdel'
 const GROUPADD = '/usr/sbin/groupadd'
+const GROUPDEL = '/usr/sbin/groupdel'
 const GPASSWD = '/usr/bin/gpasswd'
 const SMBPASSWD = '/usr/bin/smbpasswd'
 const PDBEDIT = '/usr/bin/pdbedit'
@@ -70,8 +75,13 @@ async function smbpasswdIsInstalled(): Promise<boolean> {
 export interface ShareIdentityRouteOptions {
   executor: CommandExecutor
   jobQueue: JobQueue
-  /** Accepted for a uniform register signature; identity ops are never gated. */
+  /** Used by the delete routes' confirm gate (Principle 14). */
   confirmStore: ConfirmStore
+  /**
+   * Absolute path to smb.conf — the delete routes read it to refuse an
+   * identity a share still names in `valid users` (identity.1d).
+   */
+  smbConfPath: string
   /**
    * Is `smbpasswd` present and executable on this node? Defaults to a real
    * access(X_OK) probe. The dev mock overrides it to `true` (nothing is ever
@@ -85,7 +95,7 @@ export async function shareIdentityRoutes(
   server: FastifyInstance,
   opts: ShareIdentityRouteOptions,
 ) {
-  const { executor, jobQueue } = opts
+  const { executor, jobQueue, confirmStore, smbConfPath } = opts
   const smbAvailable = opts.smbpasswdAvailable ?? smbpasswdIsInstalled
 
   /**
@@ -213,9 +223,52 @@ export async function shareIdentityRoutes(
       fullName: entry.gecos || null,
       primaryGroup: primaryGroupName(entry, groups),
       groups: userGroups(entry, groups),
-      smbEnabled: smb.has(entry.name),
+      // Case-FOLDED (identity.1b): Samba matches names case-insensitively and
+      // may hold the passdb entry under a different case than passwd.
+      smbEnabled: passdbHas(smb, entry.name),
       locked: isExpired(expire),
       local,
+    }
+  }
+
+  /**
+   * The share names (SMB `valid users`) that reference an identity (identity.1d).
+   * A user is referenced by a bare entry, a group by an `@`-prefixed one; the
+   * match is case-folded (Samba is case-insensitive in smb.conf too).
+   *
+   * Returns `{ shares, unknown }`: `unknown` is true when smb.conf could not
+   * be read (a read error, not an absent file) — the caller then discloses it
+   * at the confirm door instead of failing open silently (the ahr-mutate D3
+   * pattern). An ABSENT file (samba removed) genuinely means no references.
+   */
+  async function sharesReferencing(
+    name: string,
+    isGroup: boolean,
+  ): Promise<{ shares: string[], unknown: boolean }> {
+    let text: string
+    try {
+      text = await readConfig(smbConfPath)
+    }
+    catch {
+      return { shares: [], unknown: true }
+    }
+    const shares = parseSmbConf(text).shares
+    const refs = shares
+      .filter(s => s.validUsers.some(entry => (isGroup
+        ? entry.startsWith('@') && sameIdentityName(entry.slice(1), name)
+        : sameIdentityName(entry, name))))
+      .map(s => s.name)
+    return { shares: refs, unknown: false }
+  }
+
+  /** The hard-409 body for a referenced identity — ONE shape for both verbs. */
+  function referencedConflict(kind: 'user' | 'group', name: string, shares: string[]) {
+    return {
+      error: {
+        code: 'CONFLICT',
+        reason: 'referenced-by-share',
+        message: `${kind === 'user' ? 'User' : 'Group'} '${name}' is referenced by share(s): ${shares.join(', ')}. Remove it from their 'valid users' first. This refusal has no confirm bypass.`,
+      },
     }
   }
 
@@ -247,10 +300,21 @@ export async function shareIdentityRoutes(
 
   // --- GET /identity/groups — enriched ShareGroup list ----------------------
   server.get('/identity/groups', async () => {
-    const [groups, local] = await Promise.all([allGroups(), localGroupNames()])
+    const [groups, users, local] = await Promise.all([allGroups(), allUsers(), localGroupNames()])
     const data: ShareGroup[] = groups
       .filter(g => isShareRelevant(g.gid))
-      .map(g => ({ ...toSystemGroup(g), members: g.members, local: local.has(g.name) }))
+      .map((g) => {
+        // identity.1c: explain an existing user-private group — a user with
+        // the SAME NAME whose PRIMARY gid is this group. Exact match: both
+        // sides come from the same (case-sensitive) account database.
+        const owner = users.find(u => u.name === g.name && u.gid === g.gid)
+        return {
+          ...toSystemGroup(g),
+          members: g.members,
+          local: local.has(g.name),
+          ...(owner ? { privateGroupOf: owner.name } : {}),
+        }
+      })
     return { data }
   })
 
@@ -318,8 +382,12 @@ export async function shareIdentityRoutes(
       return { error: { code: 'VALIDATION_ERROR', message: `${SMB_NOT_INSTALLED}. The user was NOT created.` } }
     }
 
-    // useradd -M -s /usr/sbin/nologin [-c <fullName>] [-G <groups>] <name>
-    const args = ['-M', '-s', NOLOGIN]
+    // useradd -N -M -s /usr/sbin/nologin [-c <fullName>] [-G <groups>] <name>
+    // -N (identity.1c): NO user-private group — the account takes the default
+    // group from /etc/default/useradd, so creating 'Alice' does not conjure a
+    // phantom group 'alice' into the Groups list. Pre-existing users keep
+    // whatever group they already had.
+    const args = ['-N', '-M', '-s', NOLOGIN]
     if (req.fullName !== undefined)
       args.push('-c', req.fullName)
     if (req.groups && req.groups.length > 0)
@@ -462,7 +530,8 @@ export async function shareIdentityRoutes(
         // smbpasswd -d/-e errors on users with no entry, which is normal for a
         // share user that never had an SMB password. On a node without samba
         // smbNames() fails open to empty, so this is skipped entirely.
-        const hasSmb = (await smbNames()).has(name)
+        // Case-FOLDED (identity.1b): the passdb may hold a different case.
+        const hasSmb = passdbHas(await smbNames(), name)
         if (hasSmb) {
           updateProgress(`${enabled ? 'Enabling' : 'Disabling'} SMB access for '${name}'`)
           const smb = await execSmbpasswd([enabled ? '-e' : '-d', name])
@@ -567,6 +636,169 @@ export async function shareIdentityRoutes(
             throw new Error(r.stderr.trim() || `gpasswd -d ${user} exited with code ${r.exitCode}`)
         }
         return { group: name, added: add, removed: remove }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // --- DELETE /identity/users/:name — delete a local share user -------------
+  //
+  // Identity.1d. The same local-identity gate the update routes use (LookupName
+  // → exists → local), then the HARD refusals (no confirm bypass): a name a
+  // share still carries in `valid users`. What remains is confirm-gated
+  // (Principle 14): the account is gone from the system, and the files it owns
+  // keep their uid — `userdel` without `-r`, by design.
+  server.delete<{ Params: { name: string } }>('/identity/users/:name', async (request, reply) => {
+    const nameParsed = LookupName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid user name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const name = nameParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const entry = await resolveUser(name)
+    if (!entry) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `User '${name}' not found` } }
+    }
+    if (!(await isLocalUser(name)))
+      return rejectDirectory(reply, 'user', name)
+
+    const refs = await sharesReferencing(name, false)
+    if (refs.shares.length > 0) {
+      reply.code(409)
+      return referencedConflict('user', name, refs.shares)
+    }
+
+    // The passdb check is route-time for the WARNING (it describes what will
+    // happen); the job re-checks live so the `smbpasswd -x` side stays honest
+    // if the passdb moves between the two.
+    const hasSmb = passdbHas(await smbNames(), name)
+    const warnings = [
+      `User '${name}' (uid ${entry.uid}) will be removed from the system`,
+      `Files owned by the user keep their uid (${entry.uid}) — ownership is not changed, and a later user with the same uid would own them`,
+    ]
+    if (hasSmb)
+      warnings.push(`Its SMB password entry will be removed`)
+    if (refs.unknown)
+      warnings.push('ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names this user before confirming.')
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'identity.user.delete',
+      params: { name },
+      message: `Deleting share user '${name}' removes the account`,
+      warnings,
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'identity.user.delete',
+      { ...identity, params: { user: name } },
+      async (updateProgress) => {
+        updateProgress(`Deleting share user '${name}'`)
+        // Without `-r`: the files keep their uid, and nothing is swept from
+        // disk — a later user with the same uid would own them.
+        const r = await executor.exec(USERDEL, [name])
+        if (r.exitCode !== 0)
+          throw new Error(r.stderr.trim() || `userdel exited with code ${r.exitCode}`)
+
+        // userdel does not touch the passdb: drop the entry only if one exists
+        // (smbpasswd -x errors on a user with none). Case-folded like every
+        // other passdb comparison; on a node without samba smbNames() fails
+        // open to empty, so this is skipped entirely.
+        let smbEntryRemoved = false
+        if (passdbHas(await smbNames(), name)) {
+          updateProgress(`Removing SMB password entry for '${name}'`)
+          const smb = await execSmbpasswd(['-x', name])
+          if (smb.exitCode !== 0)
+            throw new Error(smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`)
+          smbEntryRemoved = true
+        }
+        return { deleted: name, smbEntryRemoved }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // --- DELETE /identity/groups/:name — delete a local group ------------------
+  //
+  // Identity.1d. Same gates as the user delete, plus the group's own hard
+  // refusal: groupdel cannot run while the group is ANY account's primary
+  // group (the account would be left with an unresolvable primary gid).
+  server.delete<{ Params: { name: string } }>('/identity/groups/:name', async (request, reply) => {
+    const nameParsed = LookupName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid group name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const name = nameParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const entry = await resolveGroup(name)
+    if (!entry) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Group '${name}' not found` } }
+    }
+    if (!(await isLocalGroup(name)))
+      return rejectDirectory(reply, 'group', name)
+
+    // Every resolvable account is checked, not only local ones: a directory
+    // user pinned to this gid would be broken the same way.
+    const primaries = (await allUsers()).filter(u => u.gid === entry.gid).map(u => u.name)
+    if (primaries.length > 0) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'primary-group-in-use',
+          message: `Group '${name}' is the primary group of: ${primaries.join(', ')}. Change their primary group (or remove the users) first. This refusal has no confirm bypass.`,
+        },
+      }
+    }
+
+    const refs = await sharesReferencing(name, true)
+    if (refs.shares.length > 0) {
+      reply.code(409)
+      return referencedConflict('group', name, refs.shares)
+    }
+
+    const warnings = [
+      `Group '${name}' (gid ${entry.gid}) will be removed from the system`,
+      `Files owned by the group keep their gid (${entry.gid}) — ownership is not changed, and a later group with the same gid would own them`,
+    ]
+    if (refs.unknown)
+      warnings.push('ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names this group before confirming.')
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'identity.group.delete',
+      params: { name },
+      message: `Deleting group '${name}' removes the group`,
+      warnings,
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'identity.group.delete',
+      { ...identity, params: { group: name } },
+      async (updateProgress) => {
+        updateProgress(`Deleting group '${name}'`)
+        const r = await executor.exec(GROUPDEL, [name])
+        if (r.exitCode !== 0)
+          throw new Error(r.stderr.trim() || `groupdel exited with code ${r.exitCode}`)
+        return { deleted: name }
       },
     )
 

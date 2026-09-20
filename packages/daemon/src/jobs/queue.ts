@@ -111,6 +111,54 @@ export class JobQueue {
   }
 
   /**
+   * The OLDEST job still in flight (queued or running) for any of `operations`
+   * that named `target` — "is one of these running on this pool right now?".
+   *
+   * {@link findByOperation} cannot answer that: it returns the LATEST job per
+   * operation whatever its status, so a completed job submitted after a running
+   * one HIDES the running one, and a mutual-exclusion check built on it lets
+   * the second job through (a scrub starting on top of a repair that has md's
+   * `rmw_level` and `sync_min`/`sync_max` turned aside). Status is the filter
+   * here, and the answer is a job that is actually in flight or nothing.
+   */
+  findActive(operations: string | readonly string[], target: string, paramKey: string = 'name'): Job | undefined {
+    const wanted = new Set(typeof operations === 'string' ? [operations] : operations)
+    for (const record of this.jobs.values()) {
+      if (!wanted.has(record.job.operation) || record.submitter.params?.[paramKey] !== target)
+        continue
+      if (record.job.status === 'queued' || record.job.status === 'running')
+        return record.job
+    }
+    return undefined
+  }
+
+  /**
+   * The most recently submitted job for `operation` on `target` that actually
+   * COMPLETED — "what did the last successful run of this say?".
+   *
+   * {@link findByOperation} answers with the latest job whatever its status, so
+   * a scrub that failed two minutes ago hides the good one before it. The
+   * parity rewrite (selfheal.10) stands entirely on the evidence of the last
+   * COMPLETED two-phase scrub — the band's parity mismatch count with a clean
+   * phase 2 — and a failed or running job carries no such verdict.
+   *
+   * In memory like the rest of the queue: after a daemon restart the honest
+   * answer is "no evidence", and the rewrite refuses rather than assuming.
+   */
+  findLastCompleted(operation: string, target: string, paramKey: string = 'name'): Job | undefined {
+    let latest: Job | undefined
+    for (const record of this.jobs.values()) {
+      if (record.job.operation !== operation || record.job.status !== 'completed')
+        continue
+      if (record.submitter.params?.[paramKey] !== target)
+        continue
+      if (!latest || record.job.createdAt >= latest.createdAt)
+        latest = record.job
+    }
+    return latest
+  }
+
+  /**
    * Every distinct `params.name` target seen for `operation`, in first-submitted
    * order. Pairs with {@link findByOperation} for "what has this operation been
    * asked to do, and how did the latest attempt on each end up?" — the question

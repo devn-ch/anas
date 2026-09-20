@@ -42,6 +42,22 @@ describe('pveNotify', () => {
     assert.deepEqual(executor.calls[0].args.slice(2), ['error', 'backup failed', 'detail'])
   })
 
+  it('decodes @ARGV from UTF-8 so a multi-byte character is not encoded twice (selfheal.7 F1)', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    await pveNotify(executor, 'warning', 'AHR scrub: parity mismatch on tank-r1', 'rot exists in tank-r1 — phase 2 (running now) will name the files')
+    const body = executor.calls[0].args[1]
+    assert.ok(body.includes('use Encode qw(decode)'))
+    assert.ok(body.includes('map { decode(\'UTF-8\', $_, Encode::FB_DEFAULT) } @ARGV'))
+    // The decode happens in perl, never here: the argv still carries the text
+    // exactly as the caller wrote it.
+    assert.deepEqual(executor.calls[0].args.slice(2), [
+      'warning',
+      'AHR scrub: parity mismatch on tank-r1',
+      'rot exists in tank-r1 — phase 2 (running now) will name the files',
+    ])
+  })
+
   it('refuses a template name outside the shipped shape — nothing is executed', async () => {
     const executor = new MockExecutor()
     executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })

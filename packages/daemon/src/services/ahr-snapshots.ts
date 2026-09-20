@@ -111,11 +111,35 @@ export function isSubvolLayoutMount(options: string): boolean {
  */
 const topLevelMountChains = new Map<string, Promise<unknown>>()
 
+/**
+ * How many holders are queued on each path RIGHT NOW.
+ *
+ * The chain map cannot answer that — its tail promise outlives the last
+ * holder, so a path that has ever been used looks permanently occupied. This
+ * counter is what {@link withTopLevelMountWithin} needs to fail fast instead of
+ * joining a queue it may be stuck in for hours (design review 2026-09-14, S2).
+ */
+const topLevelMountHolders = new Map<string, number>()
+
+function releaseHolder(path: string): void {
+  const left = (topLevelMountHolders.get(path) ?? 1) - 1
+  if (left <= 0)
+    topLevelMountHolders.delete(path)
+  else
+    topLevelMountHolders.set(path, left)
+}
+
 function serializeOnPath<T>(path: string, task: () => Promise<T>): Promise<T> {
+  topLevelMountHolders.set(path, (topLevelMountHolders.get(path) ?? 0) + 1)
   const prev = topLevelMountChains.get(path) ?? Promise.resolve()
-  const result = prev.then(task, task)
+  const result = prev.then(task, task).finally(() => releaseHolder(path))
   topLevelMountChains.set(path, result.then(() => undefined, () => undefined))
   return result
+}
+
+/** Holders queued on a pool's top-level mount path right now (0 = free). */
+export function topLevelMountQueueDepth(pool: AhrPool, opts?: AhrSnapshotOptions): number {
+  return topLevelMountHolders.get(topLevelMountPath(pool, opts)) ?? 0
 }
 
 /** Is `path` still an active mountpoint? (findmnt reads the kernel table only.) */
@@ -190,6 +214,44 @@ export async function withTopLevelMount<T>(
       throw opError
     return result
   })
+}
+
+/** Default ceiling on a bounded top-level-mount acquire (S2). */
+export const AHR_TOP_LEVEL_MOUNT_WAIT_MS = 60000
+
+/** The outcome of a bounded acquire: it ran, or it gave up without running. */
+export type BoundedMountResult<T>
+  = | { ran: true, value: T, waitedMs: number }
+    | { ran: false, waitedMs: number }
+
+/**
+ * {@link withTopLevelMount}, but never for longer than `waitMs`.
+ *
+ * `withTopLevelMount` serialises every holder of one pool's top-level mount
+ * onto a single promise chain, which is exactly right for correctness and
+ * exactly wrong for a caller that must not block: a backup run keeps that mount
+ * for the whole of one `pbc` invocation — hours — and the self-heal engine's
+ * final cold read would sit behind it with `rmw_level` turned down on a live
+ * array (S2). So the queue depth is checked first and, once it clears, the
+ * mount is taken in the SAME synchronous turn (no `await` between the check and
+ * the call, so nothing can slip in front). Past the ceiling the caller is told
+ * it did not run and decides what that means — for the cold read, a repair
+ * reported honestly as "post-check passed, cold read skipped".
+ */
+export async function withTopLevelMountWithin<T>(
+  executor: CommandExecutor,
+  pool: AhrPool,
+  fn: (topLevelPath: string) => Promise<T>,
+  opts?: AhrSnapshotOptions,
+  waitMs: number = AHR_TOP_LEVEL_MOUNT_WAIT_MS,
+): Promise<BoundedMountResult<T>> {
+  const started = Date.now()
+  while (topLevelMountQueueDepth(pool, opts) > 0) {
+    if (Date.now() - started >= waitMs)
+      return { ran: false, waitedMs: Date.now() - started }
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  return { ran: true, value: await withTopLevelMount(executor, pool, fn, opts), waitedMs: Date.now() - started }
 }
 
 // ---- Naming -----------------------------------------------------------------
