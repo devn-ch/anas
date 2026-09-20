@@ -654,7 +654,8 @@
     // (referenced-by-share, primary-group-in-use) arrive as a plain 409 with NO
     // confirm code and surface as an error alert naming the reason; the confirm
     // gate's warnings (the account goes away, the files keep their uid/gid, the
-    // SMB passdb entry is dropped) render in the Yes/No dialog.
+    // SMB passdb entry is dropped) render in the confirm window, the same
+    // presentation as pool destroy, dataset destroy, share and LUN delete.
 
     function deleteUser(node, view, rec) {
         if (!rec || !isLocal(rec)) {
@@ -672,10 +673,16 @@
                 onComplete: function () {
                     reloadAll(view, node);
                 },
+                onFailed: function () {
+                    // A failed delete may already have removed the account (or
+                    // partially applied), so the grid reloads on failure too.
+                    reloadAll(view, node);
+                },
                 confirmTitle: 'Delete user',
                 confirmIntro: '<b>'
                     + enc(t('Delete share user') + ' "' + userName + '"?') + '</b>',
                 confirmButtonText: 'Delete',
+                confirmWindow: true,
                 confirmCls: 'anas-win-user-delete',
                 confirmButtonCls: 'anas-btn-user-delete-confirm',
             });
@@ -700,10 +707,16 @@
                 onComplete: function () {
                     reloadAll(view, node);
                 },
+                onFailed: function () {
+                    // A failed delete may already have removed the account (or
+                    // partially applied), so the grid reloads on failure too.
+                    reloadAll(view, node);
+                },
                 confirmTitle: 'Delete group',
                 confirmIntro: '<b>'
                     + enc(t('Delete group') + ' "' + groupName + '"?') + '</b>',
                 confirmButtonText: 'Delete',
+                confirmWindow: true,
                 confirmCls: 'anas-win-group-delete',
                 confirmButtonCls: 'anas-btn-group-delete-confirm',
             });

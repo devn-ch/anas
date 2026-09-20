@@ -8786,8 +8786,8 @@ async function shareUsersChecks() {
   eq('delete(user): it DELETEs the selected user',
     [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path],
     ['del', '/identity/users/Alice'])
-  ok('delete(user): it goes through the CONFIRM-CODE flow (confirmAndRun), not a plain job',
-    jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === false,
+  ok('delete(user): it goes through the CONFIRM-CODE flow with the widget window (same presentation as pool/dataset/share/LUN delete), not a plain job',
+    jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === true,
     JSON.stringify(jobs[0] || {}))
   ok('delete(user): the grids REFRESH after the job is accepted',
     apiGets.includes('/identity/users') && apiGets.includes('/identity/groups'),
@@ -8808,8 +8808,8 @@ async function shareUsersChecks() {
   eq('delete(group): it DELETEs the selected group',
     [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path],
     ['del', '/identity/groups/smbusers'])
-  ok('delete(group): it goes through the confirm-code flow too',
-    jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === false,
+  ok('delete(group): it goes through the confirm-code flow with the widget window too',
+    jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === true,
     JSON.stringify(jobs[0] || {}))
 }
 
