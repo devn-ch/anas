@@ -7,6 +7,7 @@ import {
   shareGroupExists,
   shareUserExists,
   smbUserExists,
+  sshExec,
   userDisabled,
   userGroups,
 } from './fixtures/stunt-node'
@@ -31,9 +32,13 @@ import {
  *     '.anas-btn-user-smbpw' / '.anas-btn-user-toggle' / '.anas-btn-user-groups'
  *     (per-selection; enabled only for a LOCAL row — directory users are
  *     read-only). Groups toolbar: '.anas-btn-group-add' / '.anas-btn-group-members'.
- *   - Every mutation is a plain job (202 + { job }) — NOT confirm-gated. The row
- *     appears/updates once the change lands on the real system (getent/pdbedit
- *     are the source of truth). Enable/Disable is a plain UI Ext.Msg.confirm.
+ *   - Every mutation is a plain job (202 + { job }); create/password/toggle are
+ *     NOT confirm-gated. The row appears/updates once the change lands on the
+ *     real system (getent/pdbedit are the source of truth). Enable/Disable is a
+ *     plain UI Ext.Msg.confirm; the DELETE verbs (identity.1d) run the daemon's
+ *     confirm-code gate through windows '.anas-win-user-delete' /
+ *     '.anas-win-group-delete' with confirm buttons
+ *     '.anas-btn-user-delete-confirm' / '.anas-btn-group-delete-confirm'.
  *   - Create windows '.anas-win-group-create' / '.anas-win-user-create', submit
  *     hooks '.anas-btn-group-create-submit' / '.anas-btn-user-create-submit'.
  *     Set-SMB-password window '.anas-win-smb-password', submit
@@ -248,5 +253,30 @@ test.describe.serial('ANAS Share Users create → SMB password → group → dis
     // The window closes on job completion and the passdb entry is still present.
     await expect(pwin).toBeHidden({ timeout: 30_000 })
     await expect.poll(() => smbUserExists(ITEST_USR), { timeout: 60_000 }).toBe(true)
+
+    // --- Delete via the daemon confirm gate (identity.1d) ----------------------
+    // The user still has an SMB passdb entry, so the delete job must drop that
+    // entry BEFORE userdel (smbpasswd resolves the entry through the Unix
+    // account). Select → toolbar delete → confirm window → the row disappears
+    // (the view's own store reload — no page reload) and both sources of truth
+    // agree the identity is gone.
+    await userRow(page, ITEST_USR).click()
+    const deleteBtn = page.locator('.anas-btn-user-delete')
+    await expect(deleteBtn).toBeEnabled({ timeout: 20_000 })
+    await deleteBtn.click()
+    const dwin = page.locator('.anas-win-user-delete')
+    await expect(dwin).toBeVisible({ timeout: 20_000 })
+    await dwin.locator('.anas-btn-user-delete-confirm').click()
+
+    await expect(userRow(page, ITEST_USR)).toBeHidden({ timeout: 60_000 })
+    await expect(page.locator('.anas-view-users')).toBeVisible()
+
+    // Source of truth over SSH: the account is gone (getent exits non-zero) and
+    // the passdb no longer lists the user.
+    await expect.poll(() => shareUserExists(ITEST_USR), { timeout: 60_000 }).toBe(false)
+    await expect.poll(
+      () => sshExec('pdbedit -L 2>/dev/null').catch(() => ''),
+      { timeout: 60_000 },
+    ).not.toContain(ITEST_USR)
   })
 })

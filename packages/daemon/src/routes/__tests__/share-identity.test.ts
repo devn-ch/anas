@@ -737,16 +737,43 @@ describe('share-identity routes', () => {
       assert.equal(job.status, 'completed')
       assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: true })
 
-      // Exact argv, in order: userdel first, smbpasswd -x only because the
-      // passdb has the entry (stored as ALICE — matched case-folded).
-      assert.deepEqual(find(executor.calls, '/usr/sbin/userdel', () => true), ['Alice'])
+      // Exact argv, in order: smbpasswd -x FIRST (it resolves the passdb entry
+      // through the Unix account, so it must run while the account exists —
+      // and only because the passdb has the entry, stored as ALICE, matched
+      // case-folded), then userdel.
       assert.deepEqual(find(executor.calls, '/usr/bin/smbpasswd', () => true), ['-x', 'Alice'])
+      assert.deepEqual(find(executor.calls, '/usr/sbin/userdel', () => true), ['Alice'])
       assert.equal(find(executor.calls, '/usr/sbin/userdel', a => a.includes('-r')), undefined)
+      const smbIdx = executor.calls.findIndex(c => c.command === '/usr/bin/smbpasswd')
+      const delIdx = executor.calls.findIndex(c => c.command === '/usr/sbin/userdel')
+      assert.ok(smbIdx !== -1 && delIdx !== -1 && smbIdx < delIdx, 'smbpasswd -x must run before userdel')
 
       // The consumed code cannot open the gate a second time.
       const reuse = await del('/v1/identity/users/Alice', code)
       assert.equal(reuse.statusCode, 409)
       assert.equal((reuse.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
+    })
+
+    it('fails the job on a failed smbpasswd -x and never runs userdel', async () => {
+      await bootNode({ smbConf: CLEAN_SMB_CONF })
+      // smbpasswd cannot resolve the entry — the historical order bug (#60)
+      // produced exactly this after userdel had already run.
+      executor.addFixture({
+        command: '/usr/bin/smbpasswd',
+        args: ['-x', 'Alice'],
+        result: { stdout: '', stderr: 'Failed to find a Unix account for Alice\n', exitCode: 1 },
+      })
+      const first = await del('/v1/identity/users/Alice')
+      assert.equal(first.statusCode, 409)
+      const code = first.headers['x-anas-confirm-code'] as string
+
+      const ok = await del('/v1/identity/users/Alice', code)
+      assert.equal(ok.statusCode, 202)
+      const job = await waitForQueueJob((ok.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error?.message ?? '', /Failed to find a Unix account/)
+      // Nothing destroyed: the account is still there, only the SMB step failed.
+      assert.equal(executor.calls.some(c => c.command === '/usr/sbin/userdel'), false)
     })
 
     it('skips smbpasswd -x when the passdb has no entry for the user', async () => {

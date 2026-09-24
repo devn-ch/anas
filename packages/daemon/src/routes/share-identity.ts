@@ -702,17 +702,14 @@ export async function shareIdentityRoutes(
       'identity.user.delete',
       { ...identity, params: { user: name } },
       async (updateProgress) => {
-        updateProgress(`Deleting share user '${name}'`)
-        // Without `-r`: the files keep their uid, and nothing is swept from
-        // disk — a later user with the same uid would own them.
-        const r = await executor.exec(USERDEL, [name])
-        if (r.exitCode !== 0)
-          throw new Error(r.stderr.trim() || `userdel exited with code ${r.exitCode}`)
-
-        // userdel does not touch the passdb: drop the entry only if one exists
-        // (smbpasswd -x errors on a user with none). Case-folded like every
-        // other passdb comparison; on a node without samba smbNames() fails
-        // open to empty, so this is skipped entirely.
+        // Order matters: smbpasswd resolves the passdb entry through the Unix
+        // account, so the SMB entry is dropped FIRST, while the account still
+        // exists. A failed SMB step at this point destroys nothing — after
+        // userdel it would fail ("Failed to find a Unix account") and leave
+        // the passdb entry orphaned behind a deleted account. Drop the entry
+        // only if one exists (smbpasswd -x errors on a user with none),
+        // case-folded like every other passdb comparison; on a node without
+        // samba smbNames() fails open to empty, so this is skipped entirely.
         let smbEntryRemoved = false
         if (passdbHas(await smbNames(), name)) {
           updateProgress(`Removing SMB password entry for '${name}'`)
@@ -721,6 +718,13 @@ export async function shareIdentityRoutes(
             throw new Error(smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`)
           smbEntryRemoved = true
         }
+
+        updateProgress(`Deleting share user '${name}'`)
+        // Without `-r`: the files keep their uid, and nothing is swept from
+        // disk — a later user with the same uid would own them.
+        const r = await executor.exec(USERDEL, [name])
+        if (r.exitCode !== 0)
+          throw new Error(r.stderr.trim() || `userdel exited with code ${r.exitCode}`)
         return { deleted: name, smbEntryRemoved }
       },
     )
